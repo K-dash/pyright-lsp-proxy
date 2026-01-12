@@ -37,6 +37,15 @@ pub enum BackendError {
 
     #[error("Backend not running")]
     NotRunning,
+
+    #[error("Initialize timeout after {0}s")]
+    InitializeTimeout(u64),
+
+    #[error("Initialize failed: {0}")]
+    InitializeFailed(String),
+
+    #[error("Initialize response error: {0}")]
+    InitializeResponseError(String),
 }
 
 #[derive(Error, Debug)]

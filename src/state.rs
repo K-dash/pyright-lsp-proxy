@@ -1,8 +1,18 @@
 use crate::message::RpcMessage;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use url::Url;
 
-/// プロキシが保持する状態（Phase 3b-1: 最小復元版）
+/// 開いているドキュメント（Phase 3b-2）
+#[derive(Debug, Clone)]
+pub struct OpenDocument {
+    pub uri: Url,
+    pub language_id: String,
+    pub version: i32,
+    pub text: String,
+}
+
+/// プロキシが保持する状態（Phase 3b-2: 複数ドキュメント復元版）
 pub struct ProxyState {
     /// 現在アクティブな .venv のパス
     pub active_venv: Option<PathBuf>,
@@ -13,8 +23,8 @@ pub struct ProxyState {
     /// Claude Code からの initialize メッセージ（backend 初期化で流用）
     pub client_initialize: Option<RpcMessage>,
 
-    /// 最後に開いたファイル（URI, text, venv）
-    pub last_open: Option<(Url, String, PathBuf)>,
+    /// 開いているドキュメント（Phase 3b-2）
+    pub open_documents: HashMap<Url, OpenDocument>,
 
     /// backend 再起動の世代（ログと競合回避用）
     pub backend_session: u64,
@@ -29,7 +39,7 @@ impl ProxyState {
             active_venv: None,
             git_toplevel: None,
             client_initialize: None,
-            last_open: None,
+            open_documents: HashMap::new(),
             backend_session: 0,
             switching: false,
         }
