@@ -1,0 +1,9 @@
+{
+  "name": "pyright-lsp-proxy",
+  "version": "0.1.0",
+  "description": "Pyright LSP proxy for monorepo with automatic .venv switching",
+  "author": {
+    "name": "K-dash"
+  },
+  "license": "MIT"
+}

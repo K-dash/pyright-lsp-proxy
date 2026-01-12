@@ -1,0 +1,67 @@
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum ProxyError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("JSON parse error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("Invalid URI")]
+    InvalidUri,
+
+    #[error("Invalid message: {0}")]
+    InvalidMessage(String),
+
+    #[error("Backend error: {0}")]
+    Backend(#[from] BackendError),
+
+    #[error("Framing error: {0}")]
+    Framing(#[from] FramingError),
+
+    #[error("Venv error: {0}")]
+    Venv(#[from] VenvError),
+}
+
+#[derive(Error, Debug)]
+pub enum BackendError {
+    #[error("Failed to spawn pyright: {0}")]
+    SpawnFailed(#[from] std::io::Error),
+
+    #[error("Backend process exited unexpectedly")]
+    UnexpectedExit,
+
+    #[error("Shutdown timeout")]
+    ShutdownTimeout,
+
+    #[error("Backend not running")]
+    NotRunning,
+}
+
+#[derive(Error, Debug)]
+pub enum FramingError {
+    #[error("Missing Content-Length header")]
+    MissingContentLength,
+
+    #[error("Invalid Content-Length value")]
+    InvalidContentLength,
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+#[derive(Error, Debug)]
+pub enum VenvError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Git command failed: {0}")]
+    GitFailed(String),
+
+    #[error("No .venv found")]
+    NotFound,
+}

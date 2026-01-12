@@ -1,0 +1,21 @@
+{
+  "name": "pyright-lsp-proxy-marketplace",
+  "version": "0.1.0",
+  "description": "Local marketplace for Pyright LSP Proxy plugin",
+  "owner": {
+    "name": "K-dash",
+    "email": "k-dash@example.com"
+  },
+  "plugins": [
+    {
+      "name": "pyright-lsp-proxy",
+      "description": "Pyright LSP proxy for monorepo with automatic .venv switching",
+      "version": "0.1.0",
+      "author": {
+        "name": "furukawa"
+      },
+      "source": "./plugins/pyright-lsp-proxy",
+      "category": "development"
+    }
+  ]
+}
