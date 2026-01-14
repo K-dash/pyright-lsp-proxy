@@ -2,9 +2,9 @@ use crate::error::BackendError;
 use crate::framing::{LspFrameReader, LspFrameWriter};
 use crate::message::{RpcId, RpcMessage};
 use std::path::Path;
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 pub struct PyrightBackend {
     child: Child,
@@ -67,7 +67,7 @@ impl PyrightBackend {
         self.writer
             .write_message(message)
             .await
-            .map_err(|e| BackendError::SpawnFailed(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| BackendError::SpawnFailed(std::io::Error::other(e)))?;
         Ok(())
     }
 
@@ -76,7 +76,7 @@ impl PyrightBackend {
         self.reader
             .read_message()
             .await
-            .map_err(|e| BackendError::SpawnFailed(std::io::Error::new(std::io::ErrorKind::Other, e)))
+            .map_err(|e| BackendError::SpawnFailed(std::io::Error::other(e)))
     }
 
     /// backend を graceful shutdown する（Phase 3b-1）
@@ -89,7 +89,10 @@ impl PyrightBackend {
         let shutdown_id = self.next_id;
         self.next_id += 1;
 
-        tracing::info!(shutdown_id = shutdown_id, "Sending shutdown request to backend");
+        tracing::info!(
+            shutdown_id = shutdown_id,
+            "Sending shutdown request to backend"
+        );
 
         // shutdown request 送信
         let shutdown_msg = RpcMessage {
@@ -163,10 +166,7 @@ impl PyrightBackend {
         tracing::debug!("Sent exit notification, waiting for process to exit");
 
         // プロセス wait を 1秒待つ
-        let wait_result = tokio::time::timeout(
-            Duration::from_secs(1),
-            self.child.wait()
-        ).await;
+        let wait_result = tokio::time::timeout(Duration::from_secs(1), self.child.wait()).await;
 
         match wait_result {
             Ok(Ok(status)) => {
@@ -192,16 +192,13 @@ impl PyrightBackend {
         // SIGTERM を送る（kill が非同期で完了しない可能性があるので start_kill）
         if let Err(e) = self.child.start_kill() {
             tracing::error!(error = ?e, "Failed to kill backend");
-            return Err(BackendError::SpawnFailed(
-                std::io::Error::new(std::io::ErrorKind::Other, "Failed to kill backend")
-            ));
+            return Err(BackendError::SpawnFailed(std::io::Error::other(
+                "Failed to kill backend",
+            )));
         }
 
         // wait して終了を確認（タイムアウト付き）
-        let wait_result = tokio::time::timeout(
-            Duration::from_millis(500),
-            self.child.wait()
-        ).await;
+        let wait_result = tokio::time::timeout(Duration::from_millis(500), self.child.wait()).await;
 
         match wait_result {
             Ok(Ok(status)) => {
@@ -214,9 +211,10 @@ impl PyrightBackend {
             }
             Err(_) => {
                 tracing::error!("Backend kill timeout");
-                Err(BackendError::SpawnFailed(
-                    std::io::Error::new(std::io::ErrorKind::TimedOut, "Backend kill timeout")
-                ))
+                Err(BackendError::SpawnFailed(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Backend kill timeout",
+                )))
             }
         }
     }

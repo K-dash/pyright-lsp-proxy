@@ -157,7 +157,8 @@ impl LspProxy {
                                 let version = text_document
                                     .get("version")
                                     .and_then(|v| v.as_i64())
-                                    .unwrap_or(0) as i32;
+                                    .unwrap_or(0)
+                                    as i32;
 
                                 tracing::info!(
                                     count = count,
@@ -186,11 +187,9 @@ impl LspProxy {
                                 }
 
                                 // .venv 探索
-                                let found_venv = venv::find_venv(
-                                    &file_path,
-                                    self.state.git_toplevel.as_deref(),
-                                )
-                                .await?;
+                                let found_venv =
+                                    venv::find_venv(&file_path, self.state.git_toplevel.as_deref())
+                                        .await?;
 
                                 if let Some(ref venv) = found_venv {
                                     // Phase 3b-2: 切替判定
@@ -233,7 +232,7 @@ impl LspProxy {
     async fn restart_backend_with_venv(
         &mut self,
         backend: &mut PyrightBackend,
-        new_venv: &std::path::PathBuf,
+        new_venv: &std::path::Path,
         client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
     ) -> Result<PyrightBackend, ProxyError> {
         self.state.backend_session += 1;
@@ -259,7 +258,10 @@ impl LspProxy {
         let mut new_backend = PyrightBackend::spawn(Some(new_venv), self.debug).await?;
 
         // 3. backend に initialize を送る（プロキシが backend クライアントになる）
-        let init_params = self.state.client_initialize.as_ref()
+        let init_params = self
+            .state
+            .client_initialize
+            .as_ref()
             .and_then(|msg| msg.params.clone())
             .ok_or_else(|| ProxyError::InvalidMessage("No initialize params cached".to_string()))?;
 
@@ -282,14 +284,11 @@ impl LspProxy {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return Err(ProxyError::Backend(
-                    crate::error::BackendError::InitializeTimeout(10)
+                    crate::error::BackendError::InitializeTimeout(10),
                 ));
             }
 
-            let wait_result = tokio::time::timeout(
-                remaining,
-                new_backend.read_message()
-            ).await;
+            let wait_result = tokio::time::timeout(remaining, new_backend.read_message()).await;
 
             match wait_result {
                 Ok(Ok(msg)) => {
@@ -301,8 +300,11 @@ impl LspProxy {
                                 if let Some(error) = &msg.error {
                                     return Err(ProxyError::Backend(
                                         crate::error::BackendError::InitializeResponseError(
-                                            format!("code={}, message={}", error.code, error.message)
-                                        )
+                                            format!(
+                                                "code={}, message={}",
+                                                error.code, error.message
+                                            ),
+                                        ),
                                     ));
                                 }
 
@@ -346,14 +348,15 @@ impl LspProxy {
                 }
                 Ok(Err(e)) => {
                     return Err(ProxyError::Backend(
-                        crate::error::BackendError::InitializeFailed(
-                            format!("Error reading initialize response: {}", e)
-                        )
+                        crate::error::BackendError::InitializeFailed(format!(
+                            "Error reading initialize response: {}",
+                            e
+                        )),
                     ));
                 }
                 Err(_) => {
                     return Err(ProxyError::Backend(
-                        crate::error::BackendError::InitializeTimeout(10)
+                        crate::error::BackendError::InitializeTimeout(10),
                     ));
                 }
             }
@@ -440,7 +443,7 @@ impl LspProxy {
         );
 
         // 7. 状態更新
-        self.state.active_venv = Some(new_venv.clone());
+        self.state.active_venv = Some(new_venv.to_path_buf());
 
         tracing::info!(
             session = session,
@@ -512,8 +515,14 @@ impl LspProxy {
                                     for change in changes_array {
                                         if let Some(range) = change.get("range") {
                                             // Incremental sync: range を使って部分更新
-                                            if let Some(new_text) = change.get("text").and_then(|t| t.as_str()) {
-                                                Self::apply_incremental_change(&mut doc.text, range, new_text)?;
+                                            if let Some(new_text) =
+                                                change.get("text").and_then(|t| t.as_str())
+                                            {
+                                                Self::apply_incremental_change(
+                                                    &mut doc.text,
+                                                    range,
+                                                    new_text,
+                                                )?;
                                                 tracing::debug!(
                                                     uri = %url,
                                                     "Applied incremental change"
@@ -521,7 +530,9 @@ impl LspProxy {
                                             }
                                         } else {
                                             // Full sync: 全文置換
-                                            if let Some(new_text) = change.get("text").and_then(|t| t.as_str()) {
+                                            if let Some(new_text) =
+                                                change.get("text").and_then(|t| t.as_str())
+                                            {
                                                 doc.text = new_text.to_string();
                                                 tracing::debug!(
                                                     uri = %url,
@@ -598,23 +609,31 @@ impl LspProxy {
         let start = range.get("start").ok_or_else(|| {
             ProxyError::InvalidMessage("didChange range missing start".to_string())
         })?;
-        let end = range.get("end").ok_or_else(|| {
-            ProxyError::InvalidMessage("didChange range missing end".to_string())
-        })?;
+        let end = range
+            .get("end")
+            .ok_or_else(|| ProxyError::InvalidMessage("didChange range missing end".to_string()))?;
 
-        let start_line = start.get("line").and_then(|l| l.as_u64()).ok_or_else(|| {
-            ProxyError::InvalidMessage("didChange start missing line".to_string())
-        })? as usize;
-        let start_char = start.get("character").and_then(|c| c.as_u64()).ok_or_else(|| {
-            ProxyError::InvalidMessage("didChange start missing character".to_string())
-        })? as usize;
+        let start_line =
+            start.get("line").and_then(|l| l.as_u64()).ok_or_else(|| {
+                ProxyError::InvalidMessage("didChange start missing line".to_string())
+            })? as usize;
+        let start_char = start
+            .get("character")
+            .and_then(|c| c.as_u64())
+            .ok_or_else(|| {
+                ProxyError::InvalidMessage("didChange start missing character".to_string())
+            })? as usize;
 
-        let end_line = end.get("line").and_then(|l| l.as_u64()).ok_or_else(|| {
-            ProxyError::InvalidMessage("didChange end missing line".to_string())
-        })? as usize;
-        let end_char = end.get("character").and_then(|c| c.as_u64()).ok_or_else(|| {
-            ProxyError::InvalidMessage("didChange end missing character".to_string())
-        })? as usize;
+        let end_line =
+            end.get("line").and_then(|l| l.as_u64()).ok_or_else(|| {
+                ProxyError::InvalidMessage("didChange end missing line".to_string())
+            })? as usize;
+        let end_char = end
+            .get("character")
+            .and_then(|c| c.as_u64())
+            .ok_or_else(|| {
+                ProxyError::InvalidMessage("didChange end missing character".to_string())
+            })? as usize;
 
         // line/character を byte offset に変換
         let start_offset = Self::position_to_offset(text, start_line, start_char)?;
@@ -636,11 +655,7 @@ impl LspProxy {
 
     /// LSP position (line, character) を byte offset に変換
     /// LSP の character は UTF-16 code unit 数
-    fn position_to_offset(
-        text: &str,
-        line: usize,
-        character: usize,
-    ) -> Result<usize, ProxyError> {
+    fn position_to_offset(text: &str, line: usize, character: usize) -> Result<usize, ProxyError> {
         let mut current_line = 0;
         let mut line_start_offset = 0;
 

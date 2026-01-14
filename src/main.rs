@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
                 .with_writer(file_appender)
                 .with_ansi(false) // ファイル出力なのでANSIカラーコードを無効化
                 .with_target(true) // モジュール名を表示
-                .with_thread_ids(true) // スレッドIDを表示
+                .with_thread_ids(true), // スレッドIDを表示
         )
         .with(
             EnvFilter::try_from_default_env()

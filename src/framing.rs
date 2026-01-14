@@ -29,10 +29,7 @@ impl<R: AsyncRead + Unpin> LspFrameReader<R> {
 
         // デバッグ出力
         if self.debug {
-            eprintln!(
-                "[DEBUG RX] {}",
-                String::from_utf8_lossy(&content)
-            );
+            eprintln!("[DEBUG RX] {}", String::from_utf8_lossy(&content));
         }
 
         // 3. JSON としてパース
@@ -63,8 +60,7 @@ impl<R: AsyncRead + Unpin> LspFrameReader<R> {
 
             // Content-Length ヘッダーをパース
             let line = line.trim();
-            if line.starts_with(CONTENT_LENGTH) {
-                let len_str = &line[CONTENT_LENGTH.len()..];
+            if let Some(len_str) = line.strip_prefix(CONTENT_LENGTH) {
                 content_length = Some(
                     len_str
                         .parse()
@@ -95,10 +91,7 @@ impl<W: AsyncWrite + Unpin> LspFrameWriter<W> {
 
         // デバッグ出力
         if self.debug {
-            eprintln!(
-                "[DEBUG TX] {}",
-                String::from_utf8_lossy(&content)
-            );
+            eprintln!("[DEBUG TX] {}", String::from_utf8_lossy(&content));
         }
 
         let header = format!("Content-Length: {}\r\n\r\n", content.len());
@@ -117,7 +110,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_message() {
-        let input = b"Content-Length: 46\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}";
+        let input =
+            b"Content-Length: 46\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}";
         let mut reader = LspFrameReader::with_debug(&input[..], false);
         let msg = reader.read_message().await.unwrap();
         assert_eq!(msg.method_name(), Some("initialize"));
