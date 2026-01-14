@@ -1,12 +1,11 @@
 use crate::message::RpcMessage;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use url::Url;
 
 /// 開いているドキュメント（Phase 3b-2）
 #[derive(Debug, Clone)]
 pub struct OpenDocument {
-    pub uri: Url,
     pub language_id: String,
     pub version: i32,
     pub text: String,
@@ -29,8 +28,8 @@ pub struct ProxyState {
     /// backend 再起動の世代（ログと競合回避用）
     pub backend_session: u64,
 
-    /// backend 切替中フラグ
-    pub switching: bool,
+    /// 未解決リクエストの ID（再起動時のキャンセル通知用）
+    pub pending_requests: HashSet<crate::message::RpcId>,
 }
 
 impl ProxyState {
@@ -41,7 +40,7 @@ impl ProxyState {
             client_initialize: None,
             open_documents: HashMap::new(),
             backend_session: 0,
-            switching: false,
+            pending_requests: HashSet::new(),
         }
     }
 

@@ -8,9 +8,6 @@ pub enum ProxyError {
     #[error("JSON parse error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("Invalid URI")]
-    InvalidUri,
-
     #[error("Invalid message: {0}")]
     InvalidMessage(String),
 
@@ -28,15 +25,6 @@ pub enum ProxyError {
 pub enum BackendError {
     #[error("Failed to spawn pyright: {0}")]
     SpawnFailed(#[from] std::io::Error),
-
-    #[error("Backend process exited unexpectedly")]
-    UnexpectedExit,
-
-    #[error("Shutdown timeout")]
-    ShutdownTimeout,
-
-    #[error("Backend not running")]
-    NotRunning,
 
     #[error("Initialize timeout after {0}s")]
     InitializeTimeout(u64),
@@ -67,10 +55,4 @@ pub enum FramingError {
 pub enum VenvError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-
-    #[error("Git command failed: {0}")]
-    GitFailed(String),
-
-    #[error("No .venv found")]
-    NotFound,
 }

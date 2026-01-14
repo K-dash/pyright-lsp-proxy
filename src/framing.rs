@@ -11,13 +11,6 @@ pub struct LspFrameReader<R> {
 }
 
 impl<R: AsyncRead + Unpin> LspFrameReader<R> {
-    pub fn new(reader: R) -> Self {
-        Self {
-            reader: BufReader::new(reader),
-            debug: false,
-        }
-    }
-
     pub fn with_debug(reader: R, debug: bool) -> Self {
         Self {
             reader: BufReader::new(reader),
@@ -92,13 +85,6 @@ pub struct LspFrameWriter<W> {
 }
 
 impl<W: AsyncWrite + Unpin> LspFrameWriter<W> {
-    pub fn new(writer: W) -> Self {
-        Self {
-            writer,
-            debug: false,
-        }
-    }
-
     pub fn with_debug(writer: W, debug: bool) -> Self {
         Self { writer, debug }
     }
@@ -131,8 +117,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_message() {
-        let input = b"Content-Length: 52\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}";
-        let mut reader = LspFrameReader::new(&input[..]);
+        let input = b"Content-Length: 46\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}";
+        let mut reader = LspFrameReader::with_debug(&input[..], false);
         let msg = reader.read_message().await.unwrap();
         assert_eq!(msg.method_name(), Some("initialize"));
         assert!(msg.is_request());
@@ -141,7 +127,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_message() {
         let mut output = Vec::new();
-        let mut writer = LspFrameWriter::new(&mut output);
+        let mut writer = LspFrameWriter::with_debug(&mut output, false);
         let msg = RpcMessage {
             jsonrpc: "2.0".to_string(),
             id: Some(crate::message::RpcId::Number(1)),

@@ -17,7 +17,7 @@ pub struct RpcMessage {
     pub error: Option<RpcError>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(untagged)]
 pub enum RpcId {
     Number(i64),

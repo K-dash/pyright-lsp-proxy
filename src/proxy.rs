@@ -66,12 +66,22 @@ impl LspProxy {
                         self.state.client_initialize = Some(msg.clone());
                     }
 
+                    // クライアントからのリクエスト ID を追跡
+                    if msg.is_request() {
+                        if let Some(id) = &msg.id {
+                            self.state.pending_requests.insert(id.clone());
+                        }
+                    }
+
                     // textDocument/didOpen の場合は .venv 探索 & 切替判定
                     if method == Some("textDocument/didOpen") {
                         didopen_count += 1;
 
                         // Phase 3b-2: 切替が必要なら backend 再起動
-                        if let Some(new_backend) = self.handle_did_open(&msg, didopen_count, &mut backend).await? {
+                        if let Some(new_backend) = self
+                            .handle_did_open(&msg, didopen_count, &mut backend, &mut client_writer)
+                            .await?
+                        {
                             tracing::info!(session = self.state.backend_session, "Backend switched successfully");
                             backend = new_backend;
                             continue; // didOpen は再起動時に再送済みなのでスキップ
@@ -81,6 +91,11 @@ impl LspProxy {
                     // textDocument/didChange の場合は text を更新（Phase 3b-2）
                     if method == Some("textDocument/didChange") {
                         self.handle_did_change(&msg).await?;
+                    }
+
+                    // textDocument/didClose の場合はキャッシュから削除
+                    if method == Some("textDocument/didClose") {
+                        self.handle_did_close(&msg).await?;
                     }
 
                     // backend に転送
@@ -95,6 +110,13 @@ impl LspProxy {
                         is_notification = msg.is_notification(),
                         "Backend -> Proxy"
                     );
+
+                    // backend からのレスポンスで pending を解決
+                    if msg.is_response() {
+                        if let Some(id) = &msg.id {
+                            self.state.pending_requests.remove(id);
+                        }
+                    }
 
                     // クライアントに転送
                     client_writer.write_message(&msg).await?;
@@ -111,6 +133,7 @@ impl LspProxy {
         msg: &crate::message::RpcMessage,
         count: usize,
         backend: &mut PyrightBackend,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
     ) -> Result<Option<PyrightBackend>, ProxyError> {
         // params から URI と text を抽出
         if let Some(params) = &msg.params {
@@ -150,7 +173,6 @@ impl LspProxy {
                                 // Phase 3b-2: didOpen をキャッシュ
                                 if let Some(text_content) = &text {
                                     let doc = crate::state::OpenDocument {
-                                        uri: url.clone(),
                                         language_id: language_id.clone(),
                                         version,
                                         text: text_content.clone(),
@@ -180,7 +202,9 @@ impl LspProxy {
                                         );
 
                                         // backend 再起動 & 切替
-                                        let new_backend = self.restart_backend_with_venv(backend, venv).await?;
+                                        let new_backend = self
+                                            .restart_backend_with_venv(backend, venv, client_writer)
+                                            .await?;
 
                                         return Ok(Some(new_backend));
                                     } else {
@@ -210,6 +234,7 @@ impl LspProxy {
         &mut self,
         backend: &mut PyrightBackend,
         new_venv: &std::path::PathBuf,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
     ) -> Result<PyrightBackend, ProxyError> {
         self.state.backend_session += 1;
         let session = self.state.backend_session;
@@ -220,8 +245,10 @@ impl LspProxy {
             "Starting backend restart sequence"
         );
 
+        // 0. 未解決リクエストへ RequestCancelled を返す
+        self.cancel_pending_requests(client_writer).await?;
+
         // 1. 既存 backend を shutdown
-        self.state.switching = true;
         if let Err(e) = backend.shutdown_gracefully().await {
             tracing::error!(error = ?e, "Failed to shutdown backend gracefully");
             // エラーでも続行（新 backend 起動を試みる）
@@ -414,7 +441,6 @@ impl LspProxy {
 
         // 7. 状態更新
         self.state.active_venv = Some(new_venv.clone());
-        self.state.switching = false;
 
         tracing::info!(
             session = session,
@@ -423,6 +449,34 @@ impl LspProxy {
         );
 
         Ok(new_backend)
+    }
+
+    /// 未解決リクエストに RequestCancelled を返す
+    async fn cancel_pending_requests(
+        &mut self,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+    ) -> Result<(), ProxyError> {
+        const REQUEST_CANCELLED: i64 = -32800;
+        let pending: Vec<_> = self.state.pending_requests.drain().collect();
+
+        for id in pending {
+            let msg = crate::message::RpcMessage {
+                jsonrpc: "2.0".to_string(),
+                id: Some(id),
+                method: None,
+                params: None,
+                result: None,
+                error: Some(crate::message::RpcError {
+                    code: REQUEST_CANCELLED,
+                    message: "Request cancelled".to_string(),
+                    data: None,
+                }),
+            };
+
+            client_writer.write_message(&msg).await?;
+        }
+
+        Ok(())
     }
 
     /// didChange 処理（Phase 3b-2）
@@ -440,7 +494,7 @@ impl LspProxy {
                             .and_then(|v| v.as_i64())
                             .map(|v| v as i32);
 
-                        // contentChanges から text を取得（full sync 前提）
+                        // contentChanges から text を取得
                         if let Some(content_changes) = params.get("contentChanges") {
                             if let Some(changes_array) = content_changes.as_array() {
                                 // empty contentChanges チェック
@@ -452,31 +506,48 @@ impl LspProxy {
                                     return Ok(());
                                 }
 
-                                // full sync の場合、最後の change に全文がある
-                                if let Some(last_change) = changes_array.last() {
-                                    if let Some(new_text) = last_change.get("text").and_then(|t| t.as_str()) {
-                                        // ドキュメントが存在する場合のみ更新
-                                        if let Some(doc) = self.state.open_documents.get_mut(&url) {
-                                            doc.text = new_text.to_string();
-
-                                            // LSP の version を採用
-                                            if let Some(v) = version {
-                                                doc.version = v;
+                                // ドキュメントが存在する場合のみ更新
+                                if let Some(doc) = self.state.open_documents.get_mut(&url) {
+                                    // 各変更を順番に適用
+                                    for change in changes_array {
+                                        if let Some(range) = change.get("range") {
+                                            // Incremental sync: range を使って部分更新
+                                            if let Some(new_text) = change.get("text").and_then(|t| t.as_str()) {
+                                                Self::apply_incremental_change(&mut doc.text, range, new_text)?;
+                                                tracing::debug!(
+                                                    uri = %url,
+                                                    "Applied incremental change"
+                                                );
                                             }
-
-                                            tracing::debug!(
-                                                uri = %url,
-                                                version = doc.version,
-                                                text_len = new_text.len(),
-                                                "Document text updated"
-                                            );
                                         } else {
-                                            tracing::warn!(
-                                                uri = %url,
-                                                "didChange for unopened document, ignoring"
-                                            );
+                                            // Full sync: 全文置換
+                                            if let Some(new_text) = change.get("text").and_then(|t| t.as_str()) {
+                                                doc.text = new_text.to_string();
+                                                tracing::debug!(
+                                                    uri = %url,
+                                                    text_len = new_text.len(),
+                                                    "Applied full sync change"
+                                                );
+                                            }
                                         }
                                     }
+
+                                    // LSP の version を採用
+                                    if let Some(v) = version {
+                                        doc.version = v;
+                                    }
+
+                                    tracing::debug!(
+                                        uri = %url,
+                                        version = doc.version,
+                                        text_len = doc.text.len(),
+                                        "Document text updated"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        uri = %url,
+                                        "didChange for unopened document, ignoring"
+                                    );
                                 }
                             }
                         }
@@ -486,5 +557,322 @@ impl LspProxy {
         }
 
         Ok(())
+    }
+
+    /// didClose 処理：キャッシュからドキュメントを削除
+    async fn handle_did_close(
+        &mut self,
+        msg: &crate::message::RpcMessage,
+    ) -> Result<(), ProxyError> {
+        if let Some(params) = &msg.params {
+            if let Some(text_document) = params.get("textDocument") {
+                if let Some(uri_str) = text_document.get("uri").and_then(|u| u.as_str()) {
+                    if let Ok(url) = url::Url::parse(uri_str) {
+                        if self.state.open_documents.remove(&url).is_some() {
+                            tracing::debug!(
+                                uri = %url,
+                                remaining_docs = self.state.open_documents.len(),
+                                "Document removed from cache"
+                            );
+                        } else {
+                            tracing::warn!(
+                                uri = %url,
+                                "didClose for unknown document"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Incremental change を適用（range ベースの部分置換）
+    fn apply_incremental_change(
+        text: &mut String,
+        range: &serde_json::Value,
+        new_text: &str,
+    ) -> Result<(), ProxyError> {
+        // range から start/end を取得
+        let start = range.get("start").ok_or_else(|| {
+            ProxyError::InvalidMessage("didChange range missing start".to_string())
+        })?;
+        let end = range.get("end").ok_or_else(|| {
+            ProxyError::InvalidMessage("didChange range missing end".to_string())
+        })?;
+
+        let start_line = start.get("line").and_then(|l| l.as_u64()).ok_or_else(|| {
+            ProxyError::InvalidMessage("didChange start missing line".to_string())
+        })? as usize;
+        let start_char = start.get("character").and_then(|c| c.as_u64()).ok_or_else(|| {
+            ProxyError::InvalidMessage("didChange start missing character".to_string())
+        })? as usize;
+
+        let end_line = end.get("line").and_then(|l| l.as_u64()).ok_or_else(|| {
+            ProxyError::InvalidMessage("didChange end missing line".to_string())
+        })? as usize;
+        let end_char = end.get("character").and_then(|c| c.as_u64()).ok_or_else(|| {
+            ProxyError::InvalidMessage("didChange end missing character".to_string())
+        })? as usize;
+
+        // line/character を byte offset に変換
+        let start_offset = Self::position_to_offset(text, start_line, start_char)?;
+        let end_offset = Self::position_to_offset(text, end_line, end_char)?;
+
+        // 範囲の検証（start > end は不正）
+        if start_offset > end_offset {
+            return Err(ProxyError::InvalidMessage(format!(
+                "Invalid range: start offset ({}) > end offset ({})",
+                start_offset, end_offset
+            )));
+        }
+
+        // 範囲を置換
+        text.replace_range(start_offset..end_offset, new_text);
+
+        Ok(())
+    }
+
+    /// LSP position (line, character) を byte offset に変換
+    /// LSP の character は UTF-16 code unit 数
+    fn position_to_offset(
+        text: &str,
+        line: usize,
+        character: usize,
+    ) -> Result<usize, ProxyError> {
+        let mut current_line = 0;
+        let mut line_start_offset = 0;
+
+        for (idx, ch) in text.char_indices() {
+            if ch == '\n' {
+                if current_line == line {
+                    // 目的の行の終端に到達（改行文字の前）
+                    return Self::find_offset_in_line(text, line_start_offset, idx, character);
+                }
+                current_line += 1;
+                line_start_offset = idx + 1;
+            }
+        }
+
+        // 最終行（改行で終わらない場合）または空テキストの最初の行
+        if current_line == line {
+            return Self::find_offset_in_line(text, line_start_offset, text.len(), character);
+        }
+
+        // 行番号が範囲外
+        Err(ProxyError::InvalidMessage(format!(
+            "Position out of range: line={} (max={}), character={}",
+            line, current_line, character
+        )))
+    }
+
+    /// 行内で UTF-16 code unit をカウントして byte offset を返す
+    /// character が行長を超える場合は行末に clamp
+    fn find_offset_in_line(
+        text: &str,
+        line_start: usize,
+        line_end: usize,
+        character: usize,
+    ) -> Result<usize, ProxyError> {
+        let line_text = &text[line_start..line_end];
+        let mut utf16_offset = 0;
+
+        for (idx, ch) in line_text.char_indices() {
+            if utf16_offset >= character {
+                return Ok(line_start + idx);
+            }
+            utf16_offset += ch.len_utf16();
+        }
+
+        // character が行長を超える場合は行末に clamp
+        Ok(line_end)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_position_to_offset_simple() {
+        let text = "hello\nworld\n";
+
+        // line 0, char 0 -> offset 0
+        assert_eq!(LspProxy::position_to_offset(text, 0, 0).unwrap(), 0);
+
+        // line 0, char 5 -> offset 5 (end of "hello")
+        assert_eq!(LspProxy::position_to_offset(text, 0, 5).unwrap(), 5);
+
+        // line 1, char 0 -> offset 6 (start of "world")
+        assert_eq!(LspProxy::position_to_offset(text, 1, 0).unwrap(), 6);
+
+        // line 1, char 5 -> offset 11 (end of "world")
+        assert_eq!(LspProxy::position_to_offset(text, 1, 5).unwrap(), 11);
+    }
+
+    #[test]
+    fn test_position_to_offset_multibyte() {
+        // マルチバイト文字を含むテキスト
+        let text = "こんにちは\nworld\n";
+
+        // line 0, char 0 -> offset 0
+        assert_eq!(LspProxy::position_to_offset(text, 0, 0).unwrap(), 0);
+
+        // line 0, char 1 -> offset 3 (after "こ")
+        assert_eq!(LspProxy::position_to_offset(text, 0, 1).unwrap(), 3);
+
+        // line 1, char 0 -> offset 16 (start of "world", after "こんにちは\n")
+        assert_eq!(LspProxy::position_to_offset(text, 1, 0).unwrap(), 16);
+    }
+
+    #[test]
+    fn test_apply_incremental_change_simple_replace() {
+        let mut text = "hello world".to_string();
+        let range = json!({
+            "start": { "line": 0, "character": 0 },
+            "end": { "line": 0, "character": 5 }
+        });
+
+        LspProxy::apply_incremental_change(&mut text, &range, "hi").unwrap();
+        assert_eq!(text, "hi world");
+    }
+
+    #[test]
+    fn test_apply_incremental_change_insert() {
+        let mut text = "hello world".to_string();
+        let range = json!({
+            "start": { "line": 0, "character": 5 },
+            "end": { "line": 0, "character": 5 }
+        });
+
+        // 挿入（range が空）
+        LspProxy::apply_incremental_change(&mut text, &range, " beautiful").unwrap();
+        assert_eq!(text, "hello beautiful world");
+    }
+
+    #[test]
+    fn test_apply_incremental_change_delete() {
+        let mut text = "hello beautiful world".to_string();
+        let range = json!({
+            "start": { "line": 0, "character": 5 },
+            "end": { "line": 0, "character": 15 }
+        });
+
+        // 削除（new_text が空）
+        LspProxy::apply_incremental_change(&mut text, &range, "").unwrap();
+        assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn test_apply_incremental_change_multiline() {
+        let mut text = "def hello():\n    print('hello')\n".to_string();
+        let range = json!({
+            "start": { "line": 1, "character": 11 },
+            "end": { "line": 1, "character": 16 }
+        });
+
+        // "hello" を "world" に置換
+        LspProxy::apply_incremental_change(&mut text, &range, "world").unwrap();
+        assert_eq!(text, "def hello():\n    print('world')\n");
+    }
+
+    #[test]
+    fn test_apply_incremental_change_cross_line() {
+        let mut text = "line1\nline2\nline3\n".to_string();
+        let range = json!({
+            "start": { "line": 0, "character": 5 },
+            "end": { "line": 2, "character": 0 }
+        });
+
+        // 複数行にまたがる削除
+        LspProxy::apply_incremental_change(&mut text, &range, "").unwrap();
+        assert_eq!(text, "line1line3\n");
+    }
+
+    #[test]
+    fn test_position_to_offset_surrogate_pair() {
+        // サロゲートペア（絵文字）を含むテキスト
+        // 😀 は U+1F600 で UTF-16 では 2 code units (サロゲートペア)
+        // UTF-8 では 4 bytes
+        let text = "a😀b\n";
+
+        // line 0, char 0 -> offset 0 (before 'a')
+        assert_eq!(LspProxy::position_to_offset(text, 0, 0).unwrap(), 0);
+
+        // line 0, char 1 -> offset 1 (before '😀')
+        assert_eq!(LspProxy::position_to_offset(text, 0, 1).unwrap(), 1);
+
+        // line 0, char 3 -> offset 5 (before 'b', 😀 は UTF-16 で 2 code units)
+        assert_eq!(LspProxy::position_to_offset(text, 0, 3).unwrap(), 5);
+
+        // line 0, char 4 -> offset 6 (before '\n')
+        assert_eq!(LspProxy::position_to_offset(text, 0, 4).unwrap(), 6);
+    }
+
+    #[test]
+    fn test_position_to_offset_line_end_clamp() {
+        // 行末を超える character は行末に clamp される
+        let text = "abc\ndef\n";
+
+        // line 0, char 100 -> offset 3 (行末に clamp)
+        assert_eq!(LspProxy::position_to_offset(text, 0, 100).unwrap(), 3);
+
+        // line 1, char 100 -> offset 7 (行末に clamp)
+        assert_eq!(LspProxy::position_to_offset(text, 1, 100).unwrap(), 7);
+    }
+
+    #[test]
+    fn test_position_to_offset_line_out_of_range() {
+        let text = "abc\ndef\n";
+
+        // line 10 は範囲外
+        let result = LspProxy::position_to_offset(text, 10, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_apply_incremental_change_invalid_range() {
+        // start > end の不正な範囲
+        let mut text = "hello world".to_string();
+        let range = json!({
+            "start": { "line": 0, "character": 10 },
+            "end": { "line": 0, "character": 5 }
+        });
+
+        let result = LspProxy::apply_incremental_change(&mut text, &range, "test");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_apply_incremental_change_with_emoji() {
+        // 絵文字を含むテキストの編集
+        let mut text = "hello 😀 world".to_string();
+        // "😀 " を削除 (position 6 から 9: 😀 は UTF-16 で 2 code units + space 1)
+        let range = json!({
+            "start": { "line": 0, "character": 6 },
+            "end": { "line": 0, "character": 9 }
+        });
+
+        LspProxy::apply_incremental_change(&mut text, &range, "").unwrap();
+        assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn test_position_to_offset_empty_text() {
+        let text = "";
+
+        // 空テキストでも line 0, char 0 は有効
+        assert_eq!(LspProxy::position_to_offset(text, 0, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_position_to_offset_no_trailing_newline() {
+        // 末尾に改行がないテキスト
+        let text = "abc";
+
+        assert_eq!(LspProxy::position_to_offset(text, 0, 0).unwrap(), 0);
+        assert_eq!(LspProxy::position_to_offset(text, 0, 3).unwrap(), 3);
     }
 }
