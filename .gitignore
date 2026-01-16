@@ -25,3 +25,6 @@ tmp/
 
 # Plugin binary directory (downloaded by install.sh)
 bin/
+
+# Local plugin development configuration
+plugins/
