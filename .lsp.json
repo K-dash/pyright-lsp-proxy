@@ -2,9 +2,6 @@
   "pyright-lsp-proxy": {
     "command": "${CLAUDE_PLUGIN_ROOT}/bin/pyright-lsp-proxy",
     "args": [],
-    "env": {
-      "PYRIGHT_LSP_PROXY_LOG_FILE": "${PYRIGHT_LSP_PROXY_LOG_FILE:-}"
-    },
     "extensionToLanguage": {
       ".py": "python",
       ".pyi": "python"
