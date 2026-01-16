@@ -22,3 +22,6 @@ target
 
 .DS_Store
 tmp/
+
+# Plugin binary directory (downloaded by install.sh)
+bin/

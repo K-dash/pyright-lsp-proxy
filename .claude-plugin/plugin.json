@@ -1,0 +1,23 @@
+{
+  "name": "pyright-lsp-proxy",
+  "version": "0.1.0",
+  "description": "Pyright LSP proxy for monorepo with automatic .venv switching",
+  "author": {
+    "name": "K-dash"
+  },
+  "homepage": "https://github.com/K-dash/pyright-lsp-proxy",
+  "repository": "https://github.com/K-dash/pyright-lsp-proxy",
+  "license": "MIT",
+  "keywords": ["lsp", "pyright", "proxy", "rust", "monorepo", "python"],
+  "hooks": "./hooks.json",
+  "lspServers": {
+    "pyright-lsp-proxy": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/pyright-lsp-proxy",
+      "args": [],
+      "extensionToLanguage": {
+        ".py": "python",
+        ".pyi": "python"
+      }
+    }
+  }
+}
