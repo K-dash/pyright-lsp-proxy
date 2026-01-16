@@ -8,53 +8,80 @@ mod venv;
 
 use clap::Parser;
 use proxy::LspProxy;
+use std::path::PathBuf;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Enable debug protocol logging (dumps JSON-RPC messages to stderr)
-    #[arg(long)]
-    debug_protocol: bool,
+    /// Optional path to log file (default: stderr only)
+    /// Can also be set via PYRIGHT_LSP_PROXY_LOG_FILE environment variable
+    #[arg(long, env = "PYRIGHT_LSP_PROXY_LOG_FILE")]
+    log_file: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // ログファイルの設定（日次ローテーション）
-    let log_dir = "/tmp";
-    let log_file_prefix = "pyright-lsp-proxy";
+    // ログ初期化（デフォルトは stderr、--log-file でファイル出力を追加）
+    if let Some(log_path) = &args.log_file {
+        // ファイル出力が指定された場合：stderr + ファイル
+        let file_appender = RollingFileAppender::new(
+            Rotation::NEVER,
+            log_path.parent().unwrap_or(std::path::Path::new(".")),
+            log_path
+                .file_name()
+                .unwrap_or(std::ffi::OsStr::new("pyright-lsp-proxy.log")),
+        );
 
-    // RollingFileAppender を使用してログファイルを作成
-    // Rotation::NEVER で日次ローテーションなし（単一ファイル）
-    let file_appender = RollingFileAppender::new(Rotation::NEVER, log_dir, log_file_prefix);
+        tracing_subscriber::registry()
+            .with(
+                fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_ansi(false)
+                    .with_target(true)
+                    .with_thread_ids(true),
+            )
+            .with(
+                fmt::layer()
+                    .with_writer(file_appender)
+                    .with_ansi(false)
+                    .with_target(true)
+                    .with_thread_ids(true),
+            )
+            .with(
+                EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new("pyright_lsp_proxy=debug")),
+            )
+            .init();
 
-    // tracing 初期化（ファイルに出力）
-    tracing_subscriber::registry()
-        .with(
-            fmt::layer()
-                .with_writer(file_appender)
-                .with_ansi(false) // ファイル出力なのでANSIカラーコードを無効化
-                .with_target(true) // モジュール名を表示
-                .with_thread_ids(true), // スレッドIDを表示
-        )
-        .with(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("pyright_lsp_proxy=debug")),
-        )
-        .init();
+        tracing::info!(
+            log_file = %log_path.display(),
+            "Starting pyright-lsp-proxy (logging to stderr and file)"
+        );
+    } else {
+        // デフォルト：stderr のみ
+        tracing_subscriber::registry()
+            .with(
+                fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_ansi(false)
+                    .with_target(true)
+                    .with_thread_ids(true),
+            )
+            .with(
+                EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new("pyright_lsp_proxy=debug")),
+            )
+            .init();
 
-    tracing::info!(
-        debug_protocol = args.debug_protocol,
-        log_dir = log_dir,
-        log_file = format!("{}/{}", log_dir, log_file_prefix),
-        "Starting pyright-lsp-proxy"
-    );
+        tracing::info!("Starting pyright-lsp-proxy (logging to stderr only)");
+    }
 
     // プロキシを起動
-    let mut proxy = LspProxy::new(args.debug_protocol);
+    let mut proxy = LspProxy::new();
     proxy.run().await?;
 
     Ok(())

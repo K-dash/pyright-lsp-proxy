@@ -11,6 +11,13 @@ pub struct LspFrameReader<R> {
 }
 
 impl<R: AsyncRead + Unpin> LspFrameReader<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader: BufReader::new(reader),
+            debug: false,
+        }
+    }
+
     pub fn with_debug(reader: R, debug: bool) -> Self {
         Self {
             reader: BufReader::new(reader),
@@ -81,6 +88,13 @@ pub struct LspFrameWriter<W> {
 }
 
 impl<W: AsyncWrite + Unpin> LspFrameWriter<W> {
+    pub fn new(writer: W) -> Self {
+        Self {
+            writer,
+            debug: false,
+        }
+    }
+
     pub fn with_debug(writer: W, debug: bool) -> Self {
         Self { writer, debug }
     }

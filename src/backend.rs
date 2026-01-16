@@ -17,7 +17,7 @@ impl PyrightBackend {
     /// pyright-langserver を起動
     ///
     /// venv_path が Some の場合、VIRTUAL_ENV と PATH を設定
-    pub async fn spawn(venv_path: Option<&Path>, debug: bool) -> Result<Self, BackendError> {
+    pub async fn spawn(venv_path: Option<&Path>) -> Result<Self, BackendError> {
         let mut cmd = Command::new("pyright-langserver");
         cmd.arg("--stdio")
             .stdin(Stdio::piped())
@@ -51,8 +51,8 @@ impl PyrightBackend {
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
 
-        let reader = LspFrameReader::with_debug(stdout, debug);
-        let writer = LspFrameWriter::with_debug(stdin, debug);
+        let reader = LspFrameReader::new(stdout);
+        let writer = LspFrameWriter::new(stdin);
 
         Ok(Self {
             child,

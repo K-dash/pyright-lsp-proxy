@@ -7,22 +7,20 @@ use tokio::io::{stdin, stdout};
 
 pub struct LspProxy {
     state: ProxyState,
-    debug: bool,
 }
 
 impl LspProxy {
-    pub fn new(debug: bool) -> Self {
+    pub fn new() -> Self {
         Self {
             state: ProxyState::new(),
-            debug,
         }
     }
 
     /// メインループ（Phase 3a: fallback env で即座に起動）
     pub async fn run(&mut self) -> Result<(), ProxyError> {
         // stdin/stdout のフレームリーダー/ライター
-        let mut client_reader = LspFrameReader::with_debug(stdin(), self.debug);
-        let mut client_writer = LspFrameWriter::with_debug(stdout(), self.debug);
+        let mut client_reader = LspFrameReader::new(stdin());
+        let mut client_writer = LspFrameWriter::new(stdout());
 
         // 起動時 cwd を取得
         let cwd = std::env::current_dir()?;
@@ -42,7 +40,7 @@ impl LspProxy {
         }
 
         // backend を起動（fallback env で、なければ venv なし）
-        let mut backend = PyrightBackend::spawn(fallback_venv.as_deref(), self.debug).await?;
+        let mut backend = PyrightBackend::spawn(fallback_venv.as_deref()).await?;
 
         let mut didopen_count = 0;
 
@@ -255,7 +253,7 @@ impl LspProxy {
 
         // 2. 新しい backend を起動
         tracing::info!(session = session, venv = %new_venv.display(), "Spawning new backend");
-        let mut new_backend = PyrightBackend::spawn(Some(new_venv), self.debug).await?;
+        let mut new_backend = PyrightBackend::spawn(Some(new_venv)).await?;
 
         // 3. backend に initialize を送る（プロキシが backend クライアントになる）
         let init_params = self
