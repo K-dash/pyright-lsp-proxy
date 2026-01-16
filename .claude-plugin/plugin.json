@@ -9,7 +9,7 @@
   "repository": "https://github.com/K-dash/pyright-lsp-proxy",
   "license": "MIT",
   "keywords": ["lsp", "pyright", "proxy", "rust", "monorepo", "python"],
-  "hooks": "../hooks.json",
+  "hooks": "./hooks.json",
   "lspServers": {
     "pyright-lsp-proxy": {
       "command": "${CLAUDE_PLUGIN_ROOT}/bin/pyright-lsp-proxy",
