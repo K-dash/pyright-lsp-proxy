@@ -1,7 +1,14 @@
-use crate::message::RpcMessage;
-use std::collections::{HashMap, HashSet};
+use crate::message::{RpcId, RpcMessage};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use url::Url;
+
+/// 未解決リクエストの情報
+#[derive(Debug, Clone)]
+pub struct PendingRequest {
+    /// このリクエストが送られた backend の session
+    pub backend_session: u64,
+}
 
 /// 開いているドキュメント（Phase 3b-2）
 #[derive(Debug, Clone)]
@@ -26,8 +33,8 @@ pub struct ProxyState {
     /// backend 再起動の世代（ログと競合回避用）
     pub backend_session: u64,
 
-    /// 未解決リクエストの ID（再起動時のキャンセル通知用）
-    pub pending_requests: HashSet<crate::message::RpcId>,
+    /// 未解決リクエスト（世代付き）
+    pub pending_requests: HashMap<RpcId, PendingRequest>,
 }
 
 impl ProxyState {
@@ -37,7 +44,7 @@ impl ProxyState {
             client_initialize: None,
             open_documents: HashMap::new(),
             backend_session: 0,
-            pending_requests: HashSet::new(),
+            pending_requests: HashMap::new(),
         }
     }
 }

@@ -1,6 +1,6 @@
 {
   "name": "pyright-lsp-proxy",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Pyright LSP proxy for monorepo with automatic .venv switching",
   "author": {
     "name": "K-dash"

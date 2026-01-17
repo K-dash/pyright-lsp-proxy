@@ -28,6 +28,9 @@ bin/pyright-lsp-proxy
 bin/pyright-lsp-proxy-macos-arm64
 bin/pyright-lsp-proxy-linux-x86_64
 
+# Claude plugin binaries (local build)
+.claude-plugin/bin/
+
 # Local plugin development configuration
 plugins/
 README.md

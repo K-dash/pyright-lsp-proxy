@@ -41,6 +41,7 @@ impl LspProxy {
             BackendState::Running {
                 backend: Box::new(backend),
                 active_venv: venv,
+                session: self.state.backend_session,
             }
         } else {
             tracing::warn!("No fallback .venv found, starting in Disabled mode (strict venv)");
@@ -98,13 +99,6 @@ impl LspProxy {
                         continue;
                     }
 
-                    // クライアントからのリクエスト ID を追跡
-                    if msg.is_request() {
-                        if let Some(id) = &msg.id {
-                            self.state.pending_requests.insert(id.clone());
-                        }
-                    }
-
                     // 1. didOpen は常に処理（復活トリガー）
                     if method == Some("textDocument/didOpen") {
                         didopen_count += 1;
@@ -122,7 +116,7 @@ impl LspProxy {
                         if is_disabled { continue; }  // Disabled時はbackendに送らない
                     }
 
-                    // 3. Request-based venv 切り替え（Disabled 時も実行）
+                    // 3. Request 処理（透過リトライ対応）
                     const VENV_CHECK_METHODS: &[&str] = &[
                         "textDocument/hover",
                         "textDocument/definition",
@@ -132,53 +126,68 @@ impl LspProxy {
                         "textDocument/implementation",
                     ];
 
-                    if let Some(m) = method {
-                        if VENV_CHECK_METHODS.contains(&m) {
-                            if let Some(url) = Self::extract_text_document_uri(&msg) {
-                                if let Ok(file_path) = url.to_file_path() {
-                                    // キャッシュから venv を取得（O(1)）
-                                    let target_venv = if let Some(doc) =
-                                        self.state.open_documents.get(&url)
-                                    {
-                                        doc.venv.clone()
+                    if msg.is_request() {
+                        let m = method;
+
+                        // VENV_CHECK_METHODS なら ensure_backend_for_uri を通す
+                        if let Some(method_name) = m {
+                            if VENV_CHECK_METHODS.contains(&method_name) {
+                                if let Some(url) = Self::extract_text_document_uri(&msg) {
+                                    if let Ok(file_path) = url.to_file_path() {
+                                        let old_session = backend_state.session();
+
+                                        let switched = self
+                                            .ensure_backend_for_uri(
+                                                &mut backend_state,
+                                                &mut client_writer,
+                                                &url,
+                                                &file_path,
+                                            )
+                                            .await?;
+
+                                        if switched {
+                                            tracing::info!(
+                                                method = method_name,
+                                                uri = %url,
+                                                from_session = ?old_session,
+                                                to_session = ?backend_state.session(),
+                                                "Venv switched, request will be sent to new backend"
+                                            );
+                                        }
                                     } else {
-                                        // didOpen が来ていない URI → 探索（例外経路）
-                                        tracing::debug!(uri = %url, "URI not in cache, searching venv");
-                                        venv::find_venv(
-                                            &file_path,
-                                            self.state.git_toplevel.as_deref(),
-                                        )
-                                        .await?
-                                    };
-
-                                    // 共通関数で状態遷移
-                                    let switched = self
-                                        .transition_backend_state(
-                                            &mut backend_state,
-                                            &mut client_writer,
-                                            target_venv.as_deref(),
-                                            &file_path,
-                                        )
-                                        .await?;
-
-                                    // ★ 切り替えが発生したら RequestCancelled で返す
-                                    if switched && msg.is_request() {
-                                        tracing::info!(
-                                            method = m,
+                                        // URI 抽出成功したが file_path 変換失敗
+                                        tracing::debug!(
+                                            method = method_name,
                                             uri = %url,
-                                            "Request cancelled due to venv switch"
+                                            "Skipping venv check: could not convert URI to file path"
                                         );
-                                        let cancel_response =
-                                            Self::create_request_cancelled_response(&msg);
-                                        client_writer.write_message(&cancel_response).await?;
-                                        continue;
                                     }
+                                } else {
+                                    // URI 抽出失敗 → 切替チェックをスキップ
+                                    tracing::debug!(
+                                        method = method_name,
+                                        "Skipping venv check: could not extract textDocument.uri"
+                                    );
                                 }
+                            }
+                        }
+
+                        // pending に登録（現在の backend session を記録）
+                        if let Some(id) = &msg.id {
+                            if let Some(session) = backend_state.session() {
+                                self.state.pending_requests.insert(
+                                    id.clone(),
+                                    crate::state::PendingRequest {
+                                        backend_session: session,
+                                    },
+                                );
                             }
                         }
                     }
 
                     // 4. Disabled 時はリクエストにエラーを返す（VENV_CHECK_METHODS 以外）
+                    // ★ ensure_backend_for_uri() で状態が変わった可能性があるので再取得
+                    let is_disabled = backend_state.is_disabled();
                     if is_disabled && msg.is_request() {
                         let error_message = "pyright-lsp-proxy: .venv not found (strict mode). Create .venv or run hooks.";
                         if let Some((reason, last_file)) = backend_state.disabled_info() {
@@ -196,7 +205,14 @@ impl LspProxy {
                     }
 
                     // 5. Running 時は backend に転送
-                    if let BackendState::Running { backend, .. } = &mut backend_state {
+                    if let BackendState::Running { backend, session, .. } = &mut backend_state {
+                        if msg.is_request() {
+                            tracing::debug!(
+                                session = *session,
+                                method = msg.method.as_deref(),
+                                "Sending request to backend"
+                            );
+                        }
                         backend.send_message(&msg).await?;
                     }
                 }
@@ -209,15 +225,31 @@ impl LspProxy {
                     }
                 } => {
                     let msg = result?;
+                    let running_session = backend_state.session();
+
                     tracing::debug!(
                         is_response = msg.is_response(),
                         is_notification = msg.is_notification(),
                         "Backend -> Proxy"
                     );
 
-                    // backend からのレスポンスで pending を解決
+                    // backend からのレスポンスで pending を解決 + 世代チェック
                     if msg.is_response() {
                         if let Some(id) = &msg.id {
+                            // pending から取得して世代チェック
+                            if let Some(pending) = self.state.pending_requests.get(id) {
+                                if Some(pending.backend_session) != running_session {
+                                    // 古い世代からの response → 破棄
+                                    tracing::warn!(
+                                        id = ?id,
+                                        pending_session = pending.backend_session,
+                                        running_session = ?running_session,
+                                        "Discarding stale response from old backend session"
+                                    );
+                                    self.state.pending_requests.remove(id);
+                                    continue;
+                                }
+                            }
                             self.state.pending_requests.remove(id);
                         }
                     }
@@ -237,20 +269,32 @@ impl LspProxy {
         url::Url::parse(uri_str).ok()
     }
 
-    /// RequestCancelled レスポンスを生成
-    fn create_request_cancelled_response(msg: &RpcMessage) -> RpcMessage {
-        RpcMessage {
-            jsonrpc: "2.0".to_string(),
-            id: msg.id.clone(),
-            method: None,
-            params: None,
-            result: None,
-            error: Some(crate::message::RpcError {
-                code: -32800,
-                message: "Request cancelled due to venv switch".to_string(),
-                data: None,
-            }),
-        }
+    /// URI に基づいて適切な backend を確保する
+    /// 戻り値: 切り替えが発生したか
+    async fn ensure_backend_for_uri(
+        &mut self,
+        backend_state: &mut BackendState,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+        url: &url::Url,
+        file_path: &std::path::Path,
+    ) -> Result<bool, ProxyError> {
+        // キャッシュから venv を取得（O(1)）
+        let target_venv = if let Some(doc) = self.state.open_documents.get(url) {
+            doc.venv.clone()
+        } else {
+            // didOpen が来ていない URI → 探索（例外経路）
+            tracing::debug!(uri = %url, "URI not in cache, searching venv");
+            venv::find_venv(file_path, self.state.git_toplevel.as_deref()).await?
+        };
+
+        // 共通関数で状態遷移
+        self.transition_backend_state(
+            backend_state,
+            client_writer,
+            target_venv.as_deref(),
+            file_path,
+        )
+        .await
     }
 
     /// venv に基づいて backend の状態を遷移させる
@@ -271,6 +315,8 @@ impl LspProxy {
 
             // Running + different venv → 切替
             (BackendState::Running { .. }, Some(venv)) => {
+                let old_session = backend_state.session().unwrap_or(0);
+
                 tracing::warn!(
                     current = ?backend_state.active_venv().map(|p| p.display().to_string()),
                     found = %venv.display(),
@@ -278,12 +324,17 @@ impl LspProxy {
                 );
 
                 if let BackendState::Running { backend, .. } = backend_state {
+                    // 旧 session の pending をキャンセル
+                    self.cancel_pending_requests_for_session(client_writer, old_session)
+                        .await?;
+
                     let new_backend = self
                         .restart_backend_with_venv(backend, venv, client_writer)
                         .await?;
                     *backend_state = BackendState::Running {
                         backend: Box::new(new_backend),
                         active_venv: venv.to_path_buf(),
+                        session: self.state.backend_session,
                     };
                 }
                 Ok(true)
@@ -314,6 +365,7 @@ impl LspProxy {
                 *backend_state = BackendState::Running {
                     backend: Box::new(new_backend),
                     active_venv: venv.to_path_buf(),
+                    session: self.state.backend_session,
                 };
                 Ok(true)
             }
@@ -437,9 +489,6 @@ impl LspProxy {
             new_venv = %new_venv.display(),
             "Starting backend restart sequence"
         );
-
-        // 0. 未解決リクエストへ RequestCancelled を返す
-        self.cancel_pending_requests(client_writer).await?;
 
         // 1. 既存 backend を shutdown
         if let Err(e) = backend.shutdown_gracefully().await {
@@ -1003,7 +1052,12 @@ impl LspProxy {
         client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
     ) -> Result<(), ProxyError> {
         const REQUEST_CANCELLED: i64 = -32800;
-        let pending: Vec<_> = self.state.pending_requests.drain().collect();
+        let pending: Vec<_> = self
+            .state
+            .pending_requests
+            .drain()
+            .map(|(id, _)| id)
+            .collect();
 
         for id in pending {
             let msg = crate::message::RpcMessage {
@@ -1020,6 +1074,43 @@ impl LspProxy {
             };
 
             client_writer.write_message(&msg).await?;
+        }
+
+        Ok(())
+    }
+
+    /// 指定した session の pending request をキャンセル
+    async fn cancel_pending_requests_for_session(
+        &mut self,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+        old_session: u64,
+    ) -> Result<(), ProxyError> {
+        const REQUEST_CANCELLED: i64 = -32800;
+
+        let to_cancel: Vec<_> = self
+            .state
+            .pending_requests
+            .iter()
+            .filter(|(_, p)| p.backend_session == old_session)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for id in to_cancel {
+            self.state.pending_requests.remove(&id);
+            let msg = crate::message::RpcMessage {
+                jsonrpc: "2.0".to_string(),
+                id: Some(id.clone()),
+                method: None,
+                params: None,
+                result: None,
+                error: Some(crate::message::RpcError {
+                    code: REQUEST_CANCELLED,
+                    message: "Request cancelled due to backend restart".to_string(),
+                    data: None,
+                }),
+            };
+            client_writer.write_message(&msg).await?;
+            tracing::info!(id = ?id, session = old_session, "Cancelled pending request");
         }
 
         Ok(())

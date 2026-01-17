@@ -7,6 +7,7 @@ pub enum BackendState {
     Running {
         backend: Box<PyrightBackend>,
         active_venv: PathBuf,
+        session: u64,
     },
     /// backend が無効（venv が見つからない）
     Disabled {
@@ -36,6 +37,14 @@ impl BackendState {
                 Some((reason.as_str(), last_file.as_ref()))
             }
             BackendState::Running { .. } => None,
+        }
+    }
+
+    /// Running 時の session を取得
+    pub fn session(&self) -> Option<u64> {
+        match self {
+            BackendState::Running { session, .. } => Some(*session),
+            BackendState::Disabled { .. } => None,
         }
     }
 }
