@@ -5,7 +5,7 @@ use std::path::PathBuf;
 pub enum BackendState {
     /// backend が動作中
     Running {
-        backend: PyrightBackend,
+        backend: Box<PyrightBackend>,
         active_venv: PathBuf,
     },
     /// backend が無効（venv が見つからない）

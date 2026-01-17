@@ -39,7 +39,7 @@ impl LspProxy {
             tracing::info!(venv = %venv.display(), "Using fallback .venv");
             let backend = PyrightBackend::spawn(Some(&venv)).await?;
             BackendState::Running {
-                backend,
+                backend: Box::new(backend),
                 active_venv: venv,
             }
         } else {
@@ -93,11 +93,9 @@ impl LspProxy {
                     }
 
                     // initialized notification（Disabled 時は無視）
-                    if method == Some("initialized") {
-                        if is_disabled {
-                            tracing::debug!("Disabled mode: ignoring initialized notification");
-                            continue;
-                        }
+                    if method == Some("initialized") && is_disabled {
+                        tracing::debug!("Disabled mode: ignoring initialized notification");
+                        continue;
                     }
 
                     // クライアントからのリクエスト ID を追跡
@@ -241,7 +239,7 @@ impl LspProxy {
 
                                 // 状態遷移ロジック（Strict venv mode）
                                 tracing::debug!(
-                                    is_running = backend_state.is_disabled() == false,
+                                    is_running = !backend_state.is_disabled(),
                                     is_disabled = backend_state.is_disabled(),
                                     has_venv = found_venv.is_some(),
                                     "State transition check"
@@ -272,7 +270,7 @@ impl LspProxy {
                                                 .await?;
 
                                             *backend_state = BackendState::Running {
-                                                backend: new_backend,
+                                                backend: Box::new(new_backend),
                                                 active_venv: venv.clone(),
                                             };
                                         }
@@ -309,7 +307,7 @@ impl LspProxy {
                                         let new_backend = self.spawn_and_init_backend(venv).await?;
 
                                         *backend_state = BackendState::Running {
-                                            backend: new_backend,
+                                            backend: Box::new(new_backend),
                                             active_venv: venv.clone(),
                                         };
                                     }
@@ -490,6 +488,7 @@ impl LspProxy {
         let mut restored = 0;
         let mut skipped = 0;
         let mut failed = 0;
+        let mut skipped_uris: Vec<url::Url> = Vec::new();
 
         tracing::info!(
             session = session,
@@ -507,6 +506,7 @@ impl LspProxy {
 
             if !should_restore {
                 skipped += 1;
+                skipped_uris.push(url.clone());
                 tracing::debug!(
                     session = session,
                     uri = %url,
@@ -570,6 +570,26 @@ impl LspProxy {
             "Document restoration completed"
         );
 
+        // スキップしたURIのdiagnosticsをクリア
+        if !skipped_uris.is_empty() {
+            let (ok, clear_failed) = self.clear_diagnostics_for_uris(&skipped_uris, client_writer).await;
+
+            if clear_failed == 0 {
+                tracing::info!(
+                    session = session,
+                    cleared_ok = ok,
+                    "Diagnostics cleared for skipped documents"
+                );
+            } else {
+                tracing::info!(
+                    session = session,
+                    cleared_ok = ok,
+                    cleared_failed = clear_failed,
+                    "Diagnostics clear partially failed for skipped documents"
+                );
+            }
+        }
+
         tracing::info!(
             session = session,
             venv = %new_venv.display(),
@@ -577,6 +597,43 @@ impl LspProxy {
         );
 
         Ok(new_backend)
+    }
+
+    /// 指定URIのdiagnosticsをクリア（空配列を送信）
+    /// ベストエフォート: 1件失敗しても続行
+    async fn clear_diagnostics_for_uris(
+        &self,
+        uris: &[url::Url],
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+    ) -> (usize, usize) {
+        let mut ok = 0;
+        let mut failed = 0;
+
+        for uri in uris {
+            tracing::trace!(uri = %uri, "Clearing diagnostics");
+
+            let clear_msg = RpcMessage {
+                jsonrpc: "2.0".to_string(),
+                id: None,
+                method: Some("textDocument/publishDiagnostics".to_string()),
+                params: Some(serde_json::json!({
+                    "uri": uri.to_string(),
+                    "diagnostics": []
+                })),
+                result: None,
+                error: None,
+            };
+
+            match client_writer.write_message(&clear_msg).await {
+                Ok(_) => ok += 1,
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!(uri = %uri, error = ?e, "Failed to clear diagnostics");
+                }
+            }
+        }
+
+        (ok, failed)
     }
 
     /// backend を shutdown して Disabled 状態へ（Strict venv mode）
@@ -594,6 +651,25 @@ impl LspProxy {
             file = %file_path.display(),
             "Disabling backend (no .venv found)"
         );
+
+        // open_documents の全URIへ空diagnosticsを送信（借用地雷回避: 先にclone）
+        let uris: Vec<url::Url> = self.state.open_documents.keys().cloned().collect();
+        let (ok, failed) = self.clear_diagnostics_for_uris(&uris, client_writer).await;
+
+        if failed == 0 {
+            tracing::info!(
+                session = session,
+                cleared_ok = ok,
+                "Diagnostics cleared for all open documents"
+            );
+        } else {
+            tracing::info!(
+                session = session,
+                cleared_ok = ok,
+                cleared_failed = failed,
+                "Diagnostics clear partially failed"
+            );
+        }
 
         // 未解決リクエストへ RequestCancelled を返す
         self.cancel_pending_requests(client_writer).await?;
