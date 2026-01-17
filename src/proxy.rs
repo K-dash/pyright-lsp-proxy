@@ -1,6 +1,8 @@
 use crate::backend::PyrightBackend;
+use crate::backend_state::BackendState;
 use crate::error::ProxyError;
 use crate::framing::{LspFrameReader, LspFrameWriter};
+use crate::message::RpcMessage;
 use crate::state::ProxyState;
 use crate::venv;
 use tokio::io::{stdin, stdout};
@@ -16,7 +18,7 @@ impl LspProxy {
         }
     }
 
-    /// メインループ（Phase 3a: fallback env で即座に起動）
+    /// メインループ（Phase 3a: fallback env で即座に起動、Strict venv mode）
     pub async fn run(&mut self) -> Result<(), ProxyError> {
         // stdin/stdout のフレームリーダー/ライター
         let mut client_reader = LspFrameReader::new(stdin());
@@ -32,15 +34,23 @@ impl LspProxy {
         // fallback env を探索
         let fallback_venv = venv::find_fallback_venv(&cwd).await?;
 
-        if let Some(ref venv) = fallback_venv {
-            tracing::info!(venv = %venv.display(), "Using fallback .venv");
-            self.state.active_venv = Some(venv.clone());
-        } else {
-            tracing::warn!("No fallback .venv found, starting without venv");
-        }
-
         // backend を起動（fallback env で、なければ venv なし）
-        let mut backend = PyrightBackend::spawn(fallback_venv.as_deref()).await?;
+        let mut backend_state = if let Some(venv) = fallback_venv {
+            tracing::info!(venv = %venv.display(), "Using fallback .venv");
+            let backend = PyrightBackend::spawn(Some(&venv)).await?;
+            BackendState::Running {
+                backend,
+                active_venv: venv,
+            }
+        } else {
+            tracing::warn!("No fallback .venv found, starting in Disabled mode (strict venv)");
+            // venv なしで起動した場合は Disabled にする（strict mode）
+            // backend は spawn しない（didOpen で venv が見つかったときに spawn する）
+            BackendState::Disabled {
+                reason: "No fallback .venv found".to_string(),
+                last_file: None,
+            }
+        };
 
         let mut didopen_count = 0;
 
@@ -50,6 +60,7 @@ impl LspProxy {
                 result = client_reader.read_message() => {
                     let msg = result?;
                     let method = msg.method_name();
+                    let is_disabled = backend_state.is_disabled();
 
                     tracing::debug!(
                         method = ?method,
@@ -62,6 +73,31 @@ impl LspProxy {
                     if method == Some("initialize") {
                         tracing::info!("Caching initialize message for backend restart");
                         self.state.client_initialize = Some(msg.clone());
+
+                        // Disabled 時も initialize には成功レスポンスを返す（capabilities は空）
+                        if is_disabled {
+                            tracing::warn!("Disabled mode: returning minimal initialize response");
+                            let init_response = crate::message::RpcMessage {
+                                jsonrpc: "2.0".to_string(),
+                                id: msg.id.clone(),
+                                method: None,
+                                params: None,
+                                result: Some(serde_json::json!({
+                                    "capabilities": {}
+                                })),
+                                error: None,
+                            };
+                            client_writer.write_message(&init_response).await?;
+                            continue;
+                        }
+                    }
+
+                    // initialized notification（Disabled 時は無視）
+                    if method == Some("initialized") {
+                        if is_disabled {
+                            tracing::debug!("Disabled mode: ignoring initialized notification");
+                            continue;
+                        }
                     }
 
                     // クライアントからのリクエスト ID を追跡
@@ -71,37 +107,53 @@ impl LspProxy {
                         }
                     }
 
-                    // textDocument/didOpen の場合は .venv 探索 & 切替判定
+                    // 1. didOpen は常に処理（復活トリガー）
                     if method == Some("textDocument/didOpen") {
                         didopen_count += 1;
-
-                        // Phase 3b-2: 切替が必要なら backend 再起動
-                        if let Some(new_backend) = self
-                            .handle_did_open(&msg, didopen_count, &mut backend, &mut client_writer)
-                            .await?
-                        {
-                            tracing::info!(session = self.state.backend_session, "Backend switched successfully");
-                            backend = new_backend;
-                            continue; // didOpen は再起動時に再送済みなのでスキップ
-                        }
+                        self.handle_did_open(&msg, didopen_count, &mut backend_state, &mut client_writer).await?;
+                        continue; // didOpen は handle 内で処理済み
                     }
 
-                    // textDocument/didChange の場合は text を更新（Phase 3b-2）
+                    // 2. didChange/didClose は常にキャッシュ更新
                     if method == Some("textDocument/didChange") {
                         self.handle_did_change(&msg).await?;
+                        if is_disabled { continue; }  // Disabled時はbackendに送らない
                     }
-
-                    // textDocument/didClose の場合はキャッシュから削除
                     if method == Some("textDocument/didClose") {
                         self.handle_did_close(&msg).await?;
+                        if is_disabled { continue; }  // Disabled時はbackendに送らない
                     }
 
-                    // backend に転送
-                    backend.send_message(&msg).await?;
+                    // 3. Disabled 時はリクエストにエラーを返す
+                    if is_disabled && msg.is_request() {
+                        let error_message = "pyright-lsp-proxy: .venv not found (strict mode). Create .venv or run hooks.";
+                        if let Some((reason, last_file)) = backend_state.disabled_info() {
+                            tracing::warn!(
+                                method = ?method,
+                                reason = reason,
+                                last_file = ?last_file.map(|p| p.display().to_string()),
+                                error_message = error_message,
+                                "Returning error response to client (Disabled mode)"
+                            );
+                        }
+                        let error_response = create_error_response(&msg, error_message);
+                        client_writer.write_message(&error_response).await?;
+                        continue;
+                    }
+
+                    // 4. Running 時は backend に転送
+                    if let BackendState::Running { backend, .. } = &mut backend_state {
+                        backend.send_message(&msg).await?;
+                    }
                 }
 
-                // バックエンド（pyright）からのメッセージ
-                result = backend.read_message() => {
+                // Running 時のみ backend からの読み取りを待つ
+                result = async {
+                    match &mut backend_state {
+                        BackendState::Running { backend, .. } => backend.read_message().await,
+                        BackendState::Disabled { .. } => std::future::pending().await,
+                    }
+                } => {
                     let msg = result?;
                     tracing::debug!(
                         is_response = msg.is_response(),
@@ -123,16 +175,14 @@ impl LspProxy {
         }
     }
 
-    /// didOpen 処理 & .venv 切替判定（Phase 3b-1）
-    ///
-    /// 返り値: Some(new_backend) の場合は backend を切替済み、None の場合は切替不要
+    /// didOpen 処理 & .venv 切替判定 + BackendState 遷移（Strict venv mode）
     async fn handle_did_open(
         &mut self,
         msg: &crate::message::RpcMessage,
         count: usize,
-        backend: &mut PyrightBackend,
+        backend_state: &mut BackendState,
         client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
-    ) -> Result<Option<PyrightBackend>, ProxyError> {
+    ) -> Result<(), ProxyError> {
         // params から URI と text を抽出
         if let Some(params) = &msg.params {
             if let Some(text_document) = params.get("textDocument") {
@@ -169,7 +219,7 @@ impl LspProxy {
                                     "didOpen received"
                                 );
 
-                                // Phase 3b-2: didOpen をキャッシュ
+                                // didOpen をキャッシュ（Disabled時の復活用）
                                 if let Some(text_content) = &text {
                                     let doc = crate::state::OpenDocument {
                                         language_id: language_id.clone(),
@@ -189,32 +239,92 @@ impl LspProxy {
                                     venv::find_venv(&file_path, self.state.git_toplevel.as_deref())
                                         .await?;
 
-                                if let Some(ref venv) = found_venv {
-                                    // Phase 3b-2: 切替判定
-                                    if self.state.needs_venv_switch(venv) {
-                                        tracing::warn!(
-                                            current = ?self.state.active_venv.as_ref().map(|p| p.display().to_string()),
-                                            found = %venv.display(),
-                                            "Venv switch needed, restarting backend"
-                                        );
+                                // 状態遷移ロジック（Strict venv mode）
+                                tracing::debug!(
+                                    is_running = backend_state.is_disabled() == false,
+                                    is_disabled = backend_state.is_disabled(),
+                                    has_venv = found_venv.is_some(),
+                                    "State transition check"
+                                );
 
-                                        // backend 再起動 & 切替
-                                        let new_backend = self
-                                            .restart_backend_with_venv(backend, venv, client_writer)
-                                            .await?;
-
-                                        return Ok(Some(new_backend));
-                                    } else {
+                                match (&*backend_state, found_venv.as_ref()) {
+                                    // Running + venv found (same) → 何もしない
+                                    (BackendState::Running { active_venv, .. }, Some(venv))
+                                        if active_venv == venv =>
+                                    {
                                         tracing::debug!(
                                             venv = %venv.display(),
                                             "Using same .venv as before"
                                         );
                                     }
-                                } else {
-                                    tracing::warn!(
-                                        path = %file_path.display(),
-                                        "No .venv found for this file"
-                                    );
+
+                                    // Running + venv found (different) → 切替
+                                    (BackendState::Running { .. }, Some(venv)) => {
+                                        tracing::warn!(
+                                            current = ?backend_state.active_venv().map(|p| p.display().to_string()),
+                                            found = %venv.display(),
+                                            "Venv switch needed, restarting backend"
+                                        );
+
+                                        if let BackendState::Running { backend, .. } = backend_state {
+                                            let new_backend = self
+                                                .restart_backend_with_venv(backend, venv, client_writer)
+                                                .await?;
+
+                                            *backend_state = BackendState::Running {
+                                                backend: new_backend,
+                                                active_venv: venv.clone(),
+                                            };
+                                        }
+                                    }
+
+                                    // Running + venv not found → Disabled へ
+                                    (BackendState::Running { .. }, None) => {
+                                        tracing::warn!(
+                                            path = %file_path.display(),
+                                            "No .venv found for this file, disabling backend"
+                                        );
+
+                                        if let BackendState::Running { backend, .. } = backend_state {
+                                            self.disable_backend(backend, client_writer, &file_path)
+                                                .await?;
+
+                                            *backend_state = BackendState::Disabled {
+                                                reason: format!(
+                                                    "No .venv found for file: {}",
+                                                    file_path.display()
+                                                ),
+                                                last_file: Some(file_path.clone()),
+                                            };
+                                        }
+                                    }
+
+                                    // Disabled + venv found → Running へ復活
+                                    (BackendState::Disabled { .. }, Some(venv)) => {
+                                        tracing::info!(
+                                            venv = %venv.display(),
+                                            "Found .venv, spawning backend"
+                                        );
+
+                                        let new_backend = self.spawn_and_init_backend(venv).await?;
+
+                                        *backend_state = BackendState::Running {
+                                            backend: new_backend,
+                                            active_venv: venv.clone(),
+                                        };
+                                    }
+
+                                    // Disabled + venv not found → そのまま
+                                    (BackendState::Disabled { .. }, None) => {
+                                        if let Some((reason, last_file)) = backend_state.disabled_info() {
+                                            tracing::warn!(
+                                                path = %file_path.display(),
+                                                reason = reason,
+                                                last_file = ?last_file.map(|p| p.display().to_string()),
+                                                "No .venv found for this file (backend still disabled)"
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -223,7 +333,7 @@ impl LspProxy {
             }
         }
 
-        Ok(None)
+        Ok(())
     }
 
     /// backend を graceful shutdown して新しい .venv で再起動（Phase 3b-1）
@@ -460,13 +570,241 @@ impl LspProxy {
             "Document restoration completed"
         );
 
-        // 7. 状態更新
-        self.state.active_venv = Some(new_venv.to_path_buf());
-
         tracing::info!(
             session = session,
             venv = %new_venv.display(),
             "Backend restart completed successfully"
+        );
+
+        Ok(new_backend)
+    }
+
+    /// backend を shutdown して Disabled 状態へ（Strict venv mode）
+    async fn disable_backend(
+        &mut self,
+        backend: &mut PyrightBackend,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+        file_path: &std::path::Path,
+    ) -> Result<(), ProxyError> {
+        self.state.backend_session += 1;
+        let session = self.state.backend_session;
+
+        tracing::info!(
+            session = session,
+            file = %file_path.display(),
+            "Disabling backend (no .venv found)"
+        );
+
+        // 未解決リクエストへ RequestCancelled を返す
+        self.cancel_pending_requests(client_writer).await?;
+
+        // backend を shutdown
+        if let Err(e) = backend.shutdown_gracefully().await {
+            tracing::error!(error = ?e, "Failed to shutdown backend gracefully");
+        }
+
+        tracing::info!(session = session, "Backend disabled");
+
+        Ok(())
+    }
+
+    /// backend を spawn して initialize する（Disabled → Running 復活用）
+    async fn spawn_and_init_backend(
+        &mut self,
+        venv: &std::path::Path,
+    ) -> Result<PyrightBackend, ProxyError> {
+        self.state.backend_session += 1;
+        let session = self.state.backend_session;
+
+        tracing::info!(
+            session = session,
+            venv = %venv.display(),
+            "Spawning backend from Disabled state"
+        );
+
+        // 1. 新しい backend を起動
+        let mut new_backend = PyrightBackend::spawn(Some(venv)).await?;
+
+        // 2. backend に initialize を送る
+        let init_params = self
+            .state
+            .client_initialize
+            .as_ref()
+            .and_then(|msg| msg.params.clone())
+            .ok_or_else(|| ProxyError::InvalidMessage("No initialize params cached".to_string()))?;
+
+        let init_msg = crate::message::RpcMessage {
+            jsonrpc: "2.0".to_string(),
+            id: Some(crate::message::RpcId::Number(1)),
+            method: Some("initialize".to_string()),
+            params: Some(init_params),
+            result: None,
+            error: None,
+        };
+
+        tracing::info!(session = session, "Sending initialize to new backend");
+        new_backend.send_message(&init_msg).await?;
+
+        // 3. initialize response を受信
+        let init_id = 1i64;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(ProxyError::Backend(
+                    crate::error::BackendError::InitializeTimeout(10),
+                ));
+            }
+
+            let wait_result = tokio::time::timeout(remaining, new_backend.read_message()).await;
+
+            match wait_result {
+                Ok(Ok(msg)) => {
+                    if msg.is_response() {
+                        if let Some(crate::message::RpcId::Number(id)) = &msg.id {
+                            if *id == init_id {
+                                if let Some(error) = &msg.error {
+                                    return Err(ProxyError::Backend(
+                                        crate::error::BackendError::InitializeResponseError(
+                                            format!("code={}, message={}", error.code, error.message),
+                                        ),
+                                    ));
+                                }
+
+                                tracing::info!(
+                                    session = session,
+                                    response_id = ?msg.id,
+                                    "Received initialize response from backend"
+                                );
+
+                                break;
+                            }
+                        }
+                    } else {
+                        tracing::debug!(
+                            session = session,
+                            method = ?msg.method,
+                            "Received notification during initialize, ignoring"
+                        );
+                    }
+                }
+                Ok(Err(e)) => {
+                    return Err(ProxyError::Backend(
+                        crate::error::BackendError::InitializeFailed(format!(
+                            "Error reading initialize response: {}",
+                            e
+                        )),
+                    ));
+                }
+                Err(_) => {
+                    return Err(ProxyError::Backend(
+                        crate::error::BackendError::InitializeTimeout(10),
+                    ));
+                }
+            }
+        }
+
+        // 4. initialized notification を送る
+        let initialized_msg = crate::message::RpcMessage {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            method: Some("initialized".to_string()),
+            params: Some(serde_json::json!({})),
+            result: None,
+            error: None,
+        };
+
+        tracing::info!(session = session, "Sending initialized to backend");
+        new_backend.send_message(&initialized_msg).await?;
+
+        // 5. ドキュメント復元（venv の親ディレクトリ配下のみ）
+        let venv_parent = venv.parent().map(|p| p.to_path_buf());
+        let total_docs = self.state.open_documents.len();
+        let mut restored = 0;
+        let mut skipped = 0;
+        let mut failed = 0;
+
+        tracing::info!(
+            session = session,
+            total_docs = total_docs,
+            venv_parent = ?venv_parent.as_ref().map(|p| p.display().to_string()),
+            "Starting document restoration"
+        );
+
+        for (url, doc) in &self.state.open_documents {
+            let should_restore = match (url.to_file_path().ok(), &venv_parent) {
+                (Some(file_path), Some(venv_parent)) => file_path.starts_with(venv_parent),
+                _ => false,
+            };
+
+            if !should_restore {
+                skipped += 1;
+                tracing::debug!(
+                    session = session,
+                    uri = %url,
+                    "Skipping document from different venv"
+                );
+                continue;
+            }
+
+            let uri_str = url.to_string();
+            let language_id = doc.language_id.clone();
+            let version = doc.version;
+            let text = doc.text.clone();
+            let text_len = text.len();
+
+            let didopen_msg = crate::message::RpcMessage {
+                jsonrpc: "2.0".to_string(),
+                id: None,
+                method: Some("textDocument/didOpen".to_string()),
+                params: Some(serde_json::json!({
+                    "textDocument": {
+                        "uri": uri_str,
+                        "languageId": language_id,
+                        "version": version,
+                        "text": text,
+                    }
+                })),
+                result: None,
+                error: None,
+            };
+
+            match new_backend.send_message(&didopen_msg).await {
+                Ok(_) => {
+                    restored += 1;
+                    tracing::info!(
+                        session = session,
+                        uri = %uri_str,
+                        version = version,
+                        text_len = text_len,
+                        "Successfully restored document"
+                    );
+                }
+                Err(e) => {
+                    failed += 1;
+                    tracing::error!(
+                        session = session,
+                        uri = %uri_str,
+                        error = ?e,
+                        "Failed to restore document, skipping"
+                    );
+                }
+            }
+        }
+
+        tracing::info!(
+            session = session,
+            restored = restored,
+            skipped = skipped,
+            failed = failed,
+            total = total_docs,
+            "Document restoration completed"
+        );
+
+        tracing::info!(
+            session = session,
+            venv = %venv.display(),
+            "Backend spawned and initialized successfully"
         );
 
         Ok(new_backend)
@@ -720,6 +1058,22 @@ impl LspProxy {
 
         // character が行長を超える場合は行末に clamp
         Ok(line_end)
+    }
+}
+
+/// エラーレスポンスを作成（Disabled 時のリクエストに返す）
+fn create_error_response(request: &RpcMessage, message: &str) -> RpcMessage {
+    RpcMessage {
+        jsonrpc: "2.0".to_string(),
+        id: request.id.clone(),
+        method: None,
+        params: None,
+        result: None,
+        error: Some(crate::message::RpcError {
+            code: -32603,  // Internal error (互換性のため)
+            message: message.to_string(),
+            data: None,
+        }),
     }
 }
 

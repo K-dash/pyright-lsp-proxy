@@ -13,9 +13,6 @@ pub struct OpenDocument {
 
 /// プロキシが保持する状態（Phase 3b-2: 複数ドキュメント復元版）
 pub struct ProxyState {
-    /// 現在アクティブな .venv のパス
-    pub active_venv: Option<PathBuf>,
-
     /// git toplevel（探索上限、初回取得でキャッシュ）
     pub git_toplevel: Option<PathBuf>,
 
@@ -35,20 +32,11 @@ pub struct ProxyState {
 impl ProxyState {
     pub fn new() -> Self {
         Self {
-            active_venv: None,
             git_toplevel: None,
             client_initialize: None,
             open_documents: HashMap::new(),
             backend_session: 0,
             pending_requests: HashSet::new(),
-        }
-    }
-
-    /// .venv 切替が必要かどうか判定
-    pub fn needs_venv_switch(&self, new_venv: &PathBuf) -> bool {
-        match &self.active_venv {
-            Some(current) => current != new_venv,
-            None => true,
         }
     }
 }
