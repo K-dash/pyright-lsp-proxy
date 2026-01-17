@@ -65,6 +65,16 @@ fi
 
 chmod +x "${BINARY_PATH}"
 
+# wrapper スクリプトもコピー
+WRAPPER_SRC="${PLUGIN_ROOT}/bin/pyright-lsp-proxy-wrapper.sh"
+WRAPPER_DST="${BIN_DIR}/pyright-lsp-proxy-wrapper.sh"
+
+if [ -f "${WRAPPER_SRC}" ]; then
+  cp "${WRAPPER_SRC}" "${WRAPPER_DST}"
+  chmod +x "${WRAPPER_DST}"
+  echo "[pyright-lsp-proxy] Wrapper script installed at ${WRAPPER_DST}"
+fi
+
 echo "[pyright-lsp-proxy] Successfully installed to ${BINARY_PATH}"
 echo "[pyright-lsp-proxy] Version:"
 "${BINARY_PATH}" --version || true

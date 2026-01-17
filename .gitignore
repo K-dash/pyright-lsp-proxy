@@ -23,8 +23,10 @@ target
 .DS_Store
 tmp/
 
-# Plugin binary directory (downloaded by install.sh)
-bin/
+# Plugin binaries (downloaded by install.sh)
+bin/pyright-lsp-proxy
+bin/pyright-lsp-proxy-macos-arm64
+bin/pyright-lsp-proxy-linux-x86_64
 
 # Local plugin development configuration
 plugins/

@@ -1,6 +1,6 @@
 {
   "name": "pyright-lsp-proxy",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Pyright LSP proxy for monorepo with automatic .venv switching",
   "author": {
     "name": "K-dash"
@@ -12,7 +12,7 @@
   "hooks": "./hooks.json",
   "lspServers": {
     "pyright-lsp-proxy": {
-      "command": "${CLAUDE_PLUGIN_ROOT}/bin/pyright-lsp-proxy",
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/pyright-lsp-proxy-wrapper.sh",
       "args": [],
       "extensionToLanguage": {
         ".py": "python",
