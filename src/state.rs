@@ -3,14 +3,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use url::Url;
 
-/// 未解決リクエストの情報
+/// Information about pending requests
 #[derive(Debug, Clone)]
 pub struct PendingRequest {
-    /// このリクエストが送られた backend の session
+    /// Backend session this request was sent to
     pub backend_session: u64,
 }
 
-/// 開いているドキュメント（Phase 3b-2）
+/// Open document
 #[derive(Debug, Clone)]
 pub struct OpenDocument {
     pub language_id: String,
@@ -19,21 +19,21 @@ pub struct OpenDocument {
     pub venv: Option<PathBuf>,
 }
 
-/// プロキシが保持する状態（Phase 3b-2: 複数ドキュメント復元版）
+/// State held by proxy
 pub struct ProxyState {
-    /// git toplevel（探索上限、初回取得でキャッシュ）
+    /// Git toplevel (search boundary, cached on first retrieval)
     pub git_toplevel: Option<PathBuf>,
 
-    /// Claude Code からの initialize メッセージ（backend 初期化で流用）
+    /// Initialize message from Claude Code (reused for backend initialization)
     pub client_initialize: Option<RpcMessage>,
 
-    /// 開いているドキュメント（Phase 3b-2）
+    /// Open documents
     pub open_documents: HashMap<Url, OpenDocument>,
 
-    /// backend 再起動の世代（ログと競合回避用）
+    /// Backend restart generation (for logging and conflict avoidance)
     pub backend_session: u64,
 
-    /// 未解決リクエスト（世代付き）
+    /// Pending requests (with generation)
     pub pending_requests: HashMap<RpcId, PendingRequest>,
 }
 

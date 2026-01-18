@@ -18,23 +18,22 @@ impl LspProxy {
         }
     }
 
-    /// メインループ（Phase 3a: fallback env で即座に起動、Strict venv mode）
     pub async fn run(&mut self) -> Result<(), ProxyError> {
-        // stdin/stdout のフレームリーダー/ライター
+        // Frame reader/writer for stdin/stdout
         let mut client_reader = LspFrameReader::new(stdin());
         let mut client_writer = LspFrameWriter::new(stdout());
 
-        // 起動時 cwd を取得
+        // Get cwd at startup
         let cwd = std::env::current_dir()?;
         tracing::info!(cwd = %cwd.display(), "Starting pyright-lsp-proxy");
 
-        // git toplevel を取得してキャッシュ
+        // Get and cache git toplevel
         self.state.git_toplevel = venv::get_git_toplevel(&cwd).await?;
 
-        // fallback env を探索
+        // Search for fallback env
         let fallback_venv = venv::find_fallback_venv(&cwd).await?;
 
-        // backend を起動（fallback env で、なければ venv なし）
+        // Start backend (with fallback env, or without venv if not found)
         let mut backend_state = if let Some(venv) = fallback_venv {
             tracing::info!(venv = %venv.display(), "Using fallback .venv");
             let backend = PyrightBackend::spawn(Some(&venv)).await?;
@@ -45,8 +44,8 @@ impl LspProxy {
             }
         } else {
             tracing::warn!("No fallback .venv found, starting in Disabled mode (strict venv)");
-            // venv なしで起動した場合は Disabled にする（strict mode）
-            // backend は spawn しない（didOpen で venv が見つかったときに spawn する）
+            // Start in Disabled state when no venv found (strict mode)
+            // Don't spawn backend (spawn when venv is found on didOpen)
             BackendState::Disabled {
                 reason: "No fallback .venv found".to_string(),
                 last_file: None,
@@ -57,7 +56,7 @@ impl LspProxy {
 
         loop {
             tokio::select! {
-                // クライアント（Claude Code）からのメッセージ
+                // Messages from client (Claude Code)
                 result = client_reader.read_message() => {
                     let msg = result?;
                     let method = msg.method_name();
@@ -70,12 +69,12 @@ impl LspProxy {
                         "Client -> Proxy"
                     );
 
-                    // initialize をキャッシュ（Phase 3b-1: backend 再初期化で流用）
+                    // Cache initialize
                     if method == Some("initialize") {
                         tracing::info!("Caching initialize message for backend restart");
                         self.state.client_initialize = Some(msg.clone());
 
-                        // Disabled 時も initialize には成功レスポンスを返す（capabilities は空）
+                        // Return success response even in Disabled state (with empty capabilities)
                         if is_disabled {
                             tracing::warn!("Disabled mode: returning minimal initialize response");
                             let init_response = crate::message::RpcMessage {
@@ -93,30 +92,30 @@ impl LspProxy {
                         }
                     }
 
-                    // initialized notification（Disabled 時は無視）
+                    // initialized notification (ignored in Disabled state)
                     if method == Some("initialized") && is_disabled {
                         tracing::debug!("Disabled mode: ignoring initialized notification");
                         continue;
                     }
 
-                    // 1. didOpen は常に処理（復活トリガー）
+                    // 1. Always process didOpen (revival trigger)
                     if method == Some("textDocument/didOpen") {
                         didopen_count += 1;
                         self.handle_did_open(&msg, didopen_count, &mut backend_state, &mut client_writer).await?;
-                        continue; // didOpen は handle 内で処理済み
+                        continue; // didOpen already handled
                     }
 
-                    // 2. didChange/didClose は常にキャッシュ更新
+                    // 2. Always update cache for didChange/didClose
                     if method == Some("textDocument/didChange") {
                         self.handle_did_change(&msg).await?;
-                        if is_disabled { continue; }  // Disabled時はbackendに送らない
+                        if is_disabled { continue; }  // Don't send to backend when Disabled
                     }
                     if method == Some("textDocument/didClose") {
                         self.handle_did_close(&msg).await?;
-                        if is_disabled { continue; }  // Disabled時はbackendに送らない
+                        if is_disabled { continue; }  // Don't send to backend when Disabled
                     }
 
-                    // 3. Request 処理（透過リトライ対応）
+                    // 3. Request processing (with transparent retry support)
                     const VENV_CHECK_METHODS: &[&str] = &[
                         "textDocument/hover",
                         "textDocument/definition",
@@ -129,7 +128,7 @@ impl LspProxy {
                     if msg.is_request() {
                         let m = method;
 
-                        // VENV_CHECK_METHODS なら ensure_backend_for_uri を通す
+                        // Pass through ensure_backend_for_uri for VENV_CHECK_METHODS
                         if let Some(method_name) = m {
                             if VENV_CHECK_METHODS.contains(&method_name) {
                                 if let Some(url) = Self::extract_text_document_uri(&msg) {
@@ -155,7 +154,7 @@ impl LspProxy {
                                             );
                                         }
                                     } else {
-                                        // URI 抽出成功したが file_path 変換失敗
+                                        // URI extraction succeeded but file_path conversion failed
                                         tracing::debug!(
                                             method = method_name,
                                             uri = %url,
@@ -163,7 +162,7 @@ impl LspProxy {
                                         );
                                     }
                                 } else {
-                                    // URI 抽出失敗 → 切替チェックをスキップ
+                                    // URI extraction failed → skip switch check
                                     tracing::debug!(
                                         method = method_name,
                                         "Skipping venv check: could not extract textDocument.uri"
@@ -172,7 +171,7 @@ impl LspProxy {
                             }
                         }
 
-                        // pending に登録（現在の backend session を記録）
+                        // Register in pending (record current backend session)
                         if let Some(id) = &msg.id {
                             if let Some(session) = backend_state.session() {
                                 self.state.pending_requests.insert(
@@ -185,8 +184,8 @@ impl LspProxy {
                         }
                     }
 
-                    // 4. Disabled 時はリクエストにエラーを返す（VENV_CHECK_METHODS 以外）
-                    // ★ ensure_backend_for_uri() で状態が変わった可能性があるので再取得
+                    // 4. Return error for requests in Disabled state (except VENV_CHECK_METHODS)
+                    // Re-check since state may have changed in ensure_backend_for_uri()
                     let is_disabled = backend_state.is_disabled();
                     if is_disabled && msg.is_request() {
                         let error_message = "pyright-lsp-proxy: .venv not found (strict mode). Create .venv or run hooks.";
@@ -204,7 +203,7 @@ impl LspProxy {
                         continue;
                     }
 
-                    // 5. Running 時は backend に転送
+                    // 5. Forward to backend when Running
                     if let BackendState::Running { backend, session, .. } = &mut backend_state {
                         if msg.is_request() {
                             tracing::debug!(
@@ -217,7 +216,7 @@ impl LspProxy {
                     }
                 }
 
-                // Running 時のみ backend からの読み取りを待つ
+                // Wait for backend read only when Running
                 result = async {
                     match &mut backend_state {
                         BackendState::Running { backend, .. } => backend.read_message().await,
@@ -233,13 +232,13 @@ impl LspProxy {
                         "Backend -> Proxy"
                     );
 
-                    // backend からのレスポンスで pending を解決 + 世代チェック
+                    // Resolve pending with backend response + generation check
                     if msg.is_response() {
                         if let Some(id) = &msg.id {
-                            // pending から取得して世代チェック
+                            // Get from pending and check generation
                             if let Some(pending) = self.state.pending_requests.get(id) {
                                 if Some(pending.backend_session) != running_session {
-                                    // 古い世代からの response → 破棄
+                                    // Response from old generation → discard
                                     tracing::warn!(
                                         id = ?id,
                                         pending_session = pending.backend_session,
@@ -254,14 +253,14 @@ impl LspProxy {
                         }
                     }
 
-                    // クライアントに転送
+                    // Forward to client
                     client_writer.write_message(&msg).await?;
                 }
             }
         }
     }
 
-    /// LSP request の params から textDocument.uri を抽出
+    /// Extract textDocument.uri from LSP request params
     fn extract_text_document_uri(msg: &RpcMessage) -> Option<url::Url> {
         let params = msg.params.as_ref()?;
         let text_document = params.get("textDocument")?;
@@ -269,8 +268,8 @@ impl LspProxy {
         url::Url::parse(uri_str).ok()
     }
 
-    /// URI に基づいて適切な backend を確保する
-    /// 戻り値: 切り替えが発生したか
+    /// Ensure appropriate backend for URI
+    /// Returns: whether a switch occurred
     async fn ensure_backend_for_uri(
         &mut self,
         backend_state: &mut BackendState,
@@ -278,16 +277,16 @@ impl LspProxy {
         url: &url::Url,
         file_path: &std::path::Path,
     ) -> Result<bool, ProxyError> {
-        // キャッシュから venv を取得（O(1)）
+        // Get venv from cache (O(1))
         let target_venv = if let Some(doc) = self.state.open_documents.get(url) {
             doc.venv.clone()
         } else {
-            // didOpen が来ていない URI → 探索（例外経路）
+            // URI without didOpen → search (exceptional path)
             tracing::debug!(uri = %url, "URI not in cache, searching venv");
             venv::find_venv(file_path, self.state.git_toplevel.as_deref()).await?
         };
 
-        // 共通関数で状態遷移
+        // State transition via common function
         self.transition_backend_state(
             backend_state,
             client_writer,
@@ -297,8 +296,8 @@ impl LspProxy {
         .await
     }
 
-    /// venv に基づいて backend の状態を遷移させる
-    /// 戻り値: 切り替えが発生したかどうか
+    /// Transition backend state based on venv
+    /// Returns: whether a switch occurred
     async fn transition_backend_state(
         &mut self,
         backend_state: &mut BackendState,
@@ -307,13 +306,13 @@ impl LspProxy {
         trigger_file: &std::path::Path,
     ) -> Result<bool, ProxyError> {
         match (&*backend_state, target_venv) {
-            // Running + same venv → 何もしない
+            // Running + same venv → do nothing
             (BackendState::Running { active_venv, .. }, Some(venv)) if active_venv == venv => {
                 tracing::debug!(venv = %venv.display(), "Using same .venv as before");
                 Ok(false)
             }
 
-            // Running + different venv → 切替
+            // Running + different venv → switch
             (BackendState::Running { .. }, Some(venv)) => {
                 let old_session = backend_state.session().unwrap_or(0);
 
@@ -324,7 +323,7 @@ impl LspProxy {
                 );
 
                 if let BackendState::Running { backend, .. } = backend_state {
-                    // 旧 session の pending をキャンセル
+                    // Cancel pending requests for old session
                     self.cancel_pending_requests_for_session(client_writer, old_session)
                         .await?;
 
@@ -340,7 +339,7 @@ impl LspProxy {
                 Ok(true)
             }
 
-            // Running + venv not found → Disabled へ
+            // Running + venv not found → transition to Disabled
             (BackendState::Running { .. }, None) => {
                 tracing::warn!(
                     path = %trigger_file.display(),
@@ -358,7 +357,7 @@ impl LspProxy {
                 Ok(true)
             }
 
-            // Disabled + venv found → Running へ復活
+            // Disabled + venv found → revive to Running
             (BackendState::Disabled { .. }, Some(venv)) => {
                 tracing::info!(venv = %venv.display(), "Found .venv, spawning backend");
                 let new_backend = self.spawn_and_init_backend(venv, client_writer).await?;
@@ -370,7 +369,7 @@ impl LspProxy {
                 Ok(true)
             }
 
-            // Disabled + venv not found → そのまま
+            // Disabled + venv not found → stay as is
             (BackendState::Disabled { reason, last_file }, None) => {
                 tracing::warn!(
                     path = %trigger_file.display(),
@@ -383,7 +382,7 @@ impl LspProxy {
         }
     }
 
-    /// didOpen 処理 & .venv 切替判定 + BackendState 遷移（Strict venv mode）
+    /// Handle didOpen & .venv switch decision + BackendState transition (Strict venv mode)
     async fn handle_did_open(
         &mut self,
         msg: &crate::message::RpcMessage,
@@ -391,7 +390,7 @@ impl LspProxy {
         backend_state: &mut BackendState,
         client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
     ) -> Result<(), ProxyError> {
-        // params から URI と text を抽出
+        // Extract URI and text from params
         if let Some(params) = &msg.params {
             if let Some(text_document) = params.get("textDocument") {
                 let text = text_document
@@ -403,7 +402,7 @@ impl LspProxy {
                     if let Some(uri_str) = uri_value.as_str() {
                         if let Ok(url) = url::Url::parse(uri_str) {
                             if let Ok(file_path) = url.to_file_path() {
-                                // languageId と version を取得
+                                // Get languageId and version
                                 let language_id = text_document
                                     .get("languageId")
                                     .and_then(|l| l.as_str())
@@ -427,12 +426,12 @@ impl LspProxy {
                                     "didOpen received"
                                 );
 
-                                // .venv 探索
+                                // Search for .venv
                                 let found_venv =
                                     venv::find_venv(&file_path, self.state.git_toplevel.as_deref())
                                         .await?;
 
-                                // didOpen をキャッシュ（Disabled時の復活用）
+                                // Cache didOpen (for revival when Disabled)
                                 if let Some(text_content) = &text {
                                     let doc = crate::state::OpenDocument {
                                         language_id: language_id.clone(),
@@ -449,7 +448,7 @@ impl LspProxy {
                                     );
                                 }
 
-                                // 状態遷移ロジック（Strict venv mode）
+                                // State transition logic (Strict venv mode)
                                 tracing::debug!(
                                     is_running = !backend_state.is_disabled(),
                                     is_disabled = backend_state.is_disabled(),
@@ -474,7 +473,7 @@ impl LspProxy {
         Ok(())
     }
 
-    /// backend を graceful shutdown して新しい .venv で再起動（Phase 3b-1）
+    /// Gracefully shutdown backend and restart with new .venv
     async fn restart_backend_with_venv(
         &mut self,
         backend: &mut PyrightBackend,
@@ -490,17 +489,17 @@ impl LspProxy {
             "Starting backend restart sequence"
         );
 
-        // 1. 既存 backend を shutdown
+        // 1. Shutdown existing backend
         if let Err(e) = backend.shutdown_gracefully().await {
             tracing::error!(error = ?e, "Failed to shutdown backend gracefully");
-            // エラーでも続行（新 backend 起動を試みる）
+            // Continue even on error (try to start new backend)
         }
 
-        // 2. 新しい backend を起動
+        // 2. Start new backend
         tracing::info!(session = session, venv = %new_venv.display(), "Spawning new backend");
         let mut new_backend = PyrightBackend::spawn(Some(new_venv)).await?;
 
-        // 3. backend に initialize を送る（プロキシが backend クライアントになる）
+        // 3. Send initialize to backend (proxy becomes backend client)
         let init_params = self
             .state
             .client_initialize
@@ -520,7 +519,7 @@ impl LspProxy {
         tracing::info!(session = session, "Sending initialize to new backend");
         new_backend.send_message(&init_msg).await?;
 
-        // 4. initialize response を受信（通知はスキップ、id 確認、タイムアウト付き）
+        // 4. Receive initialize response (skip notifications, check id, with timeout)
         let init_id = 1i64;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
@@ -536,10 +535,10 @@ impl LspProxy {
             match wait_result {
                 Ok(Ok(msg)) => {
                     if msg.is_response() {
-                        // id が一致するか確認
+                        // Check if id matches
                         if let Some(crate::message::RpcId::Number(id)) = &msg.id {
                             if *id == init_id {
-                                // error レスポンスか確認
+                                // Check if error response
                                 if let Some(error) = &msg.error {
                                     return Err(ProxyError::Backend(
                                         crate::error::BackendError::InitializeResponseError(
@@ -557,7 +556,7 @@ impl LspProxy {
                                     "Received initialize response from backend"
                                 );
 
-                                // textDocumentSync capability をログ出力（Phase 3b-2）
+                                // Log textDocumentSync capability
                                 if let Some(result) = &msg.result {
                                     if let Some(capabilities) = result.get("capabilities") {
                                         if let Some(sync) = capabilities.get("textDocumentSync") {
@@ -581,7 +580,7 @@ impl LspProxy {
                             }
                         }
                     } else {
-                        // 通知は無視してループ継続
+                        // Ignore notifications and continue loop
                         tracing::debug!(
                             session = session,
                             method = ?msg.method,
@@ -605,7 +604,7 @@ impl LspProxy {
             }
         }
 
-        // 5. initialized notification を送る
+        // 5. Send initialized notification
         let initialized_msg = crate::message::RpcMessage {
             jsonrpc: "2.0".to_string(),
             id: None,
@@ -618,8 +617,8 @@ impl LspProxy {
         tracing::info!(session = session, "Sending initialized to backend");
         new_backend.send_message(&initialized_msg).await?;
 
-        // 6. ドキュメント復元（Phase 3b-2）
-        // 新しい venv の親ディレクトリ配下にあるドキュメントのみを復元
+        // 6. Document restoration
+        // Restore only documents under the new venv's parent directory
         let venv_parent = new_venv.parent().map(|p| p.to_path_buf());
         let total_docs = self.state.open_documents.len();
         let mut restored = 0;
@@ -635,10 +634,10 @@ impl LspProxy {
         );
 
         for (url, doc) in &self.state.open_documents {
-            // venv の親ディレクトリ配下にあるドキュメントのみを復元
+            // Restore only documents under venv's parent directory
             let should_restore = match (url.to_file_path().ok(), &venv_parent) {
                 (Some(file_path), Some(venv_parent)) => file_path.starts_with(venv_parent),
-                _ => false, // file:// URL でない、または venv_parent がない場合はスキップ
+                _ => false, // Skip if not file:// URL or venv_parent is None
             };
 
             if !should_restore {
@@ -651,7 +650,7 @@ impl LspProxy {
                 );
                 continue;
             }
-            // 先に必要な値をコピー（await 前に借用終了させる）
+            // Copy required values first (end borrow before await)
             let uri_str = url.to_string();
             let language_id = doc.language_id.clone();
             let version = doc.version;
@@ -707,9 +706,11 @@ impl LspProxy {
             "Document restoration completed"
         );
 
-        // スキップしたURIのdiagnosticsをクリア
+        // Clear diagnostics for skipped URIs
         if !skipped_uris.is_empty() {
-            let (ok, clear_failed) = self.clear_diagnostics_for_uris(&skipped_uris, client_writer).await;
+            let (ok, clear_failed) = self
+                .clear_diagnostics_for_uris(&skipped_uris, client_writer)
+                .await;
 
             if clear_failed == 0 {
                 tracing::info!(
@@ -736,8 +737,8 @@ impl LspProxy {
         Ok(new_backend)
     }
 
-    /// 指定URIのdiagnosticsをクリア（空配列を送信）
-    /// ベストエフォート: 1件失敗しても続行
+    /// Clear diagnostics for specified URIs (send empty array)
+    /// Best effort: continue even if one fails
     async fn clear_diagnostics_for_uris(
         &self,
         uris: &[url::Url],
@@ -773,7 +774,7 @@ impl LspProxy {
         (ok, failed)
     }
 
-    /// backend を shutdown して Disabled 状態へ（Strict venv mode）
+    /// Shutdown backend and transition to Disabled state (Strict venv mode)
     async fn disable_backend(
         &mut self,
         backend: &mut PyrightBackend,
@@ -789,7 +790,7 @@ impl LspProxy {
             "Disabling backend (no .venv found)"
         );
 
-        // open_documents の全URIへ空diagnosticsを送信（借用地雷回避: 先にclone）
+        // Send empty diagnostics to all URIs in open_documents (clone first to avoid borrow issues)
         let uris: Vec<url::Url> = self.state.open_documents.keys().cloned().collect();
         let (ok, failed) = self.clear_diagnostics_for_uris(&uris, client_writer).await;
 
@@ -808,10 +809,10 @@ impl LspProxy {
             );
         }
 
-        // 未解決リクエストへ RequestCancelled を返す
+        // Return RequestCancelled to unresolved requests
         self.cancel_pending_requests(client_writer).await?;
 
-        // backend を shutdown
+        // Shutdown backend
         if let Err(e) = backend.shutdown_gracefully().await {
             tracing::error!(error = ?e, "Failed to shutdown backend gracefully");
         }
@@ -821,7 +822,7 @@ impl LspProxy {
         Ok(())
     }
 
-    /// backend を spawn して initialize する（Disabled → Running 復活用）
+    /// Spawn and initialize backend (for Disabled → Running revival)
     async fn spawn_and_init_backend(
         &mut self,
         venv: &std::path::Path,
@@ -836,10 +837,10 @@ impl LspProxy {
             "Spawning backend from Disabled state"
         );
 
-        // 1. 新しい backend を起動
+        // 1. Start new backend
         let mut new_backend = PyrightBackend::spawn(Some(venv)).await?;
 
-        // 2. backend に initialize を送る
+        // 2. Send initialize to backend
         let init_params = self
             .state
             .client_initialize
@@ -859,7 +860,7 @@ impl LspProxy {
         tracing::info!(session = session, "Sending initialize to new backend");
         new_backend.send_message(&init_msg).await?;
 
-        // 3. initialize response を受信
+        // 3. Receive initialize response
         let init_id = 1i64;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
@@ -880,7 +881,10 @@ impl LspProxy {
                                 if let Some(error) = &msg.error {
                                     return Err(ProxyError::Backend(
                                         crate::error::BackendError::InitializeResponseError(
-                                            format!("code={}, message={}", error.code, error.message),
+                                            format!(
+                                                "code={}, message={}",
+                                                error.code, error.message
+                                            ),
                                         ),
                                     ));
                                 }
@@ -918,7 +922,7 @@ impl LspProxy {
             }
         }
 
-        // 4. initialized notification を送る
+        // 4. Send initialized notification
         let initialized_msg = crate::message::RpcMessage {
             jsonrpc: "2.0".to_string(),
             id: None,
@@ -931,7 +935,7 @@ impl LspProxy {
         tracing::info!(session = session, "Sending initialized to backend");
         new_backend.send_message(&initialized_msg).await?;
 
-        // 5. ドキュメント復元（venv の親ディレクトリ配下のみ）
+        // 5. Document restoration (only under venv's parent directory)
         let venv_parent = venv.parent().map(|p| p.to_path_buf());
         let total_docs = self.state.open_documents.len();
         let mut restored = 0;
@@ -1017,9 +1021,11 @@ impl LspProxy {
             "Document restoration completed"
         );
 
-        // スキップしたURIのdiagnosticsをクリア
+        // Clear diagnostics for skipped URIs
         if !skipped_uris.is_empty() {
-            let (ok, clear_failed) = self.clear_diagnostics_for_uris(&skipped_uris, client_writer).await;
+            let (ok, clear_failed) = self
+                .clear_diagnostics_for_uris(&skipped_uris, client_writer)
+                .await;
 
             if clear_failed == 0 {
                 tracing::info!(
@@ -1046,7 +1052,7 @@ impl LspProxy {
         Ok(new_backend)
     }
 
-    /// 未解決リクエストに RequestCancelled を返す
+    /// Return RequestCancelled to unresolved requests
     async fn cancel_pending_requests(
         &mut self,
         client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
@@ -1079,7 +1085,7 @@ impl LspProxy {
         Ok(())
     }
 
-    /// 指定した session の pending request をキャンセル
+    /// Cancel pending requests for specified session
     async fn cancel_pending_requests_for_session(
         &mut self,
         client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
@@ -1116,7 +1122,7 @@ impl LspProxy {
         Ok(())
     }
 
-    /// didChange 処理（Phase 3b-2）
+    /// Handle didChange
     async fn handle_did_change(
         &mut self,
         msg: &crate::message::RpcMessage,
@@ -1125,16 +1131,16 @@ impl LspProxy {
             if let Some(text_document) = params.get("textDocument") {
                 if let Some(uri_str) = text_document.get("uri").and_then(|u| u.as_str()) {
                     if let Ok(url) = url::Url::parse(uri_str) {
-                        // textDocument から version を取得（LSP の version を信頼）
+                        // Get version from textDocument (trust LSP version)
                         let version = text_document
                             .get("version")
                             .and_then(|v| v.as_i64())
                             .map(|v| v as i32);
 
-                        // contentChanges から text を取得
+                        // Get text from contentChanges
                         if let Some(content_changes) = params.get("contentChanges") {
                             if let Some(changes_array) = content_changes.as_array() {
-                                // empty contentChanges チェック
+                                // Check for empty contentChanges
                                 if changes_array.is_empty() {
                                     tracing::debug!(
                                         uri = %url,
@@ -1143,12 +1149,12 @@ impl LspProxy {
                                     return Ok(());
                                 }
 
-                                // ドキュメントが存在する場合のみ更新
+                                // Update only if document exists
                                 if let Some(doc) = self.state.open_documents.get_mut(&url) {
-                                    // 各変更を順番に適用
+                                    // Apply each change in order
                                     for change in changes_array {
                                         if let Some(range) = change.get("range") {
-                                            // Incremental sync: range を使って部分更新
+                                            // Incremental sync: partial update using range
                                             if let Some(new_text) =
                                                 change.get("text").and_then(|t| t.as_str())
                                             {
@@ -1163,7 +1169,7 @@ impl LspProxy {
                                                 );
                                             }
                                         } else {
-                                            // Full sync: 全文置換
+                                            // Full sync: replace entire text
                                             if let Some(new_text) =
                                                 change.get("text").and_then(|t| t.as_str())
                                             {
@@ -1177,7 +1183,7 @@ impl LspProxy {
                                         }
                                     }
 
-                                    // LSP の version を採用
+                                    // Adopt LSP version
                                     if let Some(v) = version {
                                         doc.version = v;
                                     }
@@ -1204,7 +1210,7 @@ impl LspProxy {
         Ok(())
     }
 
-    /// didClose 処理：キャッシュからドキュメントを削除
+    /// Handle didClose: remove document from cache
     async fn handle_did_close(
         &mut self,
         msg: &crate::message::RpcMessage,
@@ -1233,13 +1239,13 @@ impl LspProxy {
         Ok(())
     }
 
-    /// Incremental change を適用（range ベースの部分置換）
+    /// Apply incremental change (range-based partial replacement)
     fn apply_incremental_change(
         text: &mut String,
         range: &serde_json::Value,
         new_text: &str,
     ) -> Result<(), ProxyError> {
-        // range から start/end を取得
+        // Get start/end from range
         let start = range.get("start").ok_or_else(|| {
             ProxyError::InvalidMessage("didChange range missing start".to_string())
         })?;
@@ -1269,11 +1275,11 @@ impl LspProxy {
                 ProxyError::InvalidMessage("didChange end missing character".to_string())
             })? as usize;
 
-        // line/character を byte offset に変換
+        // Convert line/character to byte offset
         let start_offset = Self::position_to_offset(text, start_line, start_char)?;
         let end_offset = Self::position_to_offset(text, end_line, end_char)?;
 
-        // 範囲の検証（start > end は不正）
+        // Validate range (start > end is invalid)
         if start_offset > end_offset {
             return Err(ProxyError::InvalidMessage(format!(
                 "Invalid range: start offset ({}) > end offset ({})",
@@ -1281,14 +1287,14 @@ impl LspProxy {
             )));
         }
 
-        // 範囲を置換
+        // Replace range
         text.replace_range(start_offset..end_offset, new_text);
 
         Ok(())
     }
 
-    /// LSP position (line, character) を byte offset に変換
-    /// LSP の character は UTF-16 code unit 数
+    /// Convert LSP position (line, character) to byte offset
+    /// LSP character is UTF-16 code unit count
     fn position_to_offset(text: &str, line: usize, character: usize) -> Result<usize, ProxyError> {
         let mut current_line = 0;
         let mut line_start_offset = 0;
@@ -1296,7 +1302,7 @@ impl LspProxy {
         for (idx, ch) in text.char_indices() {
             if ch == '\n' {
                 if current_line == line {
-                    // 目的の行の終端に到達（改行文字の前）
+                    // Reached end of target line (before newline character)
                     return Self::find_offset_in_line(text, line_start_offset, idx, character);
                 }
                 current_line += 1;
@@ -1304,20 +1310,20 @@ impl LspProxy {
             }
         }
 
-        // 最終行（改行で終わらない場合）または空テキストの最初の行
+        // Last line (if not ending with newline) or first line of empty text
         if current_line == line {
             return Self::find_offset_in_line(text, line_start_offset, text.len(), character);
         }
 
-        // 行番号が範囲外
+        // Line number out of range
         Err(ProxyError::InvalidMessage(format!(
             "Position out of range: line={} (max={}), character={}",
             line, current_line, character
         )))
     }
 
-    /// 行内で UTF-16 code unit をカウントして byte offset を返す
-    /// character が行長を超える場合は行末に clamp
+    /// Count UTF-16 code units within line and return byte offset
+    /// Clamp to end of line if character exceeds line length
     fn find_offset_in_line(
         text: &str,
         line_start: usize,
@@ -1334,12 +1340,12 @@ impl LspProxy {
             utf16_offset += ch.len_utf16();
         }
 
-        // character が行長を超える場合は行末に clamp
+        // Clamp to end of line if character exceeds line length
         Ok(line_end)
     }
 }
 
-/// エラーレスポンスを作成（Disabled 時のリクエストに返す）
+/// Create error response (returned for requests in Disabled state)
 fn create_error_response(request: &RpcMessage, message: &str) -> RpcMessage {
     RpcMessage {
         jsonrpc: "2.0".to_string(),
@@ -1348,7 +1354,7 @@ fn create_error_response(request: &RpcMessage, message: &str) -> RpcMessage {
         params: None,
         result: None,
         error: Some(crate::message::RpcError {
-            code: -32603,  // Internal error (互換性のため)
+            code: -32603, // Internal error (for compatibility)
             message: message.to_string(),
             data: None,
         }),
@@ -1379,16 +1385,16 @@ mod tests {
 
     #[test]
     fn test_position_to_offset_multibyte() {
-        // マルチバイト文字を含むテキスト
+        // Text containing multibyte characters (Japanese: "hello")
         let text = "こんにちは\nworld\n";
 
         // line 0, char 0 -> offset 0
         assert_eq!(LspProxy::position_to_offset(text, 0, 0).unwrap(), 0);
 
-        // line 0, char 1 -> offset 3 (after "こ")
+        // line 0, char 1 -> offset 3 (after first Japanese character)
         assert_eq!(LspProxy::position_to_offset(text, 0, 1).unwrap(), 3);
 
-        // line 1, char 0 -> offset 16 (start of "world", after "こんにちは\n")
+        // line 1, char 0 -> offset 16 (start of "world", after Japanese text + newline)
         assert_eq!(LspProxy::position_to_offset(text, 1, 0).unwrap(), 16);
     }
 
@@ -1412,7 +1418,7 @@ mod tests {
             "end": { "line": 0, "character": 5 }
         });
 
-        // 挿入（range が空）
+        // Insert (empty range)
         LspProxy::apply_incremental_change(&mut text, &range, " beautiful").unwrap();
         assert_eq!(text, "hello beautiful world");
     }
@@ -1425,7 +1431,7 @@ mod tests {
             "end": { "line": 0, "character": 15 }
         });
 
-        // 削除（new_text が空）
+        // Delete (empty new_text)
         LspProxy::apply_incremental_change(&mut text, &range, "").unwrap();
         assert_eq!(text, "hello world");
     }
@@ -1438,7 +1444,7 @@ mod tests {
             "end": { "line": 1, "character": 16 }
         });
 
-        // "hello" を "world" に置換
+        // Replace "hello" with "world"
         LspProxy::apply_incremental_change(&mut text, &range, "world").unwrap();
         assert_eq!(text, "def hello():\n    print('world')\n");
     }
@@ -1451,16 +1457,16 @@ mod tests {
             "end": { "line": 2, "character": 0 }
         });
 
-        // 複数行にまたがる削除
+        // Delete spanning multiple lines
         LspProxy::apply_incremental_change(&mut text, &range, "").unwrap();
         assert_eq!(text, "line1line3\n");
     }
 
     #[test]
     fn test_position_to_offset_surrogate_pair() {
-        // サロゲートペア（絵文字）を含むテキスト
-        // 😀 は U+1F600 で UTF-16 では 2 code units (サロゲートペア)
-        // UTF-8 では 4 bytes
+        // Text containing surrogate pair (emoji)
+        // 😀 is U+1F600, 2 code units in UTF-16 (surrogate pair)
+        // 4 bytes in UTF-8
         let text = "a😀b\n";
 
         // line 0, char 0 -> offset 0 (before 'a')
@@ -1469,7 +1475,7 @@ mod tests {
         // line 0, char 1 -> offset 1 (before '😀')
         assert_eq!(LspProxy::position_to_offset(text, 0, 1).unwrap(), 1);
 
-        // line 0, char 3 -> offset 5 (before 'b', 😀 は UTF-16 で 2 code units)
+        // line 0, char 3 -> offset 5 (before 'b', emoji is 2 UTF-16 code units)
         assert_eq!(LspProxy::position_to_offset(text, 0, 3).unwrap(), 5);
 
         // line 0, char 4 -> offset 6 (before '\n')
@@ -1478,13 +1484,13 @@ mod tests {
 
     #[test]
     fn test_position_to_offset_line_end_clamp() {
-        // 行末を超える character は行末に clamp される
+        // Character exceeding line end is clamped to line end
         let text = "abc\ndef\n";
 
-        // line 0, char 100 -> offset 3 (行末に clamp)
+        // line 0, char 100 -> offset 3 (clamped to line end)
         assert_eq!(LspProxy::position_to_offset(text, 0, 100).unwrap(), 3);
 
-        // line 1, char 100 -> offset 7 (行末に clamp)
+        // line 1, char 100 -> offset 7 (clamped to line end)
         assert_eq!(LspProxy::position_to_offset(text, 1, 100).unwrap(), 7);
     }
 
@@ -1492,14 +1498,14 @@ mod tests {
     fn test_position_to_offset_line_out_of_range() {
         let text = "abc\ndef\n";
 
-        // line 10 は範囲外
+        // line 10 is out of range
         let result = LspProxy::position_to_offset(text, 10, 0);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_apply_incremental_change_invalid_range() {
-        // start > end の不正な範囲
+        // Invalid range where start > end
         let mut text = "hello world".to_string();
         let range = json!({
             "start": { "line": 0, "character": 10 },
@@ -1512,9 +1518,9 @@ mod tests {
 
     #[test]
     fn test_apply_incremental_change_with_emoji() {
-        // 絵文字を含むテキストの編集
+        // Editing text containing emoji
         let mut text = "hello 😀 world".to_string();
-        // "😀 " を削除 (position 6 から 9: 😀 は UTF-16 で 2 code units + space 1)
+        // Delete "😀 " (position 6 to 9: 😀 is 2 UTF-16 code units + 1 space)
         let range = json!({
             "start": { "line": 0, "character": 6 },
             "end": { "line": 0, "character": 9 }
@@ -1528,13 +1534,13 @@ mod tests {
     fn test_position_to_offset_empty_text() {
         let text = "";
 
-        // 空テキストでも line 0, char 0 は有効
+        // line 0, char 0 is valid even for empty text
         assert_eq!(LspProxy::position_to_offset(text, 0, 0).unwrap(), 0);
     }
 
     #[test]
     fn test_position_to_offset_no_trailing_newline() {
-        // 末尾に改行がないテキスト
+        // Text without trailing newline
         let text = "abc";
 
         assert_eq!(LspProxy::position_to_offset(text, 0, 0).unwrap(), 0);

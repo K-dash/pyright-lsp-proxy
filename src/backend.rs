@@ -14,25 +14,25 @@ pub struct PyrightBackend {
 }
 
 impl PyrightBackend {
-    /// pyright-langserver を起動
+    /// Spawn pyright-langserver
     ///
-    /// venv_path が Some の場合、VIRTUAL_ENV と PATH を設定
+    /// When venv_path is Some, set VIRTUAL_ENV and PATH
     pub async fn spawn(venv_path: Option<&Path>) -> Result<Self, BackendError> {
         let mut cmd = Command::new("pyright-langserver");
         cmd.arg("--stdio")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit()) // stderr は親に継承（デバッグ用）
+            .stderr(Stdio::inherit()) // Inherit stderr to parent (for debugging)
             .kill_on_drop(true);
 
-        // 環境変数設定
+        // Set environment variables
         if let Some(venv) = venv_path {
             let venv_str = venv.to_string_lossy();
 
-            // VIRTUAL_ENV を設定
+            // Set VIRTUAL_ENV
             cmd.env("VIRTUAL_ENV", venv_str.as_ref());
 
-            // PATH の先頭に .venv/bin を追加
+            // Prepend .venv/bin to PATH
             let current_path = std::env::var("PATH").unwrap_or_default();
             let new_path = format!("{}/bin:{}", venv_str, current_path);
             cmd.env("PATH", &new_path);
@@ -62,7 +62,7 @@ impl PyrightBackend {
         })
     }
 
-    /// メッセージを送信
+    /// Send message
     pub async fn send_message(&mut self, message: &RpcMessage) -> Result<(), BackendError> {
         self.writer
             .write_message(message)
@@ -71,7 +71,7 @@ impl PyrightBackend {
         Ok(())
     }
 
-    /// メッセージを受信
+    /// Receive message
     pub async fn read_message(&mut self) -> Result<RpcMessage, BackendError> {
         self.reader
             .read_message()
@@ -79,12 +79,12 @@ impl PyrightBackend {
             .map_err(|e| BackendError::SpawnFailed(std::io::Error::other(e)))
     }
 
-    /// backend を graceful shutdown する（Phase 3b-1）
+    /// Gracefully shutdown backend
     ///
-    /// 1. shutdown request 送信（1〜2秒待つ）
-    /// 2. exit notification 送信（1秒待つ）
-    /// 3. プロセス wait（1秒待つ）
-    /// 4. ダメなら kill
+    /// 1. Send shutdown request (wait 1-2 seconds)
+    /// 2. Send exit notification (wait 1 second)
+    /// 3. Wait for process (1 second)
+    /// 4. Kill if failed
     pub async fn shutdown_gracefully(&mut self) -> Result<(), BackendError> {
         let shutdown_id = self.next_id;
         self.next_id += 1;
@@ -94,7 +94,7 @@ impl PyrightBackend {
             "Sending shutdown request to backend"
         );
 
-        // shutdown request 送信
+        // Send shutdown request
         let shutdown_msg = RpcMessage {
             jsonrpc: "2.0".to_string(),
             id: Some(RpcId::Number(shutdown_id as i64)),
@@ -109,7 +109,7 @@ impl PyrightBackend {
             return self.kill_backend().await;
         }
 
-        // shutdown response を 2秒待つ（通知はスキップしてレスポンスを待つ）
+        // Wait 2 seconds for shutdown response (skip notifications, wait for response)
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -122,9 +122,9 @@ impl PyrightBackend {
 
             match wait_result {
                 Ok(Ok(msg)) => {
-                    // レスポンス（id あり）か確認
+                    // Check if response (has id)
                     if msg.is_response() {
-                        // shutdown_id と一致するか確認
+                        // Check if matches shutdown_id
                         if let Some(RpcId::Number(id)) = &msg.id {
                             if *id == shutdown_id as i64 {
                                 tracing::info!(response_id = ?msg.id, "Received shutdown response");
@@ -134,7 +134,7 @@ impl PyrightBackend {
                             }
                         }
                     } else {
-                        // 通知は無視してループ継続
+                        // Ignore notifications and continue loop
                         tracing::debug!(method = ?msg.method, "Received notification during shutdown, ignoring");
                     }
                 }
@@ -149,7 +149,7 @@ impl PyrightBackend {
             }
         }
 
-        // exit notification 送信
+        // Send exit notification
         let exit_msg = RpcMessage {
             jsonrpc: "2.0".to_string(),
             id: None,
@@ -165,7 +165,7 @@ impl PyrightBackend {
 
         tracing::debug!("Sent exit notification, waiting for process to exit");
 
-        // プロセス wait を 1秒待つ
+        // Wait 1 second for process to exit
         let wait_result = tokio::time::timeout(Duration::from_secs(1), self.child.wait()).await;
 
         match wait_result {
@@ -181,15 +181,15 @@ impl PyrightBackend {
             }
         }
 
-        // ダメなら kill
+        // Kill if failed
         self.kill_backend().await
     }
 
-    /// backend プロセスを強制終了
+    /// Force kill backend process
     async fn kill_backend(&mut self) -> Result<(), BackendError> {
         tracing::warn!("Killing backend process");
 
-        // SIGTERM を送る（kill が非同期で完了しない可能性があるので start_kill）
+        // Send SIGTERM (use start_kill since kill may not complete async)
         if let Err(e) = self.child.start_kill() {
             tracing::error!(error = ?e, "Failed to kill backend");
             return Err(BackendError::SpawnFailed(std::io::Error::other(
@@ -197,7 +197,7 @@ impl PyrightBackend {
             )));
         }
 
-        // wait して終了を確認（タイムアウト付き）
+        // Wait and confirm termination (with timeout)
         let wait_result = tokio::time::timeout(Duration::from_millis(500), self.child.wait()).await;
 
         match wait_result {

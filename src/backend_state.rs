@@ -1,15 +1,15 @@
 use crate::backend::PyrightBackend;
 use std::path::PathBuf;
 
-/// backend の状態
+/// Backend state
 pub enum BackendState {
-    /// backend が動作中
+    /// Backend is running
     Running {
         backend: Box<PyrightBackend>,
         active_venv: PathBuf,
         session: u64,
     },
-    /// backend が無効（venv が見つからない）
+    /// Backend is disabled (venv not found)
     Disabled {
         reason: String,
         last_file: Option<PathBuf>,
@@ -17,12 +17,12 @@ pub enum BackendState {
 }
 
 impl BackendState {
-    /// backend が Disabled 状態かどうか
+    /// Check if backend is in Disabled state
     pub fn is_disabled(&self) -> bool {
         matches!(self, BackendState::Disabled { .. })
     }
 
-    /// active_venv を取得（Running 時のみ）
+    /// Get active_venv (only when Running)
     pub fn active_venv(&self) -> Option<&PathBuf> {
         match self {
             BackendState::Running { active_venv, .. } => Some(active_venv),
@@ -30,7 +30,7 @@ impl BackendState {
         }
     }
 
-    /// Disabled 状態の詳細を取得
+    /// Get details of Disabled state
     pub fn disabled_info(&self) -> Option<(&str, Option<&PathBuf>)> {
         match self {
             BackendState::Disabled { reason, last_file } => {
@@ -40,7 +40,7 @@ impl BackendState {
         }
     }
 
-    /// Running 時の session を取得
+    /// Get session when Running
     pub fn session(&self) -> Option<u64> {
         match self {
             BackendState::Running { session, .. } => Some(*session),

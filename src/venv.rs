@@ -5,7 +5,7 @@ use tokio::process::Command;
 const VENV_DIR: &str = ".venv";
 const PYVENV_CFG: &str = "pyvenv.cfg";
 
-/// git rev-parse --show-toplevel を実行して結果を取得
+/// Execute git rev-parse --show-toplevel and get result
 pub async fn get_git_toplevel(working_dir: &Path) -> Result<Option<PathBuf>, VenvError> {
     let output = match Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
@@ -31,11 +31,11 @@ pub async fn get_git_toplevel(working_dir: &Path) -> Result<Option<PathBuf>, Ven
     }
 }
 
-/// ファイルパスから親を辿って .venv を探索
+/// Search for .venv by traversing parent directories from file path
 ///
 /// # Arguments
-/// * `file_path` - 起点となるファイルパス
-/// * `git_toplevel` - 探索上限（None の場合はルートまで探索）
+/// * `file_path` - Starting file path
+/// * `git_toplevel` - Search boundary (if None, search up to root)
 pub async fn find_venv(
     file_path: &Path,
     git_toplevel: Option<&Path>,
@@ -46,7 +46,7 @@ pub async fn find_venv(
         "Starting .venv search"
     );
 
-    // ファイルの親ディレクトリから開始
+    // Start from file's parent directory
     let mut current = file_path.parent();
     let mut depth = 0;
 
@@ -57,7 +57,7 @@ pub async fn find_venv(
             "Searching for .venv"
         );
 
-        // git toplevel を超えたら終了
+        // Stop if we exceed git toplevel
         if let Some(toplevel) = git_toplevel {
             if !dir.starts_with(toplevel) {
                 tracing::debug!(
@@ -69,7 +69,7 @@ pub async fn find_venv(
             }
         }
 
-        // .venv/pyvenv.cfg の存在確認
+        // Check for .venv/pyvenv.cfg existence
         let venv_path = dir.join(VENV_DIR);
         let pyvenv_cfg = venv_path.join(PYVENV_CFG);
 
@@ -82,7 +82,7 @@ pub async fn find_venv(
             return Ok(Some(venv_path));
         }
 
-        // 親ディレクトリへ
+        // Move to parent directory
         current = dir.parent();
         depth += 1;
     }
@@ -95,14 +95,14 @@ pub async fn find_venv(
     Ok(None)
 }
 
-/// fallback env を探索（起動時 cwd から .venv 探索）
+/// Search for fallback env (.venv search from cwd at startup)
 pub async fn find_fallback_venv(cwd: &Path) -> Result<Option<PathBuf>, VenvError> {
     tracing::info!(cwd = %cwd.display(), "Searching for fallback .venv");
 
-    // 1. git toplevel を取得
+    // 1. Get git toplevel
     let git_toplevel = get_git_toplevel(cwd).await?;
 
-    // 2. toplevel から .venv 探索
+    // 2. Search for .venv from toplevel
     if let Some(toplevel) = &git_toplevel {
         let venv_path = toplevel.join(VENV_DIR);
         let pyvenv_cfg = venv_path.join(PYVENV_CFG);
@@ -126,7 +126,7 @@ pub async fn find_fallback_venv(cwd: &Path) -> Result<Option<PathBuf>, VenvError
         tracing::debug!("No git toplevel found, skipping toplevel check");
     }
 
-    // 3. cwd から .venv 探索
+    // 3. Search for .venv from cwd
     let venv_path = cwd.join(VENV_DIR);
     let pyvenv_cfg = venv_path.join(PYVENV_CFG);
 

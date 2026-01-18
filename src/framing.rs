@@ -4,7 +4,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 
 const CONTENT_LENGTH: &str = "Content-Length: ";
 
-/// LSP フレームリーダー
+/// LSP frame reader
 pub struct LspFrameReader<R> {
     reader: BufReader<R>,
     debug: bool,
@@ -18,21 +18,21 @@ impl<R: AsyncRead + Unpin> LspFrameReader<R> {
         }
     }
 
-    /// 1つの LSP メッセージを読み取る
+    /// Read one LSP message
     pub async fn read_message(&mut self) -> Result<RpcMessage, FramingError> {
-        // 1. ヘッダー部を読み取る
+        // 1. Read header section
         let content_length = self.read_headers().await?;
 
-        // 2. コンテンツ部を読み取る
+        // 2. Read content section
         let mut content = vec![0u8; content_length];
         self.reader.read_exact(&mut content).await?;
 
-        // デバッグ出力
+        // Debug output
         if self.debug {
             eprintln!("[DEBUG RX] {}", String::from_utf8_lossy(&content));
         }
 
-        // 3. JSON としてパース
+        // 3. Parse as JSON
         let message: RpcMessage = serde_json::from_slice(&content)?;
 
         Ok(message)
@@ -45,7 +45,7 @@ impl<R: AsyncRead + Unpin> LspFrameReader<R> {
             let mut line = String::new();
             let bytes_read = self.reader.read_line(&mut line).await?;
 
-            // EOF 検知（read_line が 0 を返す）
+            // Detect EOF (read_line returns 0)
             if bytes_read == 0 {
                 return Err(FramingError::Io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -53,12 +53,12 @@ impl<R: AsyncRead + Unpin> LspFrameReader<R> {
                 )));
             }
 
-            // 空行（\r\n のみ）はヘッダー終了
+            // Empty line (\r\n only) marks end of headers
             if line == "\r\n" {
                 break;
             }
 
-            // Content-Length ヘッダーをパース
+            // Parse Content-Length header
             let line = line.trim();
             if let Some(len_str) = line.strip_prefix(CONTENT_LENGTH) {
                 content_length = Some(
@@ -67,14 +67,14 @@ impl<R: AsyncRead + Unpin> LspFrameReader<R> {
                         .map_err(|_| FramingError::InvalidContentLength)?,
                 );
             }
-            // Content-Type は無視（UTF-8 前提）
+            // Ignore Content-Type (assume UTF-8)
         }
 
         content_length.ok_or(FramingError::MissingContentLength)
     }
 }
 
-/// LSP フレームライター
+/// LSP frame writer
 pub struct LspFrameWriter<W> {
     writer: W,
     debug: bool,
@@ -88,11 +88,11 @@ impl<W: AsyncWrite + Unpin> LspFrameWriter<W> {
         }
     }
 
-    /// LSP メッセージを書き込む
+    /// Write LSP message
     pub async fn write_message(&mut self, message: &RpcMessage) -> Result<(), FramingError> {
         let content = serde_json::to_vec(message)?;
 
-        // デバッグ出力
+        // Debug output
         if self.debug {
             eprintln!("[DEBUG TX] {}", String::from_utf8_lossy(&content));
         }

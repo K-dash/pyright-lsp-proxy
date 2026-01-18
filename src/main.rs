@@ -26,9 +26,9 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // ログ初期化（デフォルトは stderr、--log-file でファイル出力を追加）
+    // Initialize logging (default: stderr, --log-file adds file output)
     if let Some(log_path) = &args.log_file {
-        // ファイル出力が指定された場合：stderr + ファイル
+        // File output specified: stderr + file
         let file_appender = RollingFileAppender::new(
             Rotation::NEVER,
             log_path.parent().unwrap_or(std::path::Path::new(".")),
@@ -63,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
             "Starting pyright-lsp-proxy (logging to stderr and file)"
         );
     } else {
-        // デフォルト：stderr のみ
+        // Default: stderr only
         tracing_subscriber::registry()
             .with(
                 fmt::layer()
@@ -81,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Starting pyright-lsp-proxy (logging to stderr only)");
     }
 
-    // プロキシを起動
+    // Start proxy
     let mut proxy = LspProxy::new();
     proxy.run().await?;
 

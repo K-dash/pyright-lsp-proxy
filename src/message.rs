@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// JSON-RPC メッセージの共通構造（パススルー用）
+/// Common structure for JSON-RPC messages (for passthrough)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcMessage {
     pub jsonrpc: String,
@@ -33,22 +33,22 @@ pub struct RpcError {
 }
 
 impl RpcMessage {
-    /// リクエストかどうか
+    /// Check if this is a request
     pub fn is_request(&self) -> bool {
         self.id.is_some() && self.method.is_some()
     }
 
-    /// 通知かどうか
+    /// Check if this is a notification
     pub fn is_notification(&self) -> bool {
         self.id.is_none() && self.method.is_some()
     }
 
-    /// レスポンスかどうか
+    /// Check if this is a response
     pub fn is_response(&self) -> bool {
         self.id.is_some() && self.method.is_none()
     }
 
-    /// メソッド名を取得
+    /// Get method name
     pub fn method_name(&self) -> Option<&str> {
         self.method.as_deref()
     }
