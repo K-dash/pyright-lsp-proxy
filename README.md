@@ -31,7 +31,8 @@ Intel macOS users must build from source (prebuilt binaries are arm64 only).
 
 ## Installation
 
-> **Note**: Claude Code restart is required only for initial installation. After installation, `.venv` creation and switching no longer require restarts.
+> [!Note]
+> Claude Code restart is required only for initial installation. After installation, `.venv` creation and switching no longer require restarts.
 
 ### Prerequisites
 
@@ -52,7 +53,8 @@ which pyright-langserver
 
 #### 2. Disable Official pyright Plugin
 
-**Important**: You must disable the official pyright plugin. Having both enabled causes conflicts.
+> [!Important]
+> You must disable the official pyright plugin. Having both enabled causes conflicts.
 
 ```bash
 /plugin disable pyright-lsp@claude-plugins-official
@@ -60,7 +62,8 @@ which pyright-langserver
 
 ### Method A: From GitHub Marketplace (Recommended)
 
-> **Note**: Installation uses GitHub API and `curl`. It may fail in offline environments or under rate limiting.
+> [!Note]
+> Installation uses GitHub API and `curl`. It may fail in offline environments or under rate limiting.
 
 ```bash
 # 1. Add marketplace
@@ -205,7 +208,7 @@ tail -100 /tmp/pyright-lsp-proxy.log  # Check logs
 
 For design philosophy, state transitions, and internal implementation details, see:
 
-→ [ARCHITECTURE.md](./ARCHITECTURE.md)
+[ARCHITECTURE.md](./ARCHITECTURE.md)
 
 ## License
 
