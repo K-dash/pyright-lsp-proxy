@@ -33,7 +33,24 @@ Intel macOS users must build from source (prebuilt binaries are arm64 only).
 
 > **Note**: Claude Code restart is required only for initial installation. After installation, `.venv` creation and switching no longer require restarts.
 
-### Prerequisite: Disable Official pyright Plugin
+### Prerequisites
+
+#### 1. Install pyright-langserver
+
+This proxy requires `pyright-langserver` to be available in your PATH.
+
+```bash
+# Install via npm (recommended)
+npm install -g pyright
+
+# Or via pip
+pip install pyright
+
+# Verify installation
+which pyright-langserver
+```
+
+#### 2. Disable Official pyright Plugin
 
 **Important**: You must disable the official pyright plugin. Having both enabled causes conflicts.
 
