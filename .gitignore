@@ -33,4 +33,3 @@ bin/pyright-lsp-proxy-linux-x86_64
 
 # Local plugin development configuration
 plugins/
-README.md

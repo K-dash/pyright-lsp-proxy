@@ -32,7 +32,15 @@ case "$OS" in
     fi
     ;;
   Linux)
-    BINARY_NAME="pyright-lsp-proxy-linux-x86_64"
+    if [ "$ARCH" = "x86_64" ]; then
+      BINARY_NAME="pyright-lsp-proxy-linux-x86_64"
+    elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+      BINARY_NAME="pyright-lsp-proxy-linux-arm64"
+    else
+      echo "[pyright-lsp-proxy] ERROR: Unsupported Linux architecture: $ARCH" >&2
+      echo "[pyright-lsp-proxy] Supported Linux architectures: x86_64, arm64" >&2
+      exit 1
+    fi
     ;;
   *)
     echo "[pyright-lsp-proxy] ERROR: Unsupported platform: $OS" >&2
