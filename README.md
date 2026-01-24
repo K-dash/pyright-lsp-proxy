@@ -1,15 +1,35 @@
+<div align="center">
+
 # pyright-lsp-proxy
 
-**Claude Code-specific** LSP proxy.
+**Claude Code-specific LSP proxy that handles virtual environment switching seamlessly**
+
+<div align="center">
+  <a href="https://github.com/K-dash/pyright-lsp-proxy/graphs/commit-activity"><img alt="GitHub commit activity" src="https://img.shields.io/github/commit-activity/m/K-dash/pyright-lsp-proxy"/></a>
+  <a href="https://github.com/K-dash/pyright-lsp-proxy/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/LICENSE-MIT-green"/></a>
+  <a href="https://www.rust-lang.org/"><img alt="Rust" src="https://img.shields.io/badge/rust-1.75+-orange.svg"/></a>
+</div>
+
+<p>
+  <a href="#problems-solved">Problems Solved</a>
+  ◆ <a href="#installation">Installation</a>
+  ◆ <a href="#usage">Usage</a>
+  ◆ <a href="#typical-use-case">Typical Use Case</a>
+  ◆ <a href="#architecture">Architecture</a>
+</p>
+
+</div>
+
+---
 
 Claude Code cannot handle language server restarts or reconnections, so reflecting `.venv` creation or switching previously required restarting Claude Code itself.
 pyright-lsp-proxy breaks through this limitation, reflecting virtual environment changes **within your running session**.
 
 ## Problems Solved
 
-- **venv switching in monorepos**: Pyright assumes a single venv, causing incorrect type checking and completions when moving between projects
-- **Dynamic .venv creation in worktrees**: When `.venv` is created later via hooks, etc., Claude Code restart was previously required
-- **Transparent switch on venv change**: LSP requests (hover, definition, etc.) are sent to the new backend after a switch, so the current request does not surface "Request cancelled"
+- **🔄 venv switching in monorepos** - Pyright assumes a single venv, causing incorrect type checking and completions when moving between projects
+- **⚡ Dynamic .venv creation in worktrees** - When `.venv` is created later via hooks, etc., Claude Code restart was previously required
+- **🔀 Transparent switch on venv change** - LSP requests (hover, definition, etc.) are sent to the new backend after a switch, so the current request does not surface "Request cancelled"
 
 pyright-lsp-proxy restarts pyright-langserver in the background and automatically restores open documents. Claude Code always communicates with the proxy, so it doesn't notice backend switches.
 
@@ -17,11 +37,13 @@ pyright-lsp-proxy restarts pyright-langserver in the background and automaticall
 
 ### Supported OS
 
-- macOS (arm64 only)
-- Linux (x86_64 / arm64)
+| Platform | Architecture |
+|----------|--------------|
+| macOS | arm64 only |
+| Linux | x86_64 / arm64 |
 
-Windows is currently unsupported (due to path handling differences).
-Intel macOS users must build from source (prebuilt binaries are arm64 only).
+> **Note**: Windows is currently unsupported (due to path handling differences).
+> Intel macOS users must build from source (prebuilt binaries are arm64 only).
 
 ### Prerequisites
 
@@ -126,10 +148,10 @@ Default output is stderr. For file output:
 PYRIGHT_LSP_PROXY_LOG_FILE=/tmp/pyright-lsp-proxy.log ./target/release/pyright-lsp-proxy
 ```
 
-| Environment Variable         | Description   | Default                   |
-| ---------------------------- | ------------- | ------------------------- |
-| `PYRIGHT_LSP_PROXY_LOG_FILE` | Log file path | Not set (stderr only)     |
-| `RUST_LOG`                   | Log level     | `pyright_lsp_proxy=debug` |
+| Environment Variable | Description | Default |
+|----------------------|-------------|---------|
+| `PYRIGHT_LSP_PROXY_LOG_FILE` | Log file path | Not set (stderr only) |
+| `RUST_LOG` | Log level | `pyright_lsp_proxy=debug` |
 
 For config file method and details, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
@@ -152,12 +174,12 @@ my-monorepo/
 
 ### Operation Sequence
 
-| Action                          | Proxy Behavior                                              |
-| ------------------------------- | ----------------------------------------------------------- |
-| 1. Start Claude Code            | Search for fallback .venv (start without venv if not found) |
-| 2. Open `project-a/src/main.py` | Detect `project-a/.venv` → start session 1                  |
-| 3. Open `project-b/src/main.py` | Detect `project-b/.venv` → switch to session 2              |
-| 4. Session 2 startup complete   | Restore only documents under project-b                      |
+| Action | Proxy Behavior |
+|--------|----------------|
+| 1. Start Claude Code | Search for fallback .venv (start without venv if not found) |
+| 2. Open `project-a/src/main.py` | Detect `project-a/.venv` → start session 1 |
+| 3. Open `project-b/src/main.py` | Detect `project-b/.venv` → switch to session 2 |
+| 4. Session 2 startup complete | Restore only documents under project-b |
 
 ### What Actually Happens
 
@@ -197,19 +219,19 @@ tail -100 /tmp/pyright-lsp-proxy.log  # Check logs
 
 ## Known Limitations
 
-| Item                    | Limitation                                              | Workaround           |
-| ----------------------- | ------------------------------------------------------- | -------------------- |
-| Windows unsupported     | Path handling assumes Unix-like systems                 | Use WSL2             |
-| macOS Intel unsupported | Prebuilt is arm64 only                                  | Use Apple Silicon    |
-| Fixed venv name         | Only detects `.venv` (`venv`, `env` not supported)      | Rename to `.venv`    |
-| Symlinks                | May fail to detect `pyvenv.cfg` if `.venv` is a symlink | Use actual directory |
+| Item | Limitation | Workaround |
+|------|------------|------------|
+| Windows unsupported | Path handling assumes Unix-like systems | Use WSL2 |
+| macOS Intel unsupported | Prebuilt is arm64 only | Use Apple Silicon |
+| Fixed venv name | Only detects `.venv` (`venv`, `env` not supported) | Rename to `.venv` |
+| Symlinks | May fail to detect `pyvenv.cfg` if `.venv` is a symlink | Use actual directory |
 
 ## Architecture
 
 For design philosophy, state transitions, and internal implementation details, see:
 
-[ARCHITECTURE.md](./ARCHITECTURE.md)
+**[ARCHITECTURE.md](./ARCHITECTURE.md)**
 
 ## License
 
-MIT
+This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
