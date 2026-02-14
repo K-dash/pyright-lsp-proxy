@@ -1,4 +1,4 @@
-use crate::backend::PyrightBackend;
+use crate::backend::LspBackend;
 use crate::backend_pool::{shutdown_backend_instance, spawn_reader_task, BackendInstance};
 use crate::error::ProxyError;
 use crate::framing::LspFrameWriter;
@@ -14,7 +14,7 @@ impl super::LspProxy {
     pub(crate) async fn dispatch_initialize(
         &mut self,
         msg: &RpcMessage,
-        pending_initial_backend: &mut Option<(PyrightBackend, PathBuf)>,
+        pending_initial_backend: &mut Option<(LspBackend, PathBuf)>,
         client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
     ) -> Result<(), ProxyError> {
         tracing::info!("Caching initialize message for backend initialization");
@@ -223,7 +223,7 @@ impl super::LspProxy {
                             }
                             Ok(None) => {
                                 // No venv found — return error
-                                let error_message = "pyright-lsp-proxy: .venv not found (strict mode). Create .venv or run hooks.";
+                                let error_message = "lsp-proxy: .venv not found (strict mode). Create .venv or run hooks.";
                                 tracing::warn!(
                                     method = method_name,
                                     uri = %url,
@@ -237,7 +237,7 @@ impl super::LspProxy {
                                 tracing::error!(error = ?e, "Failed to ensure backend in pool");
                                 let error_response = RpcMessage::error_response(
                                     msg,
-                                    &format!("pyright-lsp-proxy: backend error: {}", e),
+                                    &format!("lsp-proxy: backend error: {}", e),
                                 );
                                 client_writer.write_message(&error_response).await?;
                                 return Ok(());
@@ -278,14 +278,14 @@ impl super::LspProxy {
             } else {
                 // Backend disappeared (race with crash handling)
                 let error_response =
-                    RpcMessage::error_response(msg, "pyright-lsp-proxy: backend not available");
+                    RpcMessage::error_response(msg, "lsp-proxy: backend not available");
                 client_writer.write_message(&error_response).await?;
             }
         } else {
             // No target backend — check if any backend exists
             if self.state.pool.is_empty() {
                 let error_message =
-                    "pyright-lsp-proxy: .venv not found (strict mode). Create .venv or run hooks.";
+                    "lsp-proxy: .venv not found (strict mode). Create .venv or run hooks.";
                 let error_response = RpcMessage::error_response(msg, error_message);
                 client_writer.write_message(&error_response).await?;
             } else {

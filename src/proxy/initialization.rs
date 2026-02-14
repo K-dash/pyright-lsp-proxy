@@ -1,4 +1,4 @@
-use crate::backend::PyrightBackend;
+use crate::backend::LspBackend;
 use crate::backend_pool::{spawn_reader_task, BackendInstance};
 use crate::error::ProxyError;
 use crate::framing::LspFrameWriter;
@@ -11,7 +11,7 @@ impl super::LspProxy {
     /// Returns the initialize response to forward to the client.
     pub(crate) async fn complete_backend_initialization(
         &self,
-        backend: &mut PyrightBackend,
+        backend: &mut LspBackend,
         venv: &Path,
         _client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
     ) -> Result<RpcMessage, ProxyError> {
@@ -124,7 +124,7 @@ impl super::LspProxy {
         );
 
         // 1. Spawn
-        let mut backend = PyrightBackend::spawn(Some(venv)).await?;
+        let mut backend = LspBackend::spawn(self.state.backend_kind, Some(venv)).await?;
 
         // 2. Initialize handshake (direct read/write before split)
         let init_params = self
@@ -229,7 +229,7 @@ impl super::LspProxy {
     /// Restore documents belonging to a venv to a backend
     pub(crate) async fn restore_documents_to_backend(
         &self,
-        backend: &mut PyrightBackend,
+        backend: &mut LspBackend,
         venv: &Path,
         session: u64,
         _client_writer: &mut LspFrameWriter<tokio::io::Stdout>,

@@ -6,7 +6,60 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
-/// Components returned by `PyrightBackend::into_split()`
+/// Supported LSP backend types for Python type checking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum BackendKind {
+    Pyright,
+    Ty,
+    Pyrefly,
+}
+
+impl BackendKind {
+    /// Short name for logging (matches CLI value)
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::Pyright => "pyright",
+            Self::Ty => "ty",
+            Self::Pyrefly => "pyrefly",
+        }
+    }
+
+    fn command(&self) -> &'static str {
+        match self {
+            Self::Pyright => "pyright-langserver",
+            Self::Ty => "ty",
+            Self::Pyrefly => "pyrefly",
+        }
+    }
+
+    fn args(&self) -> &'static [&'static str] {
+        match self {
+            Self::Pyright => &["--stdio"],
+            Self::Ty => &["server"],
+            Self::Pyrefly => &["lsp"],
+        }
+    }
+
+    /// Apply backend-specific environment variables to the command.
+    /// Currently all backends use VIRTUAL_ENV + PATH, but this method
+    /// provides the extension point for future backend-specific env setup.
+    pub fn apply_env(&self, cmd: &mut Command, venv: &Path) {
+        let venv_str = venv.to_string_lossy();
+        cmd.env("VIRTUAL_ENV", venv_str.as_ref());
+
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}/bin:{}", venv_str, current_path);
+        cmd.env("PATH", &new_path);
+    }
+}
+
+impl std::fmt::Display for BackendKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.display_name())
+    }
+}
+
+/// Components returned by `LspBackend::into_split()`
 pub struct BackendParts {
     pub reader: LspFrameReader<ChildStdout>,
     pub writer: LspFrameWriter<ChildStdin>,
@@ -14,44 +67,41 @@ pub struct BackendParts {
     pub next_id: u64,
 }
 
-pub struct PyrightBackend {
+pub struct LspBackend {
     child: Child,
     reader: LspFrameReader<ChildStdout>,
     writer: LspFrameWriter<ChildStdin>,
     next_id: u64,
 }
 
-impl PyrightBackend {
-    /// Spawn pyright-langserver
+impl LspBackend {
+    /// Spawn an LSP backend process.
     ///
-    /// When venv_path is Some, set VIRTUAL_ENV and PATH
-    pub async fn spawn(venv_path: Option<&Path>) -> Result<Self, BackendError> {
-        let mut cmd = Command::new("pyright-langserver");
-        cmd.arg("--stdio")
-            .stdin(Stdio::piped())
+    /// When venv_path is Some, apply backend-specific environment variables.
+    pub async fn spawn(kind: BackendKind, venv_path: Option<&Path>) -> Result<Self, BackendError> {
+        let mut cmd = Command::new(kind.command());
+        for arg in kind.args() {
+            cmd.arg(arg);
+        }
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit()) // Inherit stderr to parent (for debugging)
+            .stderr(Stdio::inherit())
             .kill_on_drop(true);
 
-        // Set environment variables
         if let Some(venv) = venv_path {
-            let venv_str = venv.to_string_lossy();
-
-            // Set VIRTUAL_ENV
-            cmd.env("VIRTUAL_ENV", venv_str.as_ref());
-
-            // Prepend .venv/bin to PATH
-            let current_path = std::env::var("PATH").unwrap_or_default();
-            let new_path = format!("{}/bin:{}", venv_str, current_path);
-            cmd.env("PATH", &new_path);
+            kind.apply_env(&mut cmd, venv);
 
             tracing::info!(
-                venv = %venv_str,
-                path_prefix = %format!("{}/bin", venv_str),
-                "Spawning pyright-langserver with venv"
+                backend = kind.display_name(),
+                venv = %venv.display(),
+                path_prefix = %format!("{}/bin", venv.display()),
+                "Spawning backend with venv"
             );
         } else {
-            tracing::warn!("Spawning pyright-langserver without venv");
+            tracing::warn!(
+                backend = kind.display_name(),
+                "Spawning backend without venv"
+            );
         }
 
         let mut child = cmd.spawn()?;
@@ -311,4 +361,33 @@ pub fn shutdown_fire_and_forget(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_kind_command_and_args() {
+        assert_eq!(BackendKind::Pyright.command(), "pyright-langserver");
+        assert_eq!(BackendKind::Pyright.args(), &["--stdio"]);
+        assert_eq!(BackendKind::Ty.command(), "ty");
+        assert_eq!(BackendKind::Ty.args(), &["server"]);
+        assert_eq!(BackendKind::Pyrefly.command(), "pyrefly");
+        assert_eq!(BackendKind::Pyrefly.args(), &["lsp"]);
+    }
+
+    #[test]
+    fn backend_kind_display_name() {
+        assert_eq!(BackendKind::Pyright.display_name(), "pyright");
+        assert_eq!(BackendKind::Ty.display_name(), "ty");
+        assert_eq!(BackendKind::Pyrefly.display_name(), "pyrefly");
+    }
+
+    #[test]
+    fn backend_kind_display_trait() {
+        assert_eq!(format!("{}", BackendKind::Pyright), "pyright");
+        assert_eq!(format!("{}", BackendKind::Ty), "ty");
+        assert_eq!(format!("{}", BackendKind::Pyrefly), "pyrefly");
+    }
 }

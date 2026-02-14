@@ -1,3 +1,4 @@
+use crate::backend::BackendKind;
 use crate::backend_pool::BackendPool;
 use crate::message::{RpcId, RpcMessage};
 use std::collections::HashMap;
@@ -37,6 +38,9 @@ pub struct OpenDocument {
 
 /// State held by proxy
 pub struct ProxyState {
+    /// Which LSP backend to use
+    pub backend_kind: BackendKind,
+
     /// Git toplevel (search boundary, cached on first retrieval)
     pub git_toplevel: Option<PathBuf>,
 
@@ -61,8 +65,13 @@ pub struct ProxyState {
 }
 
 impl ProxyState {
-    pub fn new(max_backends: usize, backend_ttl: Option<Duration>) -> Self {
+    pub fn new(
+        backend_kind: BackendKind,
+        max_backends: usize,
+        backend_ttl: Option<Duration>,
+    ) -> Self {
         Self {
+            backend_kind,
             git_toplevel: None,
             client_initialize: None,
             open_documents: HashMap::new(),

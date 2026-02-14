@@ -8,6 +8,7 @@ mod state;
 mod text_edit;
 mod venv;
 
+use backend::BackendKind;
 use clap::Parser;
 use proxy::LspProxy;
 use std::path::PathBuf;
@@ -31,6 +32,16 @@ struct Args {
     /// Can also be set via PYRIGHT_LSP_PROXY_BACKEND_TTL environment variable
     #[arg(long, env = "PYRIGHT_LSP_PROXY_BACKEND_TTL", default_value = "1800")]
     backend_ttl: u64,
+
+    /// LSP backend to use: pyright, ty, or pyrefly
+    /// Can also be set via PYRIGHT_LSP_PROXY_BACKEND environment variable
+    #[arg(
+        long,
+        env = "PYRIGHT_LSP_PROXY_BACKEND",
+        default_value = "pyright",
+        value_enum
+    )]
+    backend: BackendKind,
 }
 
 #[tokio::main]
@@ -71,7 +82,8 @@ async fn main() -> anyhow::Result<()> {
 
         tracing::info!(
             log_file = %log_path.display(),
-            "Starting pyright-lsp-proxy (logging to stderr and file)"
+            backend = args.backend.display_name(),
+            "Starting LSP proxy (logging to stderr and file)"
         );
     } else {
         // Default: stderr only
@@ -89,7 +101,10 @@ async fn main() -> anyhow::Result<()> {
             )
             .init();
 
-        tracing::info!("Starting pyright-lsp-proxy (logging to stderr only)");
+        tracing::info!(
+            backend = args.backend.display_name(),
+            "Starting LSP proxy (logging to stderr only)"
+        );
     }
 
     // Convert TTL: 0 means disabled (None), otherwise Some(Duration)
@@ -100,7 +115,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Start proxy
-    let mut proxy = LspProxy::new(args.max_backends as usize, backend_ttl);
+    let mut proxy = LspProxy::new(args.backend, args.max_backends as usize, backend_ttl);
     proxy.run().await?;
 
     Ok(())

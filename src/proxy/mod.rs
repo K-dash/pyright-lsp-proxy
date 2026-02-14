@@ -5,7 +5,7 @@ mod document;
 mod initialization;
 mod pool_management;
 
-use crate::backend::PyrightBackend;
+use crate::backend::{BackendKind, LspBackend};
 use crate::error::ProxyError;
 use crate::framing::{LspFrameReader, LspFrameWriter};
 use crate::state::ProxyState;
@@ -21,9 +21,13 @@ pub struct LspProxy {
 }
 
 impl LspProxy {
-    pub fn new(max_backends: usize, backend_ttl: Option<Duration>) -> Self {
+    pub fn new(
+        backend_kind: BackendKind,
+        max_backends: usize,
+        backend_ttl: Option<Duration>,
+    ) -> Self {
         Self {
-            state: ProxyState::new(max_backends, backend_ttl),
+            state: ProxyState::new(backend_kind, max_backends, backend_ttl),
             backend_ttl,
         }
     }
@@ -35,9 +39,10 @@ impl LspProxy {
         let cwd = std::env::current_dir()?;
         tracing::info!(
             cwd = %cwd.display(),
+            backend = self.state.backend_kind.display_name(),
             max_backends = self.state.pool.max_backends(),
             backend_ttl = ?self.backend_ttl.map(|d| format!("{}s", d.as_secs())),
-            "Starting pyright-lsp-proxy"
+            "Starting LSP proxy"
         );
 
         // Get and cache git toplevel
@@ -48,11 +53,11 @@ impl LspProxy {
 
         // Pre-spawn backend if fallback venv found (but don't insert into pool yet —
         // wait for client's `initialize` to complete the handshake first)
-        let mut pending_initial_backend: Option<(PyrightBackend, PathBuf)> = if let Some(venv) =
+        let mut pending_initial_backend: Option<(LspBackend, PathBuf)> = if let Some(venv) =
             fallback_venv
         {
             tracing::info!(venv = %venv.display(), "Using fallback .venv, pre-spawning backend");
-            let backend = PyrightBackend::spawn(Some(&venv)).await?;
+            let backend = LspBackend::spawn(self.state.backend_kind, Some(&venv)).await?;
             Some((backend, venv))
         } else {
             tracing::warn!("No fallback .venv found, starting with empty pool");

@@ -23,7 +23,7 @@ pub enum ProxyError {
 
 #[derive(Error, Debug)]
 pub enum BackendError {
-    #[error("Failed to spawn pyright: {0}")]
+    #[error("Failed to spawn backend: {0}")]
     SpawnFailed(#[from] std::io::Error),
 
     #[error("Initialize timeout after {0}s")]
