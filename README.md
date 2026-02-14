@@ -77,7 +77,8 @@ typemux-cc --backend pyrefly
 | macOS | arm64 only |
 | Linux | x86_64 / arm64 |
 
-> **Note**: Windows is currently unsupported (due to path handling differences).
+> [!Note]
+> Windows is currently unsupported (due to path handling differences).
 > Intel macOS users must build from source (prebuilt binaries are arm64 only).
 
 ### Prerequisites
