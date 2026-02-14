@@ -11,10 +11,10 @@
 </div>
 
 <p>
-  <a href="#problems-solved">Problems Solved</a>
+  <a href="#quickstart">Quickstart</a>
+  ◆ <a href="#problems-solved">Problems Solved</a>
   ◆ <a href="#supported-backends">Backends</a>
   ◆ <a href="#installation">Installation</a>
-  ◆ <a href="#usage">Usage</a>
   ◆ <a href="#typical-use-case">Typical Use Case</a>
   ◆ <a href="#architecture">Architecture</a>
 </p>
@@ -25,6 +25,22 @@
 
 Claude Code cannot handle language server restarts or reconnections, so reflecting `.venv` creation or switching previously required restarting Claude Code itself.
 typemux-cc breaks through this limitation, reflecting virtual environment changes **within your running session**.
+
+## Quickstart
+
+```bash
+# 1. Install a backend (pyright recommended)
+npm install -g pyright
+
+# 2. Disable the official pyright plugin
+/plugin disable pyright-lsp@claude-plugins-official
+
+# 3. Add marketplace and install
+/plugin marketplace add K-dash/typemux-cc
+/plugin install typemux-cc@typemux-cc-marketplace
+
+# 4. Restart Claude Code (initial installation only)
+```
 
 ## Problems Solved
 
@@ -289,7 +305,7 @@ rm -rf ~/.claude/plugins/cache/typemux-cc-marketplace/
 |------|------------|------------|
 | Windows unsupported | Path handling assumes Unix-like systems | Use WSL2 |
 | macOS Intel unsupported | Prebuilt is arm64 only | Use Apple Silicon |
-| Fixed venv name | Only detects `.venv` (`venv`, `env` not supported) | Rename to `.venv` |
+| Fixed venv name | Only `.venv` with `pyvenv.cfg` — intentionally strict to avoid silently wrong environments (poetry/conda/etc. not supported) | Rename to `.venv` or create a `.venv` symlink |
 | Symlinks | May fail to detect `pyvenv.cfg` if `.venv` is a symlink | Use actual directory |
 | Late `.venv` creation | venv cached as `None` if `.venv` didn't exist when file was opened | Reopen the file after creating `.venv` |
 
