@@ -232,16 +232,16 @@ my-monorepo/
 
 ### Operation Sequence
 
-| Action | Proxy Behavior |
-|--------|----------------|
-| 1. Start Claude Code | Search for fallback .venv (start without venv if not found) |
-| 2. Open `project-a/src/main.py` | Detect `project-a/.venv` → spawn backend (session 1), add to pool |
-| 3. Open `project-b/src/main.py` | Detect `project-b/.venv` → spawn backend (session 2), add to pool |
-| 4. Return to `project-a/src/main.py` | `project-a/.venv` already in pool → route to session 1 (no restart) |
+| Claude Code Action | Proxy Behavior |
+|--------------------|----------------|
+| 1. Session starts | Search for fallback .venv (start without venv if not found) |
+| 2. Opens `project-a/src/main.py` | Detect `project-a/.venv` → spawn backend (session 1), add to pool |
+| 3. Opens `project-b/src/main.py` | Detect `project-b/.venv` → spawn backend (session 2), add to pool |
+| 4. Returns to `project-a/src/main.py` | `project-a/.venv` already in pool → route to session 1 (no restart) |
 
 ### What Actually Happens
 
-When you move from `project-a/main.py` to `project-b/main.py`:
+When Claude Code moves from `project-a/main.py` to `project-b/main.py`:
 
 1. Proxy detects different `.venv` (project-a/.venv → project-b/.venv)
 2. Checks the backend pool — `project-b/.venv` not found
@@ -251,7 +251,7 @@ When you move from `project-a/main.py` to `project-b/main.py`:
 6. Clears diagnostics for documents outside project-b/
 7. **All LSP requests for project-b files now use project-b dependencies**
 
-When you return to `project-a/main.py` later, session 1 is still in the pool — **zero restart overhead**.
+When Claude Code returns to `project-a/main.py` later, session 1 is still in the pool — **zero restart overhead**.
 
 Backends are evicted only when the pool is full (LRU) or after idle timeout (TTL, default 30 min).
 
