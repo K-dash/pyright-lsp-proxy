@@ -5,6 +5,7 @@ mod framing;
 mod message;
 mod proxy;
 mod state;
+mod text_edit;
 mod venv;
 
 use clap::Parser;
