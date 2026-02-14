@@ -42,7 +42,7 @@ npm install -g pyright
 # 4. Restart Claude Code (initial installation only)
 ```
 
-> To use **ty** or **pyrefly** instead, see [Supported Backends](#supported-backends) and set `TYPEMUX_CC_BACKEND` in your [config file](#configuration).
+> For **ty/pyrefly**, set `TYPEMUX_CC_BACKEND` in your [config](#configuration).
 
 ## Problems Solved
 
