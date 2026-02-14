@@ -54,22 +54,133 @@ graph LR
     Client[LSP Client<br/>Claude Code] <-->|JSON-RPC| Proxy[typemux-cc]
     Proxy <-->|VIRTUAL_ENV=project-a/.venv| Backend1[LSP Backend<br/>session 1]
     Proxy <-->|VIRTUAL_ENV=project-b/.venv| Backend2[LSP Backend<br/>session 2]
+    Proxy <-->|VIRTUAL_ENV=project-c/.venv| Backend3[LSP Backend<br/>session 3]
 
     style Proxy fill:#e1f5ff
     style Backend1 fill:#fff4e1
     style Backend2 fill:#fff4e1
+    style Backend3 fill:#fff4e1
 ```
 
-The proxy sits between Claude Code and the LSP backend (pyright, ty, or pyrefly), performing:
+The proxy sits between Claude Code and multiple LSP backends (pyright, ty, or pyrefly), performing:
 
-1. **Message relay**: Bidirectional forwarding of JSON-RPC messages
+1. **Message routing**: Route JSON-RPC messages to the correct backend based on document venv
 2. **venv detection**: Search for `.venv` on:
    - `textDocument/didOpen` (always)
    - LSP requests: hover, definition, references, documentSymbol, typeDefinition, implementation
    - NOTE: Cached documents reuse the last known venv and are not re-searched
-3. **Backend management**: Restart LSP backend when venv changes
-4. **State restoration**: Resend open documents after restart
-5. **Diagnostics cleanup**: Clear diagnostics for documents outside the switch target
+3. **Multi-backend pool**: Manage concurrent backend processes (one per venv, up to `max_backends`)
+4. **State restoration**: Resend open documents when spawning a new backend
+5. **Diagnostics cleanup**: Clear diagnostics for documents outside the target venv
+6. **Warmup readiness**: Queue index-dependent requests until backends finish building their cross-file index
+
+## Multi-Backend Pool
+
+### Design
+
+Instead of running a single backend and restarting on venv changes, typemux-cc maintains a **pool of concurrent backend processes** — one per venv. This eliminates restart overhead when switching between projects in a monorepo.
+
+### Pool Management
+
+| Feature | Description | Configuration |
+|---------|-------------|---------------|
+| Max backends | Upper limit on concurrent backend processes | `--max-backends` / `TYPEMUX_CC_MAX_BACKENDS` (default: 8) |
+| LRU eviction | When pool is full, evict the least recently used backend | Prefers backends with no pending requests |
+| TTL eviction | Automatically evict idle backends after a timeout | `--backend-ttl` / `TYPEMUX_CC_BACKEND_TTL` (default: 1800s) |
+| Session tracking | Each backend gets a unique session ID for stale message detection | Monotonically increasing counter |
+
+### Session Tracking
+
+```rust
+pub struct BackendInstance {
+    pub session: u64,       // Unique session ID
+    pub last_used: Instant, // For LRU tracking
+    // ...
+}
+```
+
+Each backend gets a unique session ID. Pending requests store which session they were sent to. If a response arrives from an old session (evicted/crashed backend), it's discarded as stale.
+
+```rust
+pub struct PendingRequest {
+    pub backend_session: u64, // Which backend session was this request sent to?
+    pub venv_path: PathBuf,
+}
+```
+
+## Backend-to-Client Request Proxying
+
+LSP backends can send requests to the client (e.g., `window/workDoneProgress/create`). With multiple backends, their request IDs can collide.
+
+### Solution: Proxy ID Rewriting
+
+1. Backend sends request with its own ID (e.g., `id: 1`)
+2. Proxy allocates a unique negative proxy ID (e.g., `id: -1`) to avoid collision with client IDs (positive)
+3. Original ID is stored in `pending_backend_requests`
+4. Message forwarded to client with rewritten ID
+5. Client response routed back, ID restored to original
+
+```rust
+pub struct PendingBackendRequest {
+    pub original_id: RpcId,   // Backend's original ID
+    pub venv_path: PathBuf,
+    pub session: u64,
+}
+```
+
+## Warmup Readiness
+
+### Problem
+
+After spawning, backends need time to build their cross-file index. Requests sent during this warmup period return incomplete results:
+
+- `findReferences` returns same-file results only (missing cross-project references)
+- `goToDefinition` on re-exported symbols returns empty
+
+### Solution: Warming/Ready State with Bounded Timeout
+
+```mermaid
+stateDiagram-v2
+    [*] --> Warming: Backend spawned
+    [*] --> Ready: TYPEMUX_CC_WARMUP_TIMEOUT=0
+
+    Warming --> Ready: $/progress end received
+    Warming --> Ready: Timeout expired (fail-open)
+```
+
+Each `BackendInstance` tracks its warmup state:
+
+```rust
+pub enum WarmupState {
+    Warming, // Queueing index-dependent requests
+    Ready,   // All requests forwarded normally
+}
+```
+
+### Behavior During Warmup
+
+| Request type | During Warming | After Ready |
+|-------------|----------------|-------------|
+| `textDocument/definition` | **Queued** | Forwarded |
+| `textDocument/references` | **Queued** | Forwarded |
+| `textDocument/implementation` | **Queued** | Forwarded |
+| `textDocument/typeDefinition` | **Queued** | Forwarded |
+| `textDocument/hover` | Forwarded immediately | Forwarded |
+| `textDocument/documentSymbol` | Forwarded immediately | Forwarded |
+| `textDocument/didOpen` | Forwarded immediately | Forwarded |
+| Other requests/notifications | Forwarded immediately | Forwarded |
+
+### Ready Transition Triggers (OR logic)
+
+1. **`$/progress` notification** with `kind: "end"` received from backend
+2. **Bounded timeout** (default 2s, configurable via `TYPEMUX_CC_WARMUP_TIMEOUT`) expires — **fail-open**: forward queued requests anyway
+
+### Configuration
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `TYPEMUX_CC_WARMUP_TIMEOUT` | `2` (seconds) | Warmup timeout duration |
+| `TYPEMUX_CC_WARMUP_TIMEOUT=0` | — | Disable warmup entirely (immediate Ready) |
 
 ## Strict Venv Mode
 
@@ -78,301 +189,108 @@ The proxy sits between Claude Code and the LSP backend (pyright, ty, or pyrefly)
 As stated in the design principles, disabling is better than running with the wrong venv.
 Strict Venv Mode implements this philosophy.
 
-### State Transitions
-
-```mermaid
-stateDiagram-v2
-    [*] --> Disabled: Startup (no fallback .venv)
-    [*] --> Running: Startup (fallback .venv exists)
-
-    Disabled --> Running: didOpen<br/>(.venv found)
-    Running --> Disabled: didOpen<br/>(.venv not found)
-    Running --> Running: didOpen<br/>(different .venv)
-
-    note right of Disabled
-        - Return success response for initialize<br/>(capabilities: {})
-        - Return errors for LSP requests
-        - Process didOpen/didChange<br/>(cache for revival)
-    end note
-
-    note right of Running
-        - Backend is running
-        - Forward LSP requests
-        - Process all messages
-    end note
-```
-
-### State-specific Behavior
-
-| State        | LSP Requests                                 | didOpen                         | didChange/didClose                          | Notes            |
-| ------------ | -------------------------------------------- | ------------------------------- | ------------------------------------------- | ---------------- |
-| **Running**  | Forward to backend                           | Search .venv → state transition | Update cache → forward to backend           | Normal operation |
-| **Disabled** | Return error<br/>(`-32603: .venv not found`) | Search .venv → revival trigger  | Update cache only<br/>(not sent to backend) | LSP disabled     |
-
-### Key Implementation Points
-
-1. **initialize Always Succeeds**
-
-   - Return success response to `initialize` request even in Disabled state
-   - Notify no LSP capabilities with `capabilities: {}`
-   - Prevents Claude Code from entering `server is error` state
-
-2. **Cache Updates Continue While Disabled**
-
-   - Continue recording `didChange`/`didClose` state
-   - For restoring correct document state upon revival
-
-3. **Error Messages Are Logged**
-   - Log when JSON-RPC error responses are returned
-   - For debugging and monitoring
-
-## Operation Sequences
-
-### Sequence 1: Startup → Open project-a (.venv exists)
-
-```mermaid
-sequenceDiagram
-    participant Client as Claude Code
-    participant Proxy as typemux-cc
-    participant Backend as LSP Backend
-
-    Note over Proxy: Startup: no fallback .venv<br/>→ Disabled state
-
-    Client->>Proxy: initialize request
-    Proxy->>Client: initialize response<br/>(capabilities: {})
-    Note over Proxy: Success response even in Disabled
-
-    Client->>Proxy: initialized notification
-    Note over Proxy: Ignored (no backend)
-
-    Client->>Proxy: didOpen(project-a/main.py)
-    Proxy->>Proxy: Search .venv<br/>→ Found project-a/.venv
-    Note over Proxy: Disabled → Running transition
-
-    Proxy->>Backend: spawn(VIRTUAL_ENV=project-a/.venv)
-    Proxy->>Backend: initialize request
-    Backend->>Proxy: initialize response
-    Proxy->>Backend: initialized notification
-    Proxy->>Backend: didOpen(project-a/main.py)<br/>(document restoration)
-
-
-    Note over Proxy,Backend: Session 1 startup complete
-
-    Client->>Proxy: hover request
-    Proxy->>Backend: hover request
-    Backend->>Proxy: hover response
-    Proxy->>Client: hover response
-```
-
-### Sequence 2: project-a → Open project-b (no .venv)
-
-```mermaid
-sequenceDiagram
-    participant Client as Claude Code
-    participant Proxy as typemux-cc
-    participant Backend as LSP Backend
-
-    Note over Proxy,Backend: Running state<br/>(running with project-a/.venv)
-
-    Client->>Proxy: didOpen(project-b/main.py)
-    Proxy->>Proxy: Search .venv<br/>→ Not found
-    Note over Proxy: Running → Disabled transition
-
-    Proxy->>Backend: shutdown request
-    Backend->>Proxy: shutdown response
-    Proxy->>Backend: exit notification
-    Backend-->>Proxy: Process terminated
-
-    Note over Proxy: Backend disabled complete
-
-    Client->>Proxy: hover request
-    Note over Proxy: Disabled state
-    Proxy->>Client: error response<br/>(-32603: .venv not found)
-    Note over Client: Error shown in UI<br/>"lsp-proxy: .venv not found..."
-```
-
-### Sequence 3: project-b (Disabled) → Return to project-a (.venv exists)
-
-```mermaid
-sequenceDiagram
-    participant Client as Claude Code
-    participant Proxy as typemux-cc
-    participant Backend as LSP Backend
-
-    Note over Proxy: Disabled state<br/>(no backend)
-
-    Client->>Proxy: didOpen(project-a/main.py)
-    Proxy->>Proxy: Search .venv<br/>→ Found project-a/.venv
-    Note over Proxy: Disabled → Running transition<br/>(revival)
-
-    Proxy->>Backend: spawn(VIRTUAL_ENV=project-a/.venv)
-    Proxy->>Backend: initialize request
-    Backend->>Proxy: initialize response
-    Proxy->>Backend: initialized notification
-
-    Note over Proxy: Restore from cache
-    Proxy->>Backend: didOpen(project-a/main.py)
-
-    Note over Proxy,Backend: Session 2 startup complete
-
-    Client->>Proxy: hover request
-    Proxy->>Backend: hover request
-    Backend->>Proxy: hover response
-    Proxy->>Client: hover response
-```
-
-### Operation Flow (Summary)
-
-1. Client opens a file with `textDocument/didOpen`
-2. Proxy searches for `.venv` from file path
-3. State transition decision:
-   - **Running + .venv found (same)** → Do nothing
-   - **Running + .venv found (different)** → Switch backend
-   - **Running + .venv not found** → Transition to Disabled (shutdown)
-   - **Disabled + .venv found** → Transition to Running (spawn)
-   - **Disabled + .venv not found** → Stay as is
-4. Handle LSP requests appropriately:
-   - Running: Proxy to backend
-   - Disabled: Return error response
-
-## Main Features
-
-| Feature                    | Description                                 |
-| -------------------------- | ------------------------------------------- |
-| JSON-RPC framing           | Read/write LSP messages                     |
-| Backend process management | Backend startup/shutdown control            |
-| `.venv` auto-detection     | Detect by traversing parent directories     |
-| Fallback `.venv`           | Initial venv at startup (cwd/git toplevel)  |
-| Backend auto-switching     | Restart on `.venv` change                   |
-| **Document state caching** | **Remember open file contents**             |
-| Document restoration       | Resend open files after switch              |
-| Selective restoration      | Restore only under `.venv` parent directory |
-| Incremental Sync           | `textDocument/didChange` partial update     |
-| Transparent switch         | Switch backend before sending the request   |
-| Strict Venv Mode           | Disable backend when no venv                |
-
-## Document State Cache
-
-The proxy internally holds file contents received via `textDocument/didOpen` and `textDocument/didChange`.
-
-### Why Needed?
-
-1. **Restoration on Backend Switch**
-
-   - After starting backend with new venv, open files need to be resent
-   - Client (Claude Code) still has files open, so backend state must be restored
-
-2. **Revival Preparation While Disabled**
-   - Even if backend is disabled due to missing venv, `didChange` contents continue to be recorded
-   - When correct venv is found later, backend can start with latest state
-
-### Cached Information
-
-- File URI
-- languageId (`python`, etc.)
-- Version number
-- Full text content
-
-### Storage Location
-
-- **Memory only** (not saved to disk)
-- Cleared when proxy process terminates
-- Automatically cleared when Claude Code restarts
-- No cleanup needed on uninstall
-
-### Memory Efficiency
-
-- Removed from cache on `didClose`
-- Only necessary files are held
-- Typically a few files (hundreds of KB to a few MB)
-
-### Selective Restoration Example
-
-When switching from project-a/.venv to project-b/.venv:
-
-**Open documents**:
-
-- `project-a/main.py` (version 1)
-- `project-a/utils.py` (version 1)
-- `project-b/main.py` (version 1)
-
-**Restoration behavior**:
-
-- ✅ `project-b/main.py` → Restored (same venv parent)
-- ❌ `project-a/main.py` → Skipped (different venv)
-- ❌ `project-a/utils.py` → Skipped (different venv)
-
-**Diagnostics clearing**:
-
-- Skipped documents get empty diagnostics sent to client
-- This clears stale errors from the old venv
-
-## Transparent Switch
-
-### The Problem
-
-When venv switched, previously pending requests were cancelled and returned `RequestCancelled`.
-This looked like "hover sometimes fails" to users.
-
-### The Solution
-
-The proxy now:
-
-1. Detects venv change **before** sending the request
-2. Switches backend (shutdown old, spawn new)
-3. Sends the request to the **new backend**
-4. Returns response to user
-
-From the user's perspective: **Hover/definition/etc. succeed on first try, even after venv switch.**
-
-### Implementation
-
-#### Session Tracking
-
-```rust
-pub enum BackendState {
-    Running {
-        backend: Box<LspBackend>,
-        active_venv: PathBuf,
-        session: u64,  // ★ Tracks which backend generation
-    },
-    // ...
-}
-```
-
-Each backend gets a unique session ID. Pending requests store which session they were sent to.
-
-#### Stale Response Detection
-
-```rust
-pub struct PendingRequest {
-    pub backend_session: u64,  // Which backend was this request sent to?
-}
-```
-
-If a response arrives from an old session (e.g., session=5 but current is session=6), it's discarded as stale.
-
-#### Flow
-
-```
-1. User hovers on project-a file
-2. ensure_backend_for_uri() detects project-a/.venv
-3. (Switch occurs: session 5 → 6)
-4. Request sent to session 6
-5. Response arrives from session 6
-6. User sees hover result (transparent!)
-```
-
-**Safety Mechanisms**:
-
-- Stale response check: `pending.backend_session != running.session` → discard
-- Session-specific pending cancellation: Only cancel requests from old session
+### Behavior
+
+| Condition | Behavior |
+|-----------|----------|
+| File opened, `.venv` found, backend in pool | Forward to existing backend |
+| File opened, `.venv` found, backend NOT in pool | Spawn new backend, add to pool |
+| File opened, `.venv` NOT found | Return error (`-32603: .venv not found`) |
+| Pool full, new backend needed | Evict LRU backend, then spawn new one |
+| `initialize` (no fallback .venv) | Return success with `capabilities: {}` (prevents Claude Code error state) |
 
 ### Cache Limitation (Important)
 
 When a document is already cached, its venv is not re-searched on request.
 This means creating `.venv` **after** opening a file will not take effect for that file
 until it is reopened (or the document cache is refreshed).
+
+## Operation Sequences
+
+### Sequence 1: Startup with Fallback Venv
+
+```mermaid
+sequenceDiagram
+    participant Client as Claude Code
+    participant Proxy as typemux-cc
+    participant Backend as LSP Backend
+
+    Note over Proxy: Pre-spawn: fallback .venv found
+
+    Proxy->>Backend: spawn(VIRTUAL_ENV=fallback/.venv)
+
+    Client->>Proxy: initialize request
+    Proxy->>Backend: initialize request
+    Backend->>Proxy: initialize response
+    Proxy->>Client: initialize response
+    Proxy->>Backend: initialized notification
+
+    Note over Proxy: Backend in pool (session 1, Warming)
+
+    Client->>Proxy: didOpen(project-a/main.py)
+    Proxy->>Backend: didOpen (forwarded)
+
+    Client->>Proxy: textDocument/definition
+    Note over Proxy: Index-dependent + Warming<br/>→ Queued
+
+    Note over Proxy: 2s timeout expires
+    Note over Proxy: Warming → Ready (fail-open)
+    Proxy->>Backend: textDocument/definition (drained)
+    Backend->>Proxy: definition response
+    Proxy->>Client: definition response
+```
+
+### Sequence 2: Multi-Venv Routing
+
+```mermaid
+sequenceDiagram
+    participant Client as Claude Code
+    participant Proxy as typemux-cc
+    participant A as Backend A<br/>(project-a/.venv)
+    participant B as Backend B<br/>(project-b/.venv)
+
+    Note over Proxy: Backend A already in pool
+
+    Client->>Proxy: didOpen(project-b/main.py)
+    Proxy->>Proxy: Search .venv → project-b/.venv
+    Note over Proxy: Not in pool → spawn new backend
+
+    Proxy->>B: spawn(VIRTUAL_ENV=project-b/.venv)
+    Proxy->>B: initialize + initialized
+    Proxy->>B: didOpen (document restoration)
+
+    Note over Proxy: Both backends in pool
+
+    Client->>Proxy: hover(project-a/main.py)
+    Proxy->>A: hover request
+    A->>Proxy: hover response
+    Proxy->>Client: hover response
+
+    Client->>Proxy: hover(project-b/main.py)
+    Proxy->>B: hover request
+    B->>Proxy: hover response
+    Proxy->>Client: hover response
+```
+
+### Sequence 3: LRU Eviction
+
+```mermaid
+sequenceDiagram
+    participant Client as Claude Code
+    participant Proxy as typemux-cc
+
+    Note over Proxy: Pool full (max_backends reached)
+
+    Client->>Proxy: didOpen(new-project/main.py)
+    Proxy->>Proxy: Search .venv → new-project/.venv
+    Note over Proxy: Not in pool, pool full
+
+    Proxy->>Proxy: Find LRU backend<br/>(prefer no pending requests)
+    Note over Proxy: Evict LRU backend:<br/>cancel pending, clear diagnostics, shutdown
+
+    Proxy->>Proxy: Spawn new backend
+    Note over Proxy: Pool size maintained at max
+```
 
 ## `.venv` Search Logic
 
@@ -407,6 +325,59 @@ Determines initial virtual environment at startup:
 2. `.venv` at cwd (current working directory)
 3. Start without venv if neither exists
 
+## Document State Cache
+
+The proxy internally holds file contents received via `textDocument/didOpen` and `textDocument/didChange`.
+
+### Why Needed?
+
+1. **Restoration on Backend Spawn**
+
+   - After starting backend with new venv, open files need to be resent
+   - Client (Claude Code) still has files open, so backend state must be restored
+
+2. **Revival Preparation While No Backend**
+   - Even without an active backend for a document's venv, `didChange` contents continue to be recorded
+   - When the correct backend is spawned later, it starts with the latest document state
+
+### Cached Information
+
+- File URI
+- languageId (`python`, etc.)
+- Version number
+- Full text content
+- Associated venv path
+
+### Storage
+
+- **Memory only** (not saved to disk)
+- Cleared when proxy process terminates
+- Automatically cleared when Claude Code restarts
+
+### Selective Restoration
+
+When spawning a backend for project-b/.venv, only documents under project-b/ are restored.
+Documents under project-a/ are skipped. Skipped documents get empty diagnostics sent to clear stale errors.
+
+## Main Features
+
+| Feature | Description |
+|---------|-------------|
+| JSON-RPC framing | Read/write LSP messages with Content-Length headers |
+| Multi-backend pool | Concurrent backend processes, one per venv |
+| LRU eviction | Evict least recently used backend when pool is full |
+| TTL-based eviction | Auto-evict idle backends (default: 30 min) |
+| `.venv` auto-detection | Detect by traversing parent directories |
+| Fallback `.venv` | Pre-spawn backend with initial venv at startup |
+| Warmup readiness | Queue index-dependent requests until backend index is built |
+| Document state caching | Remember open file contents for restoration |
+| Selective restoration | Restore only documents under the target venv |
+| Incremental sync | `textDocument/didChange` partial update support |
+| Backend→client proxying | Proxy ID rewriting for multiplexed backend requests |
+| `$/cancelRequest` handling | Cancel warmup-queued requests without forwarding |
+| Strict venv mode | Return errors when no venv found |
+| Diagnostics cleanup | Clear stale diagnostics on backend eviction |
+
 ## Logging Configuration
 
 ### Method 1: Environment Variables (Quick)
@@ -429,6 +400,9 @@ When running as a Claude Code plugin, the wrapper script loads config from:
 ```bash
 mkdir -p ~/.config/typemux-cc
 cat > ~/.config/typemux-cc/config << 'EOF'
+# Select backend (pyright, ty, or pyrefly)
+export TYPEMUX_CC_BACKEND="ty"
+
 # Enable file output
 export TYPEMUX_CC_LOG_FILE="/tmp/typemux-cc.log"
 
@@ -442,9 +416,9 @@ EOF
 ### Log Levels
 
 | Level   | Use Case                                      |
-| ------- | --------------------------------------------- |
+|---------|-----------------------------------------------|
 | `debug` | Default. venv search details, LSP message method names |
-| `info`  | venv switches, session info only              |
+| `info`  | venv switches, session info, warmup transitions |
 | `trace` | All search steps, detailed debugging          |
 
 ### Useful Queries
@@ -453,8 +427,11 @@ EOF
 # Real-time monitoring
 tail -f /tmp/typemux-cc.log
 
-# Venv switches only
-grep "Venv switched" /tmp/typemux-cc.log
+# Warmup transitions
+grep "warmup" /tmp/typemux-cc.log
+
+# Backend pool activity
+grep -E "(Creating new backend|Evicting|Backend warmup)" /tmp/typemux-cc.log
 
 # Document restoration stats
 grep "Document restoration completed" /tmp/typemux-cc.log
@@ -481,28 +458,38 @@ make release  # Release build
 make ci
 ```
 
-### Running Tests
-
-```bash
-# All tests
-cargo test
-
-# venv search tests only
-cargo test test_find_venv
-
-# With detailed logs
-RUST_LOG=debug cargo test
-```
-
 ### Source Code Structure
 
-| File         | Responsibility                                      |
-| ------------ | --------------------------------------------------- |
-| `main.rs`    | Entry point, logging setup                          |
-| `proxy.rs`   | LSP message routing, backend switch control         |
+| File | Responsibility |
+|------|----------------|
+| `main.rs` | Entry point, CLI argument parsing, logging setup |
 | `backend.rs` | LSP backend process management (pyright, ty, pyrefly) |
-| `venv.rs`    | `.venv` search logic                                |
-| `state.rs`   | Proxy state management (open documents, session ID) |
-| `message.rs` | JSON-RPC message type definitions                   |
+| `backend_pool.rs` | Multi-backend pool, LRU/TTL management, warmup state |
+| `state.rs` | Proxy state: pool, documents, pending requests |
+| `message.rs` | JSON-RPC message type definitions (RpcMessage, RpcId, RpcError) |
 | `framing.rs` | JSON-RPC framing (Content-Length header processing) |
-| `error.rs`   | Error type definitions                              |
+| `text_edit.rs` | Incremental text edit application for didChange |
+| `venv.rs` | `.venv` search logic (parent traversal, git toplevel boundary) |
+| `error.rs` | Error type definitions (ProxyError, BackendError, etc.) |
+| `proxy/mod.rs` | Main event loop (`tokio::select!` with 4 arms) |
+| `proxy/client_dispatch.rs` | Client message routing, warmup queueing, cancel handling |
+| `proxy/backend_dispatch.rs` | Backend message routing, proxy ID rewriting, progress detection |
+| `proxy/pool_management.rs` | LRU/TTL eviction, crash recovery, warmup expiry |
+| `proxy/initialization.rs` | Backend initialization handshake, document restoration |
+| `proxy/document.rs` | Document tracking (didOpen, didChange, didClose) |
+| `proxy/diagnostics.rs` | Diagnostic message handling, stale diagnostics cleanup |
+
+### Event Loop
+
+The main event loop in `proxy/mod.rs` uses `tokio::select!` with 4 arms:
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  tokio::select!                     │
+├─────────────────────────────────────────────────────┤
+│ 1. Client reader     │ stdin JSON-RPC messages      │
+│ 2. Backend reader    │ mpsc channel (all backends)  │
+│ 3. TTL timer         │ 60s interval sweep           │
+│ 4. Warmup timer      │ nearest warmup deadline      │
+└─────────────────────────────────────────────────────┘
+```
