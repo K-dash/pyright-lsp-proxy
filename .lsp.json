@@ -1,6 +1,6 @@
 {
-  "pyright-lsp-proxy": {
-    "command": "${CLAUDE_PLUGIN_ROOT}/bin/pyright-lsp-proxy",
+  "typemux-cc": {
+    "command": "${CLAUDE_PLUGIN_ROOT}/bin/typemux-cc",
     "args": [],
     "extensionToLanguage": {
       ".py": "python",

@@ -1,6 +1,6 @@
 # Architecture
 
-> This document explains _why_ pyright-lsp-proxy is built this way.
+> This document explains _why_ typemux-cc is built this way.
 
 Design philosophy, state transitions, and internal implementation details.
 For usage, see [README.md](./README.md).
@@ -9,13 +9,13 @@ For usage, see [README.md](./README.md).
 
 - No support for LSP clients other than Claude Code
 - No environment resolution for anything other than `.venv` (poetry/conda, etc.)
-- No simultaneous parallel operation of multiple backends (always one active backend)
+- No simultaneous parallel operation of multiple backend types (always one type per proxy instance)
 
 ## Background: Why This Tool Is Needed
 
-### Pyright's Limitation
+### Python Type-Checker Limitation
 
-Pyright langserver reads environment variables `VIRTUAL_ENV` and `sys.path` at startup to determine the Python interpreter and dependencies ([LSP-pyright README](https://github.com/sublimelsp/LSP-pyright), [Pyright discussions #4420](https://github.com/microsoft/pyright/discussions/4420)). Creating `.venv` after startup doesn't cause already-running processes to reload environment variables.
+Python type-checker LSP servers (pyright, ty, pyrefly) read environment variables `VIRTUAL_ENV` and `sys.path` at startup to determine the Python interpreter and dependencies ([LSP-pyright README](https://github.com/sublimelsp/LSP-pyright), [Pyright discussions #4420](https://github.com/microsoft/pyright/discussions/4420)). Creating `.venv` after startup doesn't cause already-running processes to reload environment variables.
 
 ### Claude Code's Limitation
 
@@ -25,7 +25,7 @@ Per LSP specification, dynamically changing environment variables requires resta
 - Processes spawned by the plugin are tied to Claude Code's session lifecycle
 - **As a result, enabling `.venv` requires restarting Claude Code itself**
 
-pyright-lsp-proxy breaks through this limitation by inserting a proxy between Claude Code and the backend.
+typemux-cc breaks through this limitation by inserting a proxy between Claude Code and the backend.
 
 ## Design Principles
 
@@ -39,7 +39,7 @@ Running with the wrong `.venv` is worse than disabling LSP functionality and ret
 - Type checking appears to pass, but fails at runtime
 - Developers continue coding based on false information, believing "LSP is working"
 
-**pyright-lsp-proxy's Choice**
+**typemux-cc's Choice**
 
 - **Explicitly return errors** when `.venv` is not found
 - Explain the situation in error messages so users can take action
@@ -51,23 +51,23 @@ Running with the wrong `.venv` is worse than disabling LSP functionality and ret
 
 ```mermaid
 graph LR
-    Client[LSP Client<br/>Claude Code] <-->|JSON-RPC| Proxy[pyright-lsp-proxy]
-    Proxy <-->|VIRTUAL_ENV=project-a/.venv| Backend1[pyright-langserver<br/>session 1]
-    Proxy <-->|VIRTUAL_ENV=project-b/.venv| Backend2[pyright-langserver<br/>session 2]
+    Client[LSP Client<br/>Claude Code] <-->|JSON-RPC| Proxy[typemux-cc]
+    Proxy <-->|VIRTUAL_ENV=project-a/.venv| Backend1[LSP Backend<br/>session 1]
+    Proxy <-->|VIRTUAL_ENV=project-b/.venv| Backend2[LSP Backend<br/>session 2]
 
     style Proxy fill:#e1f5ff
     style Backend1 fill:#fff4e1
     style Backend2 fill:#fff4e1
 ```
 
-The proxy sits between Claude Code and pyright-langserver, performing:
+The proxy sits between Claude Code and the LSP backend (pyright, ty, or pyrefly), performing:
 
 1. **Message relay**: Bidirectional forwarding of JSON-RPC messages
 2. **venv detection**: Search for `.venv` on:
    - `textDocument/didOpen` (always)
    - LSP requests: hover, definition, references, documentSymbol, typeDefinition, implementation
    - NOTE: Cached documents reuse the last known venv and are not re-searched
-3. **Backend management**: Restart pyright-langserver when venv changes
+3. **Backend management**: Restart LSP backend when venv changes
 4. **State restoration**: Resend open documents after restart
 5. **Diagnostics cleanup**: Clear diagnostics for documents outside the switch target
 
@@ -133,8 +133,8 @@ stateDiagram-v2
 ```mermaid
 sequenceDiagram
     participant Client as Claude Code
-    participant Proxy as pyright-lsp-proxy
-    participant Backend as pyright-langserver
+    participant Proxy as typemux-cc
+    participant Backend as LSP Backend
 
     Note over Proxy: Startup: no fallback .venv<br/>→ Disabled state
 
@@ -155,6 +155,7 @@ sequenceDiagram
     Proxy->>Backend: initialized notification
     Proxy->>Backend: didOpen(project-a/main.py)<br/>(document restoration)
 
+
     Note over Proxy,Backend: Session 1 startup complete
 
     Client->>Proxy: hover request
@@ -168,8 +169,8 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant Client as Claude Code
-    participant Proxy as pyright-lsp-proxy
-    participant Backend as pyright-langserver
+    participant Proxy as typemux-cc
+    participant Backend as LSP Backend
 
     Note over Proxy,Backend: Running state<br/>(running with project-a/.venv)
 
@@ -187,7 +188,7 @@ sequenceDiagram
     Client->>Proxy: hover request
     Note over Proxy: Disabled state
     Proxy->>Client: error response<br/>(-32603: .venv not found)
-    Note over Client: Error shown in UI<br/>"pyright-lsp-proxy: .venv not found..."
+    Note over Client: Error shown in UI<br/>"lsp-proxy: .venv not found..."
 ```
 
 ### Sequence 3: project-b (Disabled) → Return to project-a (.venv exists)
@@ -195,8 +196,8 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant Client as Claude Code
-    participant Proxy as pyright-lsp-proxy
-    participant Backend as pyright-langserver
+    participant Proxy as typemux-cc
+    participant Backend as LSP Backend
 
     Note over Proxy: Disabled state<br/>(no backend)
 
@@ -239,7 +240,7 @@ sequenceDiagram
 | Feature                    | Description                                 |
 | -------------------------- | ------------------------------------------- |
 | JSON-RPC framing           | Read/write LSP messages                     |
-| Pyright process management | Backend startup/shutdown control            |
+| Backend process management | Backend startup/shutdown control            |
 | `.venv` auto-detection     | Detect by traversing parent directories     |
 | Fallback `.venv`           | Initial venv at startup (cwd/git toplevel)  |
 | Backend auto-switching     | Restart on `.venv` change                   |
@@ -331,7 +332,7 @@ From the user's perspective: **Hover/definition/etc. succeed on first try, even 
 ```rust
 pub enum BackendState {
     Running {
-        backend: Box<PyrightBackend>,
+        backend: Box<LspBackend>,
         active_venv: PathBuf,
         session: u64,  // ★ Tracks which backend generation
     },
@@ -411,8 +412,8 @@ Determines initial virtual environment at startup:
 ### Method 1: Environment Variables (Quick)
 
 ```bash
-PYRIGHT_LSP_PROXY_LOG_FILE=/tmp/pyright-lsp-proxy.log ./target/release/pyright-lsp-proxy
-RUST_LOG=debug ./target/release/pyright-lsp-proxy
+TYPEMUX_CC_LOG_FILE=/tmp/typemux-cc.log ./target/release/typemux-cc
+RUST_LOG=debug ./target/release/typemux-cc
 ```
 
 ### Method 2: Config File (Persistent)
@@ -420,19 +421,19 @@ RUST_LOG=debug ./target/release/pyright-lsp-proxy
 When running as a Claude Code plugin, the wrapper script loads config from:
 
 ```bash
-~/.config/pyright-lsp-proxy/config
+~/.config/typemux-cc/config
 ```
 
 **Setup**:
 
 ```bash
-mkdir -p ~/.config/pyright-lsp-proxy
-cat > ~/.config/pyright-lsp-proxy/config << 'EOF'
+mkdir -p ~/.config/typemux-cc
+cat > ~/.config/typemux-cc/config << 'EOF'
 # Enable file output
-export PYRIGHT_LSP_PROXY_LOG_FILE="/tmp/pyright-lsp-proxy.log"
+export TYPEMUX_CC_LOG_FILE="/tmp/typemux-cc.log"
 
 # Adjust log level (optional)
-export RUST_LOG="pyright_lsp_proxy=debug"
+export RUST_LOG="typemux_cc=debug"
 EOF
 
 # Restart Claude Code
@@ -450,16 +451,16 @@ EOF
 
 ```bash
 # Real-time monitoring
-tail -f /tmp/pyright-lsp-proxy.log
+tail -f /tmp/typemux-cc.log
 
 # Venv switches only
-grep "Venv switched" /tmp/pyright-lsp-proxy.log
+grep "Venv switched" /tmp/typemux-cc.log
 
 # Document restoration stats
-grep "Document restoration completed" /tmp/pyright-lsp-proxy.log
+grep "Document restoration completed" /tmp/typemux-cc.log
 
 # Session transitions
-grep "session=" /tmp/pyright-lsp-proxy.log | grep -E "(Starting|completed)"
+grep "session=" /tmp/typemux-cc.log | grep -E "(Starting|completed)"
 ```
 
 ## Development
@@ -499,7 +500,7 @@ RUST_LOG=debug cargo test
 | ------------ | --------------------------------------------------- |
 | `main.rs`    | Entry point, logging setup                          |
 | `proxy.rs`   | LSP message routing, backend switch control         |
-| `backend.rs` | pyright-langserver process management               |
+| `backend.rs` | LSP backend process management (pyright, ty, pyrefly) |
 | `venv.rs`    | `.venv` search logic                                |
 | `state.rs`   | Proxy state management (open documents, session ID) |
 | `message.rs` | JSON-RPC message type definitions                   |

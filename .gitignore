@@ -24,9 +24,10 @@ target
 tmp/
 
 # Plugin binaries (downloaded by install.sh)
-bin/pyright-lsp-proxy
-bin/pyright-lsp-proxy-macos-arm64
-bin/pyright-lsp-proxy-linux-x86_64
+bin/typemux-cc
+bin/typemux-cc-macos-arm64
+bin/typemux-cc-linux-x86_64
+bin/typemux-cc-linux-arm64
 
 # Claude plugin binaries (local build)
 .claude-plugin/bin/

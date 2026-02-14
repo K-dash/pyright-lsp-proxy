@@ -509,26 +509,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pyright-lsp-proxy"
-version = "0.1.13"
-dependencies = [
- "anyhow",
- "bytes",
- "clap",
- "lsp-types",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-test",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
 name = "quote"
 version = "1.0.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -915,6 +895,26 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "typemux-cc"
+version = "0.1.13"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "lsp-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

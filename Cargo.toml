@@ -1,5 +1,5 @@
 [package]
-name = "pyright-lsp-proxy"
+name = "typemux-cc"
 version = "0.1.13"
 edition = "2021"
 rust-version = "1.75"

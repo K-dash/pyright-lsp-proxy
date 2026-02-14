@@ -26,7 +26,7 @@
 
 ---
 
-# pyright-lsp-proxy - Pyright LSP Proxy for Claude Code
+# typemux-cc - Python Type-Checker LSP Multiplexer for Claude Code
 
 See @README.md for project overview.
 See @ARCHITECTURE.md for architecture details.
@@ -115,7 +115,7 @@ For small, well-scoped changes (single-file fixes, typo corrections, simple bug 
   - `diagnostics.rs` - Diagnostics clearing
   - `document.rs` - Document lifecycle (didOpen/didChange/didClose) + URI utilities
 - `src/text_edit.rs` - Pure text manipulation (incremental change, position-to-offset) + tests
-- `src/backend.rs` - pyright-langserver process management
+- `src/backend.rs` - LSP backend process management (pyright, ty, pyrefly)
 - `src/backend_pool.rs` - Multi-backend pool management
 - `src/venv.rs` - `.venv` search logic
 - `src/state.rs` - Proxy state management (open documents, session ID)
@@ -146,5 +146,5 @@ Key design choices and their rationale. See @ARCHITECTURE.md for full details.
 
 ### Multi-backend Pool
 - **Context**: Monorepo environments have multiple projects with different `.venv` paths.
-- **Decision**: Pool of pyright-langserver backends, one per `.venv`, with automatic routing.
+- **Decision**: Pool of LSP backends, one per `.venv`, with automatic routing.
 - **Trade-off**: Higher memory usage vs. instant switching between projects.

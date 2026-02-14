@@ -1,8 +1,8 @@
 <div align="center">
 
-# pyright-lsp-proxy
+# typemux-cc
 
-**Claude Code-specific LSP proxy that handles virtual environment switching seamlessly**
+**Python type-checker LSP multiplexer for Claude Code — pyright, ty, pyrefly**
 
 <div align="center">
   <a href="https://github.com/K-dash/pyright-lsp-proxy/graphs/commit-activity"><img alt="GitHub commit activity" src="https://img.shields.io/github/commit-activity/m/K-dash/pyright-lsp-proxy"/></a>
@@ -12,6 +12,7 @@
 
 <p>
   <a href="#problems-solved">Problems Solved</a>
+  ◆ <a href="#supported-backends">Backends</a>
   ◆ <a href="#installation">Installation</a>
   ◆ <a href="#usage">Usage</a>
   ◆ <a href="#typical-use-case">Typical Use Case</a>
@@ -23,15 +24,31 @@
 ---
 
 Claude Code cannot handle language server restarts or reconnections, so reflecting `.venv` creation or switching previously required restarting Claude Code itself.
-pyright-lsp-proxy breaks through this limitation, reflecting virtual environment changes **within your running session**.
+typemux-cc breaks through this limitation, reflecting virtual environment changes **within your running session**.
 
 ## Problems Solved
 
-- **🔄 venv switching in monorepos** - Pyright assumes a single venv, causing incorrect type checking and completions when moving between projects
+- **🔄 venv switching in monorepos** - Python type-checkers assume a single venv, causing incorrect type checking and completions when moving between projects
 - **⚡ Dynamic .venv creation in worktrees** - When `.venv` is created later via hooks, etc., Claude Code restart was previously required
 - **🔀 Transparent switch on venv change** - LSP requests (hover, definition, etc.) are sent to the new backend after a switch, so the current request does not surface "Request cancelled"
 
-pyright-lsp-proxy restarts pyright-langserver in the background and automatically restores open documents. Claude Code always communicates with the proxy, so it doesn't notice backend switches.
+typemux-cc restarts the LSP backend in the background and automatically restores open documents. Claude Code always communicates with the proxy, so it doesn't notice backend switches.
+
+## Supported Backends
+
+| Backend | Command | Status |
+|---------|---------|--------|
+| [pyright](https://github.com/microsoft/pyright) | `pyright-langserver --stdio` | ✅ Stable (default) |
+| [ty](https://github.com/astral-sh/ty) | `ty server` | 🧪 Experimental |
+| [pyrefly](https://github.com/facebook/pyrefly) | `pyrefly lsp` | 🧪 Experimental |
+
+Select with `--backend` flag or `TYPEMUX_CC_BACKEND` environment variable:
+
+```bash
+typemux-cc --backend pyright   # default
+typemux-cc --backend ty
+typemux-cc --backend pyrefly
+```
 
 ## Requirements
 
@@ -48,7 +65,10 @@ pyright-lsp-proxy restarts pyright-langserver in the background and automaticall
 ### Prerequisites
 
 - Rust 1.75 or later (for building)
-- `pyright-langserver` command available in PATH
+- One of the supported LSP backends available in PATH:
+  - `pyright-langserver` (install via `npm install -g pyright` or `pip install pyright`)
+  - `ty` (install via `pip install ty` or `uvx ty`)
+  - `pyrefly` (install via `pip install pyrefly`)
 - Git (used to determine `.venv` search boundary, works without it)
 
 ## Installation
@@ -58,19 +78,17 @@ pyright-lsp-proxy restarts pyright-langserver in the background and automaticall
 
 ### Prerequisites
 
-#### 1. Install pyright-langserver
-
-This proxy requires `pyright-langserver` to be available in your PATH.
+#### 1. Install your preferred LSP backend
 
 ```bash
-# Install via npm (recommended)
+# pyright (default, recommended)
 npm install -g pyright
 
-# Or via pip
-pip install pyright
+# ty (experimental — by the creators of uv)
+pip install ty
 
-# Verify installation
-which pyright-langserver
+# pyrefly (experimental — by Meta)
+pip install pyrefly
 ```
 
 #### 2. Disable Official pyright Plugin
@@ -92,7 +110,7 @@ which pyright-langserver
 /plugin marketplace add K-dash/pyright-lsp-proxy
 
 # 2. Install plugin
-/plugin install pyright-lsp-proxy@pyright-lsp-proxy-marketplace
+/plugin install typemux-cc@typemux-cc-marketplace
 
 # 3. Restart Claude Code (initial installation only)
 ```
@@ -103,7 +121,7 @@ After installation, verify in `~/.claude/settings.json`:
 {
   "enabledPlugins": {
     "pyright-lsp@claude-plugins-official": false,
-    "pyright-lsp-proxy@pyright-lsp-proxy-marketplace": true
+    "typemux-cc@typemux-cc-marketplace": true
   }
 }
 ```
@@ -112,11 +130,11 @@ After installation, verify in `~/.claude/settings.json`:
 
 ```bash
 # Update
-/plugin update pyright-lsp-proxy@pyright-lsp-proxy-marketplace
+/plugin update typemux-cc@typemux-cc-marketplace
 
 # Uninstall
-/plugin uninstall pyright-lsp-proxy@pyright-lsp-proxy-marketplace
-/plugin marketplace remove pyright-lsp-proxy-marketplace
+/plugin uninstall typemux-cc@typemux-cc-marketplace
+/plugin marketplace remove typemux-cc-marketplace
 ```
 
 ### Method B: Local Build (For Developers)
@@ -127,7 +145,7 @@ cd pyright-lsp-proxy
 cargo build --release
 
 /plugin marketplace add /path/to/pyright-lsp-proxy
-/plugin install pyright-lsp-proxy@pyright-lsp-proxy-marketplace
+/plugin install typemux-cc@typemux-cc-marketplace
 # Restart Claude Code (initial installation only)
 ```
 
@@ -136,8 +154,33 @@ cargo build --release
 Automatically starts as a Claude Code plugin. For manual execution:
 
 ```bash
-./target/release/pyright-lsp-proxy
-./target/release/pyright-lsp-proxy --help
+./target/release/typemux-cc
+./target/release/typemux-cc --help
+```
+
+### Backend Selection
+
+```bash
+# Via CLI flag
+./target/release/typemux-cc --backend ty
+
+# Via environment variable
+TYPEMUX_CC_BACKEND=ty ./target/release/typemux-cc
+```
+
+### Configuration
+
+To configure the backend via the wrapper script (persistent across sessions):
+
+```bash
+mkdir -p ~/.config/typemux-cc
+cat > ~/.config/typemux-cc/config << 'EOF'
+# Select backend (pyright, ty, or pyrefly)
+export TYPEMUX_CC_BACKEND="pyright"
+
+# Enable file output
+export TYPEMUX_CC_LOG_FILE="/tmp/typemux-cc.log"
+EOF
 ```
 
 ### Logging
@@ -145,13 +188,16 @@ Automatically starts as a Claude Code plugin. For manual execution:
 Default output is stderr. For file output:
 
 ```bash
-PYRIGHT_LSP_PROXY_LOG_FILE=/tmp/pyright-lsp-proxy.log ./target/release/pyright-lsp-proxy
+TYPEMUX_CC_LOG_FILE=/tmp/typemux-cc.log ./target/release/typemux-cc
 ```
 
 | Environment Variable | Description | Default |
 |----------------------|-------------|---------|
-| `PYRIGHT_LSP_PROXY_LOG_FILE` | Log file path | Not set (stderr only) |
-| `RUST_LOG` | Log level | `pyright_lsp_proxy=debug` |
+| `TYPEMUX_CC_LOG_FILE` | Log file path | Not set (stderr only) |
+| `TYPEMUX_CC_BACKEND` | LSP backend to use | `pyright` |
+| `TYPEMUX_CC_MAX_BACKENDS` | Max concurrent backend processes | `8` |
+| `TYPEMUX_CC_BACKEND_TTL` | Backend TTL in seconds (0 = disabled) | `1800` |
+| `RUST_LOG` | Log level | `typemux_cc=debug` |
 
 For config file method and details, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
@@ -205,9 +251,9 @@ to trigger venv detection for that file.
 ### LSP Not Working
 
 ```bash
-which pyright-langserver              # Check if in PATH
-cat ~/.claude/settings.json | grep pyright  # Check plugin settings
-tail -100 /tmp/pyright-lsp-proxy.log  # Check logs
+which pyright-langserver              # Check if backend is in PATH (or: which ty, which pyrefly)
+cat ~/.claude/settings.json | grep typemux  # Check plugin settings
+tail -100 /tmp/typemux-cc.log        # Check logs
 ```
 
 ### `.venv` Not Switching

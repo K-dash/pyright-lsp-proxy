@@ -19,25 +19,25 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Optional path to log file (default: stderr only)
-    /// Can also be set via PYRIGHT_LSP_PROXY_LOG_FILE environment variable
-    #[arg(long, env = "PYRIGHT_LSP_PROXY_LOG_FILE")]
+    /// Can also be set via TYPEMUX_CC_LOG_FILE environment variable
+    #[arg(long, env = "TYPEMUX_CC_LOG_FILE")]
     log_file: Option<PathBuf>,
 
     /// Maximum number of concurrent backend processes (default: 8, minimum: 1)
-    /// Can also be set via PYRIGHT_LSP_PROXY_MAX_BACKENDS environment variable
-    #[arg(long, env = "PYRIGHT_LSP_PROXY_MAX_BACKENDS", default_value = "8", value_parser = clap::value_parser!(u64).range(1..))]
+    /// Can also be set via TYPEMUX_CC_MAX_BACKENDS environment variable
+    #[arg(long, env = "TYPEMUX_CC_MAX_BACKENDS", default_value = "8", value_parser = clap::value_parser!(u64).range(1..))]
     max_backends: u64,
 
     /// Backend TTL in seconds (default: 1800 = 30 minutes). Set to 0 to disable TTL eviction.
-    /// Can also be set via PYRIGHT_LSP_PROXY_BACKEND_TTL environment variable
-    #[arg(long, env = "PYRIGHT_LSP_PROXY_BACKEND_TTL", default_value = "1800")]
+    /// Can also be set via TYPEMUX_CC_BACKEND_TTL environment variable
+    #[arg(long, env = "TYPEMUX_CC_BACKEND_TTL", default_value = "1800")]
     backend_ttl: u64,
 
     /// LSP backend to use: pyright, ty, or pyrefly
-    /// Can also be set via PYRIGHT_LSP_PROXY_BACKEND environment variable
+    /// Can also be set via TYPEMUX_CC_BACKEND environment variable
     #[arg(
         long,
-        env = "PYRIGHT_LSP_PROXY_BACKEND",
+        env = "TYPEMUX_CC_BACKEND",
         default_value = "pyright",
         value_enum
     )]
@@ -56,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
             log_path.parent().unwrap_or(std::path::Path::new(".")),
             log_path
                 .file_name()
-                .unwrap_or(std::ffi::OsStr::new("pyright-lsp-proxy.log")),
+                .unwrap_or(std::ffi::OsStr::new("typemux-cc.log")),
         );
 
         tracing_subscriber::registry()
@@ -76,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .with(
                 EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new("pyright_lsp_proxy=debug")),
+                    .unwrap_or_else(|_| EnvFilter::new("typemux_cc=debug")),
             )
             .init();
 
@@ -97,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .with(
                 EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new("pyright_lsp_proxy=debug")),
+                    .unwrap_or_else(|_| EnvFilter::new("typemux_cc=debug")),
             )
             .init();
 

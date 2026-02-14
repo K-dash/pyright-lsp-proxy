@@ -1,18 +1,18 @@
 {
-  "name": "pyright-lsp-proxy",
+  "name": "typemux-cc",
   "version": "0.1.13",
-  "description": "Pyright LSP proxy for monorepo with automatic .venv switching",
+  "description": "Python type-checker LSP multiplexer for Claude Code (pyright, ty, pyrefly)",
   "author": {
     "name": "K-dash"
   },
   "homepage": "https://github.com/K-dash/pyright-lsp-proxy",
   "repository": "https://github.com/K-dash/pyright-lsp-proxy",
   "license": "MIT",
-  "keywords": ["lsp", "pyright", "proxy", "rust", "monorepo", "python"],
+  "keywords": ["lsp", "pyright", "ty", "pyrefly", "proxy", "rust", "monorepo", "python"],
   "hooks": "./hooks.json",
   "lspServers": {
-    "pyright-lsp-proxy": {
-      "command": "${CLAUDE_PLUGIN_ROOT}/bin/pyright-lsp-proxy-wrapper.sh",
+    "typemux-cc": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/typemux-cc-wrapper.sh",
       "args": [],
       "extensionToLanguage": {
         ".py": "python",
