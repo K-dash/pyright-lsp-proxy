@@ -295,6 +295,7 @@ rm -rf ~/.claude/plugins/cache/typemux-cc-marketplace/
 - If `.venv` was created after the file was opened, **reopen the file** to trigger venv re-detection
 - Use `RUST_LOG=trace` for detailed venv search logs
 
+> [!Note]
 > **Why does this happen?** typemux-cc caches the venv for each document on first open. If `.venv` doesn't exist yet (e.g., created later by a hook), the cache stores `None`. Subsequent requests reuse the cached value without re-searching. Reopening the file clears the cache entry and triggers a fresh search.
 
 ## Known Limitations
