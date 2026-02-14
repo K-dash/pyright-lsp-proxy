@@ -104,12 +104,20 @@ For small, well-scoped changes (single-file fixes, typo corrections, simple bug 
 ## Project Structure
 
 - `src/main.rs` - Entry point, logging setup
-- `src/proxy.rs` - LSP message routing, backend switch control
+- `src/proxy/` - LSP proxy module (split by responsibility)
+  - `mod.rs` - LspProxy struct, `new()`, `run()` orchestration loop
+  - `client_dispatch.rs` - Client message dispatch (initialize, shutdown, requests, notifications)
+  - `backend_dispatch.rs` - Backend message dispatch (response forwarding, ID rewriting)
+  - `initialization.rs` - Backend spawn + initialize handshake + document restoration
+  - `pool_management.rs` - Pool lifecycle (ensure, evict LRU/TTL, crash, cancel)
+  - `diagnostics.rs` - Diagnostics clearing
+  - `document.rs` - Document lifecycle (didOpen/didChange/didClose) + URI utilities
+- `src/text_edit.rs` - Pure text manipulation (incremental change, position-to-offset) + tests
 - `src/backend.rs` - pyright-langserver process management
 - `src/backend_pool.rs` - Multi-backend pool management
 - `src/venv.rs` - `.venv` search logic
 - `src/state.rs` - Proxy state management (open documents, session ID)
-- `src/message.rs` - JSON-RPC message type definitions
+- `src/message.rs` - JSON-RPC message type definitions + error response helper
 - `src/framing.rs` - JSON-RPC framing (Content-Length header processing)
 - `src/error.rs` - Error type definitions
 

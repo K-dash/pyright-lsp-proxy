@@ -52,4 +52,20 @@ impl RpcMessage {
     pub fn method_name(&self) -> Option<&str> {
         self.method.as_deref()
     }
+
+    /// Create an error response for a given request
+    pub fn error_response(request: &RpcMessage, message: &str) -> RpcMessage {
+        RpcMessage {
+            jsonrpc: "2.0".to_string(),
+            id: request.id.clone(),
+            method: None,
+            params: None,
+            result: None,
+            error: Some(RpcError {
+                code: -32603,
+                message: message.to_string(),
+                data: None,
+            }),
+        }
+    }
 }
