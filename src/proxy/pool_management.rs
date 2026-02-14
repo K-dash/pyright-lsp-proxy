@@ -260,4 +260,44 @@ impl super::LspProxy {
             .pending_backend_requests
             .retain(|_, pending| !(pending.venv_path == *venv_path && pending.session == session));
     }
+
+    /// Transition all warming backends past their deadline to Ready (fail-open).
+    pub(crate) async fn expire_warmup_backends(
+        &mut self,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+    ) -> Result<(), ProxyError> {
+        let expired: Vec<PathBuf> = self
+            .state
+            .pool
+            .warming_backends()
+            .into_iter()
+            .filter(|venv| {
+                self.state
+                    .pool
+                    .get(venv)
+                    .is_some_and(|inst| inst.warmup_expired())
+            })
+            .collect();
+
+        for venv_path in expired {
+            let session = match self.state.pool.get(&venv_path) {
+                Some(inst) if inst.is_warming() => inst.session,
+                _ => continue,
+            };
+
+            if let Some(inst) = self.state.pool.get_mut(&venv_path) {
+                tracing::info!(
+                    venv = %venv_path.display(),
+                    "Backend warmup complete (reason: timeout), transitioning to Ready (fail-open)"
+                );
+                let queued = inst.mark_ready();
+                if !queued.is_empty() {
+                    self.drain_warmup_queue(&venv_path, session, queued, client_writer)
+                        .await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
 }

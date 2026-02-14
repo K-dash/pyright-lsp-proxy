@@ -73,6 +73,9 @@ impl LspProxy {
         ttl_interval.tick().await;
 
         loop {
+            // Compute warmup deadline before entering select! to avoid borrow conflicts
+            let warmup_deadline = self.state.pool.nearest_warmup_deadline();
+
             tokio::select! {
                 // Messages from client
                 result = client_reader.read_message() => {
@@ -143,6 +146,9 @@ impl LspProxy {
                                 }
                             }
                         }
+                        Some("$/cancelRequest") => {
+                            self.dispatch_cancel_request(&msg).await?;
+                        }
                         _ if msg.is_request() => {
                             self.dispatch_client_request(&msg, &mut client_writer).await?;
                         }
@@ -161,6 +167,16 @@ impl LspProxy {
                 // TTL-based auto-eviction sweep
                 _ = ttl_interval.tick(), if self.backend_ttl.is_some() => {
                     self.evict_expired_backends(&mut client_writer).await?;
+                }
+
+                // Warmup timeout: fail-open transition for warming backends
+                _ = async {
+                    match warmup_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    self.expire_warmup_backends(&mut client_writer).await?;
                 }
             }
         }

@@ -1,7 +1,7 @@
 use crate::backend::shutdown_fire_and_forget;
 use crate::error::BackendError;
 use crate::framing::{LspFrameReader, LspFrameWriter};
-use crate::message::RpcMessage;
+use crate::message::{RpcId, RpcMessage};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -9,6 +9,29 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
+
+/// Warmup state for a backend instance.
+/// After spawning, backends need time to build their cross-file index.
+/// During `Warming`, index-dependent requests are queued until the backend
+/// signals readiness or the timeout expires (fail-open).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarmupState {
+    Warming,
+    Ready,
+}
+
+/// Default warmup timeout; overridable via `TYPEMUX_CC_WARMUP_TIMEOUT` env var.
+const DEFAULT_WARMUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Returns the warmup timeout duration.
+/// `TYPEMUX_CC_WARMUP_TIMEOUT=0` means warmup is disabled (immediate Ready).
+pub fn warmup_timeout() -> Duration {
+    std::env::var("TYPEMUX_CC_WARMUP_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_WARMUP_TIMEOUT)
+}
 
 /// Message from a backend reader task
 pub struct BackendMessage {
@@ -26,6 +49,9 @@ pub struct BackendInstance {
     pub last_used: Instant,
     pub reader_task: JoinHandle<()>,
     pub next_id: u64,
+    pub warmup_state: WarmupState,
+    pub warmup_deadline: Instant,
+    pub warmup_queue: Vec<RpcMessage>,
 }
 
 impl BackendInstance {
@@ -35,6 +61,44 @@ impl BackendInstance {
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+
+    /// Check if this backend is still warming up
+    pub fn is_warming(&self) -> bool {
+        self.warmup_state == WarmupState::Warming
+    }
+
+    /// Transition from Warming to Ready, returning queued messages for draining
+    pub fn mark_ready(&mut self) -> Vec<RpcMessage> {
+        self.warmup_state = WarmupState::Ready;
+        let queued = std::mem::take(&mut self.warmup_queue);
+        if !queued.is_empty() {
+            tracing::info!(
+                venv = %self.venv_path.display(),
+                queued_count = queued.len(),
+                "Warmup complete, draining queued requests"
+            );
+        }
+        queued
+    }
+
+    /// Check if the warmup deadline has passed
+    pub fn warmup_expired(&self) -> bool {
+        Instant::now() >= self.warmup_deadline
+    }
+
+    /// Remove a queued request by its JSON-RPC id (for $/cancelRequest handling).
+    /// Returns the removed message if found.
+    pub fn cancel_warmup_request(&mut self, id: &RpcId) -> Option<RpcMessage> {
+        if let Some(pos) = self
+            .warmup_queue
+            .iter()
+            .position(|msg| msg.id.as_ref() == Some(id))
+        {
+            Some(self.warmup_queue.remove(pos))
+        } else {
+            None
+        }
     }
 }
 
@@ -164,6 +228,25 @@ impl BackendPool {
     /// Get the first key in the map (arbitrary, for fallback routing)
     pub fn first_key(&self) -> Option<&PathBuf> {
         self.backends.keys().next()
+    }
+
+    /// Return venv paths of backends currently in Warming state
+    pub fn warming_backends(&self) -> Vec<PathBuf> {
+        self.backends
+            .iter()
+            .filter(|(_, inst)| inst.is_warming())
+            .map(|(venv, _)| venv.clone())
+            .collect()
+    }
+
+    /// Return the nearest warmup deadline among all warming backends.
+    /// Returns None if no backends are warming.
+    pub fn nearest_warmup_deadline(&self) -> Option<Instant> {
+        self.backends
+            .values()
+            .filter(|inst| inst.is_warming())
+            .map(|inst| inst.warmup_deadline)
+            .min()
     }
 }
 

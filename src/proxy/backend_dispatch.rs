@@ -1,6 +1,7 @@
 use crate::backend_pool::BackendMessage;
 use crate::error::ProxyError;
 use crate::framing::LspFrameWriter;
+use crate::message::RpcMessage;
 
 impl super::LspProxy {
     /// Handle a message received from a backend via the mpsc channel.
@@ -106,6 +107,32 @@ impl super::LspProxy {
                     }
                 }
 
+                // Detect $/progress end → transition warming backend to ready
+                if msg.is_notification() {
+                    if let Some(method) = msg.method_name() {
+                        if method == "$/progress" && is_progress_end(&msg) {
+                            if let Some(inst) = self.state.pool.get_mut(&venv_path) {
+                                if inst.is_warming() {
+                                    tracing::info!(
+                                        venv = %venv_path.display(),
+                                        "Backend warmup complete (reason: progress), transitioning to Ready"
+                                    );
+                                    let queued = inst.mark_ready();
+                                    if !queued.is_empty() {
+                                        self.drain_warmup_queue(
+                                            &venv_path,
+                                            session,
+                                            queued,
+                                            client_writer,
+                                        )
+                                        .await?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Forward to client
                 client_writer.write_message(&msg).await?;
             }
@@ -123,4 +150,14 @@ impl super::LspProxy {
 
         Ok(())
     }
+}
+
+/// Check if a `$/progress` notification has `params.value.kind == "end"`.
+fn is_progress_end(msg: &RpcMessage) -> bool {
+    msg.params
+        .as_ref()
+        .and_then(|p| p.get("value"))
+        .and_then(|v| v.get("kind"))
+        .and_then(|k| k.as_str())
+        == Some("end")
 }

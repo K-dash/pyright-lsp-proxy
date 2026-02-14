@@ -1,5 +1,5 @@
 use crate::backend::LspBackend;
-use crate::backend_pool::{spawn_reader_task, BackendInstance};
+use crate::backend_pool::{spawn_reader_task, warmup_timeout, BackendInstance, WarmupState};
 use crate::error::ProxyError;
 use crate::framing::LspFrameWriter;
 use crate::message::{RpcId, RpcMessage};
@@ -215,6 +215,7 @@ impl super::LspProxy {
         let tx = self.state.pool.msg_sender();
         let reader_task = spawn_reader_task(parts.reader, tx, venv.to_path_buf(), session);
 
+        let timeout = warmup_timeout();
         Ok(BackendInstance {
             writer: parts.writer,
             child: parts.child,
@@ -223,6 +224,13 @@ impl super::LspProxy {
             last_used: Instant::now(),
             reader_task,
             next_id: parts.next_id,
+            warmup_state: if timeout.is_zero() {
+                WarmupState::Ready
+            } else {
+                WarmupState::Warming
+            },
+            warmup_deadline: Instant::now() + timeout,
+            warmup_queue: Vec::new(),
         })
     }
 

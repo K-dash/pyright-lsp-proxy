@@ -1,10 +1,20 @@
 use crate::backend::LspBackend;
-use crate::backend_pool::{shutdown_backend_instance, spawn_reader_task, BackendInstance};
+use crate::backend_pool::{
+    shutdown_backend_instance, spawn_reader_task, warmup_timeout, BackendInstance, WarmupState,
+};
 use crate::error::ProxyError;
 use crate::framing::LspFrameWriter;
-use crate::message::RpcMessage;
+use crate::message::{RpcId, RpcMessage};
 use std::path::PathBuf;
 use tokio::time::Instant;
+
+/// LSP methods that depend on the cross-file index and should be queued during warmup.
+const INDEX_DEPENDENT_METHODS: &[&str] = &[
+    "textDocument/definition",
+    "textDocument/references",
+    "textDocument/implementation",
+    "textDocument/typeDefinition",
+];
 
 impl super::LspProxy {
     /// Handle client "initialize" request.
@@ -33,6 +43,7 @@ impl super::LspProxy {
                     let tx = self.state.pool.msg_sender();
                     let reader_task = spawn_reader_task(parts.reader, tx, venv.clone(), session);
 
+                    let timeout = warmup_timeout();
                     let instance = BackendInstance {
                         writer: parts.writer,
                         child: parts.child,
@@ -41,6 +52,13 @@ impl super::LspProxy {
                         last_used: Instant::now(),
                         reader_task,
                         next_id: parts.next_id,
+                        warmup_state: if timeout.is_zero() {
+                            WarmupState::Ready
+                        } else {
+                            WarmupState::Warming
+                        },
+                        warmup_deadline: Instant::now() + timeout,
+                        warmup_queue: Vec::new(),
                     };
                     self.state.pool.insert(venv, instance);
 
@@ -261,6 +279,30 @@ impl super::LspProxy {
                 inst.last_used = Instant::now();
                 let session = inst.session;
 
+                // Queue index-dependent requests during warmup
+                if let Some(method_name) = method {
+                    if inst.is_warming() && INDEX_DEPENDENT_METHODS.contains(&method_name) {
+                        // Register in pending requests (so cancel/crash handling works)
+                        if let Some(id) = &msg.id {
+                            self.state.pending_requests.insert(
+                                id.clone(),
+                                crate::state::PendingRequest {
+                                    backend_session: session,
+                                    venv_path: venv_path.clone(),
+                                },
+                            );
+                        }
+                        tracing::info!(
+                            method = method_name,
+                            id = ?msg.id,
+                            venv = %venv_path.display(),
+                            "Queueing index-dependent request during warmup"
+                        );
+                        inst.warmup_queue.push(msg.clone());
+                        return Ok(());
+                    }
+                }
+
                 // Register in pending requests
                 if let Some(id) = &msg.id {
                     self.state.pending_requests.insert(
@@ -332,5 +374,114 @@ impl super::LspProxy {
         }
 
         Ok(())
+    }
+
+    /// Handle `$/cancelRequest` notification.
+    ///
+    /// If the target request is queued in a warmup queue, remove it without
+    /// forwarding to the backend. Otherwise, forward the cancel to all backends.
+    pub(crate) async fn dispatch_cancel_request(
+        &mut self,
+        msg: &RpcMessage,
+    ) -> Result<(), ProxyError> {
+        if let Some(cancelled_id) = extract_cancel_id(msg) {
+            if let Some(pending) = self.state.pending_requests.get(&cancelled_id).cloned() {
+                if let Some(inst) = self.state.pool.get_mut(&pending.venv_path) {
+                    if inst.session == pending.backend_session
+                        && inst.cancel_warmup_request(&cancelled_id).is_some()
+                    {
+                        tracing::info!(
+                            id = ?cancelled_id,
+                            venv = %pending.venv_path.display(),
+                            "Cancelled warmup-queued request"
+                        );
+                        self.state.pending_requests.remove(&cancelled_id);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        // Not in warmup queue — forward $/cancelRequest to all backends
+        self.dispatch_client_notification(msg).await
+    }
+
+    /// Forward queued warmup requests to the backend now that it is ready.
+    /// `expected_session` is checked to avoid forwarding to a replaced backend.
+    pub(crate) async fn drain_warmup_queue(
+        &mut self,
+        venv_path: &PathBuf,
+        expected_session: u64,
+        queued: Vec<RpcMessage>,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+    ) -> Result<(), ProxyError> {
+        for request in queued {
+            let method = request.method_name().unwrap_or("unknown").to_string();
+            let id_debug = format!("{:?}", request.id);
+
+            // Session guard: if the backend was replaced (crash + re-create),
+            // discard remaining queued requests instead of forwarding to the new session.
+            let session_ok = self
+                .state
+                .pool
+                .get(venv_path)
+                .is_some_and(|inst| inst.session == expected_session);
+            if !session_ok {
+                tracing::warn!(
+                    method = %method,
+                    id = %id_debug,
+                    venv = %venv_path.display(),
+                    "Aborting warmup drain: backend session changed"
+                );
+                // Remove remaining queued requests from pending_requests
+                if let Some(req_id) = &request.id {
+                    self.state.pending_requests.remove(req_id);
+                }
+                continue;
+            }
+
+            if let Some(inst) = self.state.pool.get_mut(venv_path) {
+                match inst.writer.write_message(&request).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            method = %method,
+                            id = %id_debug,
+                            venv = %venv_path.display(),
+                            "Draining warmup queue: forwarding request"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            method = %method,
+                            id = %id_debug,
+                            venv = %venv_path.display(),
+                            error = ?e,
+                            "Failed to forward warmup-queued request"
+                        );
+                        // Remove from pending_requests and send error to client
+                        if let Some(req_id) = &request.id {
+                            self.state.pending_requests.remove(req_id);
+                        }
+                        let error_response = RpcMessage::error_response(
+                            &request,
+                            "lsp-proxy: backend write failed during warmup drain",
+                        );
+                        client_writer.write_message(&error_response).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Extract the cancel target id from a `$/cancelRequest` params.
+fn extract_cancel_id(msg: &RpcMessage) -> Option<RpcId> {
+    let params = msg.params.as_ref()?;
+    let id_value = params.get("id")?;
+    if let Some(n) = id_value.as_i64() {
+        Some(RpcId::Number(n))
+    } else {
+        id_value.as_str().map(|s| RpcId::String(s.to_string()))
     }
 }
