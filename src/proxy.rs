@@ -1,66 +1,60 @@
 use crate::backend::PyrightBackend;
-use crate::backend_state::BackendState;
+use crate::backend_pool::{
+    shutdown_backend_instance, spawn_reader_task, BackendInstance, BackendMessage,
+};
 use crate::error::ProxyError;
 use crate::framing::{LspFrameReader, LspFrameWriter};
-use crate::message::RpcMessage;
+use crate::message::{RpcId, RpcMessage};
 use crate::state::ProxyState;
 use crate::venv;
+use std::path::{Path, PathBuf};
 use tokio::io::{stdin, stdout};
+use tokio::time::Instant;
 
 pub struct LspProxy {
     state: ProxyState,
 }
 
 impl LspProxy {
-    pub fn new() -> Self {
+    pub fn new(max_backends: usize) -> Self {
         Self {
-            state: ProxyState::new(),
+            state: ProxyState::new(max_backends),
         }
     }
 
     pub async fn run(&mut self) -> Result<(), ProxyError> {
-        // Frame reader/writer for stdin/stdout
         let mut client_reader = LspFrameReader::new(stdin());
         let mut client_writer = LspFrameWriter::new(stdout());
 
-        // Get cwd at startup
         let cwd = std::env::current_dir()?;
-        tracing::info!(cwd = %cwd.display(), "Starting pyright-lsp-proxy");
+        tracing::info!(cwd = %cwd.display(), max_backends = self.state.pool.max_backends(), "Starting pyright-lsp-proxy");
 
         // Get and cache git toplevel
         self.state.git_toplevel = venv::get_git_toplevel(&cwd).await?;
 
-        // Search for fallback env
+        // Search for fallback venv
         let fallback_venv = venv::find_fallback_venv(&cwd).await?;
 
-        // Start backend (with fallback env, or without venv if not found)
-        let mut backend_state = if let Some(venv) = fallback_venv {
-            tracing::info!(venv = %venv.display(), "Using fallback .venv");
-            let backend = PyrightBackend::spawn(Some(&venv)).await?;
-            BackendState::Running {
-                backend: Box::new(backend),
-                active_venv: venv,
-                session: self.state.backend_session,
-            }
-        } else {
-            tracing::warn!("No fallback .venv found, starting in Disabled mode (strict venv)");
-            // Start in Disabled state when no venv found (strict mode)
-            // Don't spawn backend (spawn when venv is found on didOpen)
-            BackendState::Disabled {
-                reason: "No fallback .venv found".to_string(),
-                last_file: None,
-            }
-        };
+        // Pre-spawn backend if fallback venv found (but don't insert into pool yet —
+        // wait for client's `initialize` to complete the handshake first)
+        let mut pending_initial_backend: Option<(PyrightBackend, PathBuf)> =
+            if let Some(venv) = fallback_venv {
+                tracing::info!(venv = %venv.display(), "Using fallback .venv, pre-spawning backend");
+                let backend = PyrightBackend::spawn(Some(&venv)).await?;
+                Some((backend, venv))
+            } else {
+                tracing::warn!("No fallback .venv found, starting with empty pool");
+                None
+            };
 
         let mut didopen_count = 0;
 
         loop {
             tokio::select! {
-                // Messages from client (Claude Code)
+                // Messages from client
                 result = client_reader.read_message() => {
                     let msg = result?;
                     let method = msg.method_name();
-                    let is_disabled = backend_state.is_disabled();
 
                     tracing::debug!(
                         method = ?method,
@@ -69,15 +63,55 @@ impl LspProxy {
                         "Client -> Proxy"
                     );
 
-                    // Cache initialize
+                    // Handle initialize
                     if method == Some("initialize") {
-                        tracing::info!("Caching initialize message for backend restart");
+                        tracing::info!("Caching initialize message for backend initialization");
                         self.state.client_initialize = Some(msg.clone());
 
-                        // Return success response even in Disabled state (with empty capabilities)
-                        if is_disabled {
-                            tracing::warn!("Disabled mode: returning minimal initialize response");
-                            let init_response = crate::message::RpcMessage {
+                        if let Some((mut backend, venv)) = pending_initial_backend.take() {
+                            // Forward initialize to the pre-spawned backend
+                            match self.complete_backend_initialization(&mut backend, &venv, &mut client_writer).await {
+                                Ok(init_response) => {
+                                    // Split and insert into pool
+                                    let session = self.state.pool.next_session_id();
+                                    let parts = backend.into_split();
+                                    let tx = self.state.pool.msg_sender();
+                                    let reader_task = spawn_reader_task(parts.reader, tx, venv.clone(), session);
+
+                                    let instance = BackendInstance {
+                                        writer: parts.writer,
+                                        child: parts.child,
+                                        venv_path: venv.clone(),
+                                        session,
+                                        last_used: Instant::now(),
+                                        reader_task,
+                                        next_id: parts.next_id,
+                                    };
+                                    self.state.pool.insert(venv, instance);
+
+                                    // Send initialize response to client
+                                    client_writer.write_message(&init_response).await?;
+                                    tracing::info!("Initial backend inserted into pool");
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = ?e, "Failed to initialize fallback backend, returning minimal response");
+                                    let init_response = RpcMessage {
+                                        jsonrpc: "2.0".to_string(),
+                                        id: msg.id.clone(),
+                                        method: None,
+                                        params: None,
+                                        result: Some(serde_json::json!({
+                                            "capabilities": {}
+                                        })),
+                                        error: None,
+                                    };
+                                    client_writer.write_message(&init_response).await?;
+                                }
+                            }
+                        } else {
+                            // No fallback backend — return minimal capabilities
+                            tracing::warn!("No fallback backend: returning minimal initialize response");
+                            let init_response = RpcMessage {
                                 jsonrpc: "2.0".to_string(),
                                 id: msg.id.clone(),
                                 method: None,
@@ -88,34 +122,150 @@ impl LspProxy {
                                 error: None,
                             };
                             client_writer.write_message(&init_response).await?;
-                            continue;
                         }
-                    }
-
-                    // initialized notification (ignored in Disabled state)
-                    if method == Some("initialized") && is_disabled {
-                        tracing::debug!("Disabled mode: ignoring initialized notification");
                         continue;
                     }
 
-                    // 1. Always process didOpen (revival trigger)
+                    // Handle initialized notification
+                    if method == Some("initialized") {
+                        tracing::info!("Client initialized");
+                        // Forward to all backends in the pool
+                        let initialized_msg = RpcMessage {
+                            jsonrpc: "2.0".to_string(),
+                            id: None,
+                            method: Some("initialized".to_string()),
+                            params: Some(serde_json::json!({})),
+                            result: None,
+                            error: None,
+                        };
+                        // Collect keys to avoid borrow issues
+                        let venvs: Vec<PathBuf> = self.state.pool.backends_keys();
+                        for venv in &venvs {
+                            if let Some(inst) = self.state.pool.get_mut(venv) {
+                                if let Err(e) = inst.writer.write_message(&initialized_msg).await {
+                                    tracing::warn!(venv = %venv.display(), error = ?e, "Failed to forward initialized to backend");
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Handle shutdown request
+                    if method == Some("shutdown") {
+                        tracing::info!("Received shutdown request from client");
+
+                        // Shutdown all backends in the pool
+                        let venvs: Vec<PathBuf> = self.state.pool.backends_keys();
+                        for venv in &venvs {
+                            if let Some(instance) = self.state.pool.remove(venv) {
+                                tracing::info!(venv = %venv.display(), "Shutting down backend");
+                                shutdown_backend_instance(instance);
+                            }
+                        }
+
+                        // Send shutdown response to client
+                        let shutdown_response = RpcMessage {
+                            jsonrpc: "2.0".to_string(),
+                            id: msg.id.clone(),
+                            method: None,
+                            params: None,
+                            result: Some(serde_json::Value::Null),
+                            error: None,
+                        };
+                        client_writer.write_message(&shutdown_response).await?;
+                        tracing::info!("Sent shutdown response to client");
+                        continue;
+                    }
+
+                    // Handle exit notification
+                    if method == Some("exit") {
+                        tracing::info!("Received exit notification, terminating proxy");
+                        return Ok(());
+                    }
+
+                    // Handle client response (to a server→client request from backend)
+                    if msg.is_response() {
+                        if let Some(proxy_id) = &msg.id {
+                            if let Some(pending) = self.state.pending_backend_requests.remove(proxy_id) {
+                                // Restore original backend ID and route to correct backend
+                                let mut response_msg = msg.clone();
+                                response_msg.id = Some(pending.original_id);
+
+                                if let Some(inst) = self.state.pool.get_mut(&pending.venv_path) {
+                                    if inst.session == pending.session {
+                                        if let Err(e) = inst.writer.write_message(&response_msg).await {
+                                            tracing::warn!(
+                                                venv = %pending.venv_path.display(),
+                                                error = ?e,
+                                                "Failed to forward client response to backend"
+                                            );
+                                        }
+                                    } else {
+                                        tracing::warn!(
+                                            proxy_id = ?proxy_id,
+                                            expected_session = pending.session,
+                                            actual_session = inst.session,
+                                            "Discarding client response: session mismatch"
+                                        );
+                                    }
+                                } else {
+                                    tracing::warn!(
+                                        proxy_id = ?proxy_id,
+                                        venv = %pending.venv_path.display(),
+                                        "Discarding client response: backend no longer in pool"
+                                    );
+                                }
+                                continue;
+                            }
+                            // If not in pending_backend_requests, fall through (shouldn't happen normally)
+                        }
+                    }
+
+                    // Handle didOpen
                     if method == Some("textDocument/didOpen") {
                         didopen_count += 1;
-                        self.handle_did_open(&msg, didopen_count, &mut backend_state, &mut client_writer).await?;
-                        continue; // didOpen already handled
+                        self.handle_did_open(&msg, didopen_count, &mut client_writer).await?;
+                        continue;
                     }
 
-                    // 2. Always update cache for didChange/didClose
+                    // Handle didChange (always update cache)
                     if method == Some("textDocument/didChange") {
                         self.handle_did_change(&msg).await?;
-                        if is_disabled { continue; }  // Don't send to backend when Disabled
-                    }
-                    if method == Some("textDocument/didClose") {
-                        self.handle_did_close(&msg).await?;
-                        if is_disabled { continue; }  // Don't send to backend when Disabled
+                        // Forward to appropriate backend
+                        if let Some(url) = Self::extract_text_document_uri(&msg) {
+                            if let Some(venv_path) = self.venv_for_uri(&url) {
+                                if let Some(inst) = self.state.pool.get_mut(&venv_path) {
+                                    inst.last_used = Instant::now();
+                                    if let Err(e) = inst.writer.write_message(&msg).await {
+                                        tracing::warn!(venv = %venv_path.display(), error = ?e, "Failed to forward didChange");
+                                    }
+                                }
+                            }
+                        }
+                        continue;
                     }
 
-                    // 3. Request processing (with transparent retry support)
+                    // Handle didClose (always update cache)
+                    if method == Some("textDocument/didClose") {
+                        // Get venv before removing from cache
+                        let venv_for_close = Self::extract_text_document_uri(&msg)
+                            .and_then(|url| self.venv_for_uri(&url));
+
+                        self.handle_did_close(&msg).await?;
+
+                        // Forward to appropriate backend
+                        if let Some(venv_path) = venv_for_close {
+                            if let Some(inst) = self.state.pool.get_mut(&venv_path) {
+                                inst.last_used = Instant::now();
+                                if let Err(e) = inst.writer.write_message(&msg).await {
+                                    tracing::warn!(venv = %venv_path.display(), error = ?e, "Failed to forward didClose");
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Request processing
                     const VENV_CHECK_METHODS: &[&str] = &[
                         "textDocument/hover",
                         "textDocument/definition",
@@ -127,379 +277,230 @@ impl LspProxy {
 
                     if msg.is_request() {
                         let m = method;
+                        let mut target_venv: Option<PathBuf> = None;
 
-                        // Pass through ensure_backend_for_uri for VENV_CHECK_METHODS
+                        // For VENV_CHECK_METHODS, ensure the correct backend is in the pool
                         if let Some(method_name) = m {
                             if VENV_CHECK_METHODS.contains(&method_name) {
                                 if let Some(url) = Self::extract_text_document_uri(&msg) {
                                     if let Ok(file_path) = url.to_file_path() {
-                                        let old_session = backend_state.session();
-
-                                        let switched = self
-                                            .ensure_backend_for_uri(
-                                                &mut backend_state,
-                                                &mut client_writer,
-                                                &url,
-                                                &file_path,
-                                            )
-                                            .await?;
-
-                                        if switched {
-                                            tracing::info!(
-                                                method = method_name,
-                                                uri = %url,
-                                                from_session = ?old_session,
-                                                to_session = ?backend_state.session(),
-                                                "Venv switched, request will be sent to new backend"
-                                            );
+                                        match self.ensure_backend_in_pool(&url, &file_path, &mut client_writer).await {
+                                            Ok(Some(venv)) => {
+                                                target_venv = Some(venv);
+                                            }
+                                            Ok(None) => {
+                                                // No venv found — return error
+                                                let error_message = "pyright-lsp-proxy: .venv not found (strict mode). Create .venv or run hooks.";
+                                                tracing::warn!(
+                                                    method = method_name,
+                                                    uri = %url,
+                                                    "No venv found, returning error"
+                                                );
+                                                let error_response = create_error_response(&msg, error_message);
+                                                client_writer.write_message(&error_response).await?;
+                                                continue;
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(error = ?e, "Failed to ensure backend in pool");
+                                                let error_response = create_error_response(&msg, &format!("pyright-lsp-proxy: backend error: {}", e));
+                                                client_writer.write_message(&error_response).await?;
+                                                continue;
+                                            }
                                         }
-                                    } else {
-                                        // URI extraction succeeded but file_path conversion failed
-                                        tracing::debug!(
-                                            method = method_name,
-                                            uri = %url,
-                                            "Skipping venv check: could not convert URI to file path"
-                                        );
                                     }
-                                } else {
-                                    // URI extraction failed → skip switch check
-                                    tracing::debug!(
-                                        method = method_name,
-                                        "Skipping venv check: could not extract textDocument.uri"
-                                    );
                                 }
                             }
                         }
 
-                        // Register in pending (record current backend session)
-                        if let Some(id) = &msg.id {
-                            if let Some(session) = backend_state.session() {
-                                self.state.pending_requests.insert(
-                                    id.clone(),
-                                    crate::state::PendingRequest {
-                                        backend_session: session,
-                                    },
-                                );
+                        // Determine target backend if not yet determined
+                        if target_venv.is_none() {
+                            if let Some(url) = Self::extract_text_document_uri(&msg) {
+                                target_venv = self.venv_for_uri(&url);
                             }
                         }
-                    }
 
-                    // 4. Return error for requests in Disabled state (except VENV_CHECK_METHODS)
-                    // Re-check since state may have changed in ensure_backend_for_uri()
-                    let is_disabled = backend_state.is_disabled();
-                    if is_disabled && msg.is_request() {
-                        let error_message = "pyright-lsp-proxy: .venv not found (strict mode). Create .venv or run hooks.";
-                        if let Some((reason, last_file)) = backend_state.disabled_info() {
-                            tracing::warn!(
-                                method = ?method,
-                                reason = reason,
-                                last_file = ?last_file.map(|p| p.display().to_string()),
-                                error_message = error_message,
-                                "Returning error response to client (Disabled mode)"
-                            );
+                        // If we have a target, send to that backend
+                        if let Some(ref venv_path) = target_venv {
+                            if let Some(inst) = self.state.pool.get_mut(venv_path) {
+                                inst.last_used = Instant::now();
+                                let session = inst.session;
+
+                                // Register in pending requests
+                                if let Some(id) = &msg.id {
+                                    self.state.pending_requests.insert(
+                                        id.clone(),
+                                        crate::state::PendingRequest {
+                                            backend_session: session,
+                                            venv_path: venv_path.clone(),
+                                        },
+                                    );
+                                }
+
+                                if let Err(e) = inst.writer.write_message(&msg).await {
+                                    tracing::error!(venv = %venv_path.display(), error = ?e, "Failed to send request to backend");
+                                }
+                            } else {
+                                // Backend disappeared (race with crash handling)
+                                let error_response = create_error_response(&msg, "pyright-lsp-proxy: backend not available");
+                                client_writer.write_message(&error_response).await?;
+                            }
+                        } else {
+                            // No target backend — check if any backend exists
+                            if self.state.pool.is_empty() {
+                                let error_message = "pyright-lsp-proxy: .venv not found (strict mode). Create .venv or run hooks.";
+                                let error_response = create_error_response(&msg, error_message);
+                                client_writer.write_message(&error_response).await?;
+                            } else {
+                                // Forward to the first available backend (best effort for non-textDocument requests)
+                                let first_venv = self.state.pool.first_key().cloned();
+                                if let Some(venv_path) = first_venv {
+                                    if let Some(inst) = self.state.pool.get_mut(&venv_path) {
+                                        inst.last_used = Instant::now();
+                                        let session = inst.session;
+                                        if let Some(id) = &msg.id {
+                                            self.state.pending_requests.insert(
+                                                id.clone(),
+                                                crate::state::PendingRequest {
+                                                    backend_session: session,
+                                                    venv_path: venv_path.clone(),
+                                                },
+                                            );
+                                        }
+                                        if let Err(e) = inst.writer.write_message(&msg).await {
+                                            tracing::error!(venv = %venv_path.display(), error = ?e, "Failed to send request to backend");
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        let error_response = create_error_response(&msg, error_message);
-                        client_writer.write_message(&error_response).await?;
                         continue;
                     }
 
-                    // 5. Forward to backend when Running
-                    if let BackendState::Running { backend, session, .. } = &mut backend_state {
-                        if msg.is_request() {
-                            tracing::debug!(
-                                session = *session,
-                                method = msg.method.as_deref(),
-                                "Sending request to backend"
-                            );
-                        }
-                        backend.send_message(&msg).await?;
-                    }
-                }
-
-                // Wait for backend read only when Running
-                result = async {
-                    match &mut backend_state {
-                        BackendState::Running { backend, .. } => backend.read_message().await,
-                        BackendState::Disabled { .. } => std::future::pending().await,
-                    }
-                } => {
-                    let msg = result?;
-                    let running_session = backend_state.session();
-
-                    tracing::debug!(
-                        is_response = msg.is_response(),
-                        is_notification = msg.is_notification(),
-                        "Backend -> Proxy"
-                    );
-
-                    // Resolve pending with backend response + generation check
-                    if msg.is_response() {
-                        if let Some(id) = &msg.id {
-                            // Get from pending and check generation
-                            if let Some(pending) = self.state.pending_requests.get(id) {
-                                if Some(pending.backend_session) != running_session {
-                                    // Response from old generation → discard
-                                    tracing::warn!(
-                                        id = ?id,
-                                        pending_session = pending.backend_session,
-                                        running_session = ?running_session,
-                                        "Discarding stale response from old backend session"
-                                    );
-                                    self.state.pending_requests.remove(id);
-                                    continue;
+                    // Non-request, non-notification that's not handled above — forward to all backends
+                    // (This shouldn't normally happen, but be defensive)
+                    if msg.is_notification() {
+                        let venvs: Vec<PathBuf> = self.state.pool.backends_keys();
+                        for venv in &venvs {
+                            if let Some(inst) = self.state.pool.get_mut(venv) {
+                                if let Err(e) = inst.writer.write_message(&msg).await {
+                                    tracing::warn!(venv = %venv.display(), error = ?e, "Failed to forward notification to backend");
                                 }
                             }
-                            self.state.pending_requests.remove(id);
                         }
                     }
-
-                    // Forward to client
-                    client_writer.write_message(&msg).await?;
                 }
-            }
-        }
-    }
 
-    /// Extract textDocument.uri from LSP request params
-    fn extract_text_document_uri(msg: &RpcMessage) -> Option<url::Url> {
-        let params = msg.params.as_ref()?;
-        let text_document = params.get("textDocument")?;
-        let uri_str = text_document.get("uri")?.as_str()?;
-        url::Url::parse(uri_str).ok()
-    }
+                // Messages from all backends via mpsc channel
+                Some(backend_msg) = self.state.pool.backend_msg_rx.recv() => {
+                    let BackendMessage { venv_path, session, result } = backend_msg;
 
-    /// Ensure appropriate backend for URI
-    /// Returns: whether a switch occurred
-    async fn ensure_backend_for_uri(
-        &mut self,
-        backend_state: &mut BackendState,
-        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
-        url: &url::Url,
-        file_path: &std::path::Path,
-    ) -> Result<bool, ProxyError> {
-        // Get venv from cache (O(1))
-        let target_venv = if let Some(doc) = self.state.open_documents.get(url) {
-            doc.venv.clone()
-        } else {
-            // URI without didOpen → search (exceptional path)
-            tracing::debug!(uri = %url, "URI not in cache, searching venv");
-            venv::find_venv(file_path, self.state.git_toplevel.as_deref()).await?
-        };
+                    // Stale session check: discard messages from backends no longer in the pool
+                    // or whose session has changed (evicted and re-created)
+                    let is_current = self.state.pool.get(&venv_path)
+                        .is_some_and(|inst| inst.session == session);
 
-        // State transition via common function
-        self.transition_backend_state(
-            backend_state,
-            client_writer,
-            target_venv.as_deref(),
-            file_path,
-        )
-        .await
-    }
-
-    /// Transition backend state based on venv
-    /// Returns: whether a switch occurred
-    async fn transition_backend_state(
-        &mut self,
-        backend_state: &mut BackendState,
-        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
-        target_venv: Option<&std::path::Path>,
-        trigger_file: &std::path::Path,
-    ) -> Result<bool, ProxyError> {
-        match (&*backend_state, target_venv) {
-            // Running + same venv → do nothing
-            (BackendState::Running { active_venv, .. }, Some(venv)) if active_venv == venv => {
-                tracing::debug!(venv = %venv.display(), "Using same .venv as before");
-                Ok(false)
-            }
-
-            // Running + different venv → switch
-            (BackendState::Running { .. }, Some(venv)) => {
-                let old_session = backend_state.session().unwrap_or(0);
-
-                tracing::warn!(
-                    current = ?backend_state.active_venv().map(|p| p.display().to_string()),
-                    found = %venv.display(),
-                    "Venv switch needed, restarting backend"
-                );
-
-                if let BackendState::Running { backend, .. } = backend_state {
-                    // Cancel pending requests for old session
-                    self.cancel_pending_requests_for_session(client_writer, old_session)
-                        .await?;
-
-                    let new_backend = self
-                        .restart_backend_with_venv(backend, venv, client_writer)
-                        .await?;
-                    *backend_state = BackendState::Running {
-                        backend: Box::new(new_backend),
-                        active_venv: venv.to_path_buf(),
-                        session: self.state.backend_session,
-                    };
-                }
-                Ok(true)
-            }
-
-            // Running + venv not found → transition to Disabled
-            (BackendState::Running { .. }, None) => {
-                tracing::warn!(
-                    path = %trigger_file.display(),
-                    "No .venv found for this file, disabling backend"
-                );
-
-                if let BackendState::Running { backend, .. } = backend_state {
-                    self.disable_backend(backend, client_writer, trigger_file)
-                        .await?;
-                    *backend_state = BackendState::Disabled {
-                        reason: format!("No .venv found for file: {}", trigger_file.display()),
-                        last_file: Some(trigger_file.to_path_buf()),
-                    };
-                }
-                Ok(true)
-            }
-
-            // Disabled + venv found → revive to Running
-            (BackendState::Disabled { .. }, Some(venv)) => {
-                tracing::info!(venv = %venv.display(), "Found .venv, spawning backend");
-                let new_backend = self.spawn_and_init_backend(venv, client_writer).await?;
-                *backend_state = BackendState::Running {
-                    backend: Box::new(new_backend),
-                    active_venv: venv.to_path_buf(),
-                    session: self.state.backend_session,
-                };
-                Ok(true)
-            }
-
-            // Disabled + venv not found → stay as is
-            (BackendState::Disabled { reason, last_file }, None) => {
-                tracing::warn!(
-                    path = %trigger_file.display(),
-                    reason = reason.as_str(),
-                    last_file = ?last_file.as_ref().map(|p| p.display().to_string()),
-                    "No .venv found for this file (backend still disabled)"
-                );
-                Ok(false)
-            }
-        }
-    }
-
-    /// Handle didOpen & .venv switch decision + BackendState transition (Strict venv mode)
-    async fn handle_did_open(
-        &mut self,
-        msg: &crate::message::RpcMessage,
-        count: usize,
-        backend_state: &mut BackendState,
-        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
-    ) -> Result<(), ProxyError> {
-        // Extract URI and text from params
-        if let Some(params) = &msg.params {
-            if let Some(text_document) = params.get("textDocument") {
-                let text = text_document
-                    .get("text")
-                    .and_then(|t| t.as_str())
-                    .map(|s| s.to_string());
-
-                if let Some(uri_value) = text_document.get("uri") {
-                    if let Some(uri_str) = uri_value.as_str() {
-                        if let Ok(url) = url::Url::parse(uri_str) {
-                            if let Ok(file_path) = url.to_file_path() {
-                                // Get languageId and version
-                                let language_id = text_document
-                                    .get("languageId")
-                                    .and_then(|l| l.as_str())
-                                    .unwrap_or("unknown")
-                                    .to_string();
-
-                                let version = text_document
-                                    .get("version")
-                                    .and_then(|v| v.as_i64())
-                                    .unwrap_or(0)
-                                    as i32;
-
-                                tracing::info!(
-                                    count = count,
-                                    uri = uri_str,
-                                    path = %file_path.display(),
-                                    has_text = text.is_some(),
-                                    text_len = text.as_ref().map(|s| s.len()).unwrap_or(0),
-                                    language_id = %language_id,
-                                    version = version,
-                                    "didOpen received"
-                                );
-
-                                // Search for .venv
-                                let found_venv =
-                                    venv::find_venv(&file_path, self.state.git_toplevel.as_deref())
-                                        .await?;
-
-                                // Cache didOpen (for revival when Disabled)
-                                if let Some(text_content) = &text {
-                                    let doc = crate::state::OpenDocument {
-                                        language_id: language_id.clone(),
-                                        version,
-                                        text: text_content.clone(),
-                                        venv: found_venv.clone(),
-                                    };
-                                    self.state.open_documents.insert(url.clone(), doc);
-                                    tracing::debug!(
-                                        uri = %url,
-                                        doc_count = self.state.open_documents.len(),
-                                        cached_venv = ?found_venv.as_ref().map(|p| p.display().to_string()),
-                                        "Document cached"
-                                    );
-                                }
-
-                                // State transition logic (Strict venv mode)
+                    if !is_current {
+                        match result {
+                            Ok(_) => {
                                 tracing::debug!(
-                                    is_running = !backend_state.is_disabled(),
-                                    is_disabled = backend_state.is_disabled(),
-                                    has_venv = found_venv.is_some(),
-                                    "State transition check"
+                                    venv = %venv_path.display(),
+                                    session = session,
+                                    "Discarding stale message from evicted/crashed backend"
                                 );
-
-                                self.transition_backend_state(
-                                    backend_state,
-                                    client_writer,
-                                    found_venv.as_deref(),
-                                    &file_path,
-                                )
-                                .await?;
                             }
+                            Err(_) => {
+                                tracing::debug!(
+                                    venv = %venv_path.display(),
+                                    session = session,
+                                    "Discarding stale error from evicted/crashed backend"
+                                );
+                            }
+                        }
+                        continue;
+                    }
+
+                    match result {
+                        Ok(msg) => {
+                            tracing::debug!(
+                                venv = %venv_path.display(),
+                                session = session,
+                                is_response = msg.is_response(),
+                                is_notification = msg.is_notification(),
+                                is_request = msg.is_request(),
+                                "Backend -> Proxy"
+                            );
+
+                            // Check if this is a server→client request from the backend
+                            if msg.is_request() {
+                                if let Some(original_id) = &msg.id {
+                                    // Assign a proxy-unique ID to avoid collisions between backends
+                                    let proxy_id = self.state.alloc_proxy_request_id();
+
+                                    let pending = crate::state::PendingBackendRequest {
+                                        original_id: original_id.clone(),
+                                        venv_path: venv_path.clone(),
+                                        session,
+                                    };
+                                    self.state.pending_backend_requests.insert(proxy_id.clone(), pending);
+
+                                    // Rewrite the ID before forwarding to client
+                                    let mut forwarded_msg = msg;
+                                    forwarded_msg.id = Some(proxy_id);
+                                    client_writer.write_message(&forwarded_msg).await?;
+                                } else {
+                                    // Request without ID (shouldn't happen per JSON-RPC, but be defensive)
+                                    client_writer.write_message(&msg).await?;
+                                }
+                                continue;
+                            }
+
+                            // Handle response: check pending + stale check
+                            if msg.is_response() {
+                                if let Some(id) = &msg.id {
+                                    if let Some(pending) = self.state.pending_requests.get(id) {
+                                        if pending.backend_session != session || pending.venv_path != venv_path {
+                                            tracing::warn!(
+                                                id = ?id,
+                                                pending_session = pending.backend_session,
+                                                pending_venv = %pending.venv_path.display(),
+                                                msg_session = session,
+                                                msg_venv = %venv_path.display(),
+                                                "Discarding stale response from old backend session"
+                                            );
+                                            self.state.pending_requests.remove(id);
+                                            continue;
+                                        }
+                                    }
+                                    self.state.pending_requests.remove(id);
+                                }
+                            }
+
+                            // Forward to client
+                            client_writer.write_message(&msg).await?;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                venv = %venv_path.display(),
+                                session = session,
+                                error = ?e,
+                                "Backend read error (crash/EOF)"
+                            );
+                            self.handle_backend_crash(&venv_path, session, &mut client_writer).await?;
                         }
                     }
                 }
             }
         }
-
-        Ok(())
     }
 
-    /// Gracefully shutdown backend and restart with new .venv
-    async fn restart_backend_with_venv(
-        &mut self,
+    /// Complete backend initialization: forward initialize, receive response, send initialized.
+    /// Returns the initialize response to forward to the client.
+    async fn complete_backend_initialization(
+        &self,
         backend: &mut PyrightBackend,
-        new_venv: &std::path::Path,
-        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
-    ) -> Result<PyrightBackend, ProxyError> {
-        self.state.backend_session += 1;
-        let session = self.state.backend_session;
-
-        tracing::info!(
-            session = session,
-            new_venv = %new_venv.display(),
-            "Starting backend restart sequence"
-        );
-
-        // 1. Shutdown existing backend
-        if let Err(e) = backend.shutdown_gracefully().await {
-            tracing::error!(error = ?e, "Failed to shutdown backend gracefully");
-            // Continue even on error (try to start new backend)
-        }
-
-        // 2. Start new backend
-        tracing::info!(session = session, venv = %new_venv.display(), "Spawning new backend");
-        let mut new_backend = PyrightBackend::spawn(Some(new_venv)).await?;
-
-        // 3. Send initialize to backend (proxy becomes backend client)
+        venv: &Path,
+        _client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+    ) -> Result<RpcMessage, ProxyError> {
         let init_params = self
             .state
             .client_initialize
@@ -507,22 +508,22 @@ impl LspProxy {
             .and_then(|msg| msg.params.clone())
             .ok_or_else(|| ProxyError::InvalidMessage("No initialize params cached".to_string()))?;
 
-        let init_msg = crate::message::RpcMessage {
+        let init_msg = RpcMessage {
             jsonrpc: "2.0".to_string(),
-            id: Some(crate::message::RpcId::Number(1)),
+            id: Some(RpcId::Number(1)),
             method: Some("initialize".to_string()),
             params: Some(init_params),
             result: None,
             error: None,
         };
 
-        tracing::info!(session = session, "Sending initialize to new backend");
-        new_backend.send_message(&init_msg).await?;
+        tracing::info!(venv = %venv.display(), "Sending initialize to backend");
+        backend.send_message(&init_msg).await?;
 
-        // 4. Receive initialize response (skip notifications, check id, with timeout)
+        // Receive initialize response
         let init_id = 1i64;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
+        let init_response = loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return Err(ProxyError::Backend(
@@ -530,15 +531,13 @@ impl LspProxy {
                 ));
             }
 
-            let wait_result = tokio::time::timeout(remaining, new_backend.read_message()).await;
+            let wait_result = tokio::time::timeout(remaining, backend.read_message()).await;
 
             match wait_result {
                 Ok(Ok(msg)) => {
                     if msg.is_response() {
-                        // Check if id matches
-                        if let Some(crate::message::RpcId::Number(id)) = &msg.id {
+                        if let Some(RpcId::Number(id)) = &msg.id {
                             if *id == init_id {
-                                // Check if error response
                                 if let Some(error) = &msg.error {
                                     return Err(ProxyError::Backend(
                                         crate::error::BackendError::InitializeResponseError(
@@ -549,40 +548,15 @@ impl LspProxy {
                                         ),
                                     ));
                                 }
-
                                 tracing::info!(
-                                    session = session,
-                                    response_id = ?msg.id,
+                                    venv = %venv.display(),
                                     "Received initialize response from backend"
                                 );
-
-                                // Log textDocumentSync capability
-                                if let Some(result) = &msg.result {
-                                    if let Some(capabilities) = result.get("capabilities") {
-                                        if let Some(sync) = capabilities.get("textDocumentSync") {
-                                            tracing::info!(
-                                                session = session,
-                                                text_document_sync = ?sync,
-                                                "Backend textDocumentSync capability"
-                                            );
-                                        }
-                                    }
-                                }
-
-                                break;
-                            } else {
-                                tracing::debug!(
-                                    session = session,
-                                    response_id = ?msg.id,
-                                    expected_id = init_id,
-                                    "Received different response, continuing"
-                                );
+                                break msg;
                             }
                         }
                     } else {
-                        // Ignore notifications and continue loop
                         tracing::debug!(
-                            session = session,
                             method = ?msg.method,
                             "Received notification during initialize, ignoring"
                         );
@@ -602,10 +576,10 @@ impl LspProxy {
                     ));
                 }
             }
-        }
+        };
 
-        // 5. Send initialized notification
-        let initialized_msg = crate::message::RpcMessage {
+        // Send initialized notification
+        let initialized_msg = RpcMessage {
             jsonrpc: "2.0".to_string(),
             id: None,
             method: Some("initialized".to_string()),
@@ -614,17 +588,143 @@ impl LspProxy {
             error: None,
         };
 
-        tracing::info!(session = session, "Sending initialized to backend");
-        new_backend.send_message(&initialized_msg).await?;
+        tracing::info!(venv = %venv.display(), "Sending initialized to backend");
+        backend.send_message(&initialized_msg).await?;
 
-        // 6. Document restoration
-        // Restore only documents under the new venv's parent directory
-        let venv_parent = new_venv.parent().map(|p| p.to_path_buf());
+        Ok(init_response)
+    }
+
+    /// Create a new backend, initialize it, split it, and return a BackendInstance.
+    /// Does NOT insert into the pool — caller is responsible for that.
+    async fn create_backend_instance(
+        &mut self,
+        venv: &Path,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+    ) -> Result<BackendInstance, ProxyError> {
+        let session = self.state.pool.next_session_id();
+
+        tracing::info!(
+            session = session,
+            venv = %venv.display(),
+            "Creating new backend instance"
+        );
+
+        // 1. Spawn
+        let mut backend = PyrightBackend::spawn(Some(venv)).await?;
+
+        // 2. Initialize handshake (direct read/write before split)
+        let init_params = self
+            .state
+            .client_initialize
+            .as_ref()
+            .and_then(|msg| msg.params.clone())
+            .ok_or_else(|| ProxyError::InvalidMessage("No initialize params cached".to_string()))?;
+
+        let init_msg = RpcMessage {
+            jsonrpc: "2.0".to_string(),
+            id: Some(RpcId::Number(1)),
+            method: Some("initialize".to_string()),
+            params: Some(init_params),
+            result: None,
+            error: None,
+        };
+
+        backend.send_message(&init_msg).await?;
+
+        // Receive initialize response
+        let init_id = 1i64;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(ProxyError::Backend(
+                    crate::error::BackendError::InitializeTimeout(10),
+                ));
+            }
+
+            let wait_result = tokio::time::timeout(remaining, backend.read_message()).await;
+
+            match wait_result {
+                Ok(Ok(msg)) => {
+                    if msg.is_response() {
+                        if let Some(RpcId::Number(id)) = &msg.id {
+                            if *id == init_id {
+                                if let Some(error) = &msg.error {
+                                    return Err(ProxyError::Backend(
+                                        crate::error::BackendError::InitializeResponseError(
+                                            format!(
+                                                "code={}, message={}",
+                                                error.code, error.message
+                                            ),
+                                        ),
+                                    ));
+                                }
+                                tracing::info!(session = session, "Backend initialized");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    return Err(ProxyError::Backend(
+                        crate::error::BackendError::InitializeFailed(format!(
+                            "Error reading initialize response: {}",
+                            e
+                        )),
+                    ));
+                }
+                Err(_) => {
+                    return Err(ProxyError::Backend(
+                        crate::error::BackendError::InitializeTimeout(10),
+                    ));
+                }
+            }
+        }
+
+        // Send initialized
+        let initialized_msg = RpcMessage {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            method: Some("initialized".to_string()),
+            params: Some(serde_json::json!({})),
+            result: None,
+            error: None,
+        };
+        backend.send_message(&initialized_msg).await?;
+
+        // 3. Document restoration for this venv
+        self.restore_documents_to_backend(&mut backend, venv, session, client_writer)
+            .await?;
+
+        // 4. Split and create instance
+        let parts = backend.into_split();
+        let tx = self.state.pool.msg_sender();
+        let reader_task = spawn_reader_task(parts.reader, tx, venv.to_path_buf(), session);
+
+        Ok(BackendInstance {
+            writer: parts.writer,
+            child: parts.child,
+            venv_path: venv.to_path_buf(),
+            session,
+            last_used: Instant::now(),
+            reader_task,
+            next_id: parts.next_id,
+        })
+    }
+
+    /// Restore documents belonging to a venv to a backend
+    async fn restore_documents_to_backend(
+        &self,
+        backend: &mut PyrightBackend,
+        venv: &Path,
+        session: u64,
+        _client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+    ) -> Result<(), ProxyError> {
+        let venv_parent = venv.parent().map(|p| p.to_path_buf());
         let total_docs = self.state.open_documents.len();
         let mut restored = 0;
         let mut skipped = 0;
         let mut failed = 0;
-        let mut skipped_uris: Vec<url::Url> = Vec::new();
 
         tracing::info!(
             session = session,
@@ -634,30 +734,25 @@ impl LspProxy {
         );
 
         for (url, doc) in &self.state.open_documents {
-            // Restore only documents under venv's parent directory
-            let should_restore = match (url.to_file_path().ok(), &venv_parent) {
-                (Some(file_path), Some(venv_parent)) => file_path.starts_with(venv_parent),
-                _ => false, // Skip if not file:// URL or venv_parent is None
-            };
+            // Only restore documents matching this venv
+            let should_restore = doc.venv.as_deref() == Some(venv)
+                || match (url.to_file_path().ok(), &venv_parent) {
+                    (Some(file_path), Some(vp)) => file_path.starts_with(vp),
+                    _ => false,
+                };
 
             if !should_restore {
                 skipped += 1;
-                skipped_uris.push(url.clone());
-                tracing::debug!(
-                    session = session,
-                    uri = %url,
-                    "Skipping document from different venv"
-                );
                 continue;
             }
-            // Copy required values first (end borrow before await)
+
             let uri_str = url.to_string();
             let language_id = doc.language_id.clone();
             let version = doc.version;
             let text = doc.text.clone();
             let text_len = text.len();
 
-            let didopen_msg = crate::message::RpcMessage {
+            let didopen_msg = RpcMessage {
                 jsonrpc: "2.0".to_string(),
                 id: None,
                 method: Some("textDocument/didOpen".to_string()),
@@ -673,15 +768,14 @@ impl LspProxy {
                 error: None,
             };
 
-            match new_backend.send_message(&didopen_msg).await {
+            match backend.send_message(&didopen_msg).await {
                 Ok(_) => {
                     restored += 1;
                     tracing::info!(
                         session = session,
                         uri = %uri_str,
-                        version = version,
                         text_len = text_len,
-                        "Successfully restored document"
+                        "Restored document"
                     );
                 }
                 Err(e) => {
@@ -690,9 +784,8 @@ impl LspProxy {
                         session = session,
                         uri = %uri_str,
                         error = ?e,
-                        "Failed to restore document, skipping"
+                        "Failed to restore document"
                     );
-                    // Continue with next document (partial restoration strategy)
                 }
             }
         }
@@ -706,39 +799,347 @@ impl LspProxy {
             "Document restoration completed"
         );
 
-        // Clear diagnostics for skipped URIs
-        if !skipped_uris.is_empty() {
-            let (ok, clear_failed) = self
-                .clear_diagnostics_for_uris(&skipped_uris, client_writer)
-                .await;
+        Ok(())
+    }
 
-            if clear_failed == 0 {
-                tracing::info!(
-                    session = session,
-                    cleared_ok = ok,
-                    "Diagnostics cleared for skipped documents"
-                );
-            } else {
-                tracing::info!(
-                    session = session,
-                    cleared_ok = ok,
-                    cleared_failed = clear_failed,
-                    "Diagnostics clear partially failed for skipped documents"
-                );
+    /// Ensure a backend for the given URI's venv is in the pool.
+    /// Returns Some(venv_path) if a backend is available, None if no venv found.
+    async fn ensure_backend_in_pool(
+        &mut self,
+        url: &url::Url,
+        file_path: &Path,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+    ) -> Result<Option<PathBuf>, ProxyError> {
+        // Get venv from cache
+        let target_venv = if let Some(doc) = self.state.open_documents.get(url) {
+            doc.venv.clone()
+        } else {
+            tracing::debug!(uri = %url, "URI not in cache, searching venv");
+            venv::find_venv(file_path, self.state.git_toplevel.as_deref()).await?
+        };
+
+        let target_venv = match target_venv {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        // Already in pool?
+        if self.state.pool.contains(&target_venv) {
+            return Ok(Some(target_venv));
+        }
+
+        // Need to create a new backend. Evict if full.
+        if self.state.pool.is_full() {
+            self.evict_lru_backend(client_writer).await?;
+        }
+
+        // Create backend instance
+        let instance = self
+            .create_backend_instance(&target_venv, client_writer)
+            .await?;
+        self.state.pool.insert(target_venv.clone(), instance);
+
+        Ok(Some(target_venv))
+    }
+
+    /// Evict the LRU backend from the pool
+    async fn evict_lru_backend(
+        &mut self,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+    ) -> Result<(), ProxyError> {
+        let pending_requests = &self.state.pending_requests;
+        let lru_venv = self.state.pool.lru_venv(|venv, session| {
+            pending_requests
+                .values()
+                .filter(|p| p.venv_path == *venv && p.backend_session == session)
+                .count()
+        });
+
+        if let Some(venv_to_evict) = lru_venv {
+            tracing::info!(
+                venv = %venv_to_evict.display(),
+                pool_size = self.state.pool.len(),
+                "Evicting LRU backend"
+            );
+
+            if let Some(instance) = self.state.pool.remove(&venv_to_evict) {
+                let evict_session = instance.session;
+
+                // Cancel pending requests for this backend
+                self.cancel_pending_requests_for_backend(
+                    client_writer,
+                    &venv_to_evict,
+                    evict_session,
+                )
+                .await?;
+
+                // Clean up pending_backend_requests for this backend
+                self.clean_pending_backend_requests(&venv_to_evict, evict_session);
+
+                // Clear diagnostics for documents under this venv
+                self.clear_diagnostics_for_venv(&venv_to_evict, client_writer)
+                    .await;
+
+                // Shutdown
+                shutdown_backend_instance(instance);
             }
         }
 
-        tracing::info!(
+        Ok(())
+    }
+
+    /// Handle backend crash: remove from pool, cancel pending, clean up
+    async fn handle_backend_crash(
+        &mut self,
+        venv_path: &PathBuf,
+        session: u64,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+    ) -> Result<(), ProxyError> {
+        // Verify session matches (avoid double-crash handling)
+        let should_remove = self
+            .state
+            .pool
+            .get(venv_path)
+            .is_some_and(|inst| inst.session == session);
+
+        if !should_remove {
+            tracing::debug!(
+                venv = %venv_path.display(),
+                session = session,
+                "Ignoring crash for already-removed backend"
+            );
+            return Ok(());
+        }
+
+        tracing::warn!(
+            venv = %venv_path.display(),
             session = session,
-            venv = %new_venv.display(),
-            "Backend restart completed successfully"
+            "Handling backend crash"
         );
 
-        Ok(new_backend)
+        if let Some(instance) = self.state.pool.remove(venv_path) {
+            // Cancel pending requests
+            self.cancel_pending_requests_for_backend(client_writer, venv_path, session)
+                .await?;
+
+            // Clean up pending_backend_requests
+            self.clean_pending_backend_requests(venv_path, session);
+
+            // Abort reader task (it already exited with error, but be safe)
+            instance.reader_task.abort();
+
+            // Don't attempt graceful shutdown — process is already dead
+            tracing::info!(
+                venv = %venv_path.display(),
+                session = session,
+                "Backend removed from pool after crash"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Cancel pending requests for a specific backend (identified by venv_path + session)
+    async fn cancel_pending_requests_for_backend(
+        &mut self,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+        venv_path: &PathBuf,
+        session: u64,
+    ) -> Result<(), ProxyError> {
+        const REQUEST_CANCELLED: i64 = -32800;
+
+        let to_cancel: Vec<RpcId> = self
+            .state
+            .pending_requests
+            .iter()
+            .filter(|(_, p)| p.venv_path == *venv_path && p.backend_session == session)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for id in to_cancel {
+            self.state.pending_requests.remove(&id);
+            let msg = RpcMessage {
+                jsonrpc: "2.0".to_string(),
+                id: Some(id.clone()),
+                method: None,
+                params: None,
+                result: None,
+                error: Some(crate::message::RpcError {
+                    code: REQUEST_CANCELLED,
+                    message: "Request cancelled due to backend eviction".to_string(),
+                    data: None,
+                }),
+            };
+            client_writer.write_message(&msg).await?;
+            tracing::info!(id = ?id, venv = %venv_path.display(), session = session, "Cancelled pending request");
+        }
+
+        Ok(())
+    }
+
+    /// Clean up pending_backend_requests entries for a specific backend
+    fn clean_pending_backend_requests(&mut self, venv_path: &PathBuf, session: u64) {
+        self.state
+            .pending_backend_requests
+            .retain(|_, pending| !(pending.venv_path == *venv_path && pending.session == session));
+    }
+
+    /// Clear diagnostics for all documents belonging to a venv
+    async fn clear_diagnostics_for_venv(
+        &self,
+        venv_path: &Path,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+    ) {
+        let uris_to_clear: Vec<url::Url> = self
+            .state
+            .open_documents
+            .iter()
+            .filter(|(_, doc)| {
+                doc.venv.as_deref() == Some(venv_path)
+            })
+            .map(|(url, _)| url.clone())
+            .collect();
+
+        let (ok, failed) = self.clear_diagnostics_for_uris(&uris_to_clear, client_writer).await;
+
+        if !uris_to_clear.is_empty() {
+            tracing::info!(
+                venv = %venv_path.display(),
+                cleared_ok = ok,
+                cleared_failed = failed,
+                "Diagnostics cleared for evicted venv"
+            );
+        }
+    }
+
+    /// Extract textDocument.uri from LSP request params
+    fn extract_text_document_uri(msg: &RpcMessage) -> Option<url::Url> {
+        let params = msg.params.as_ref()?;
+        let text_document = params.get("textDocument")?;
+        let uri_str = text_document.get("uri")?.as_str()?;
+        url::Url::parse(uri_str).ok()
+    }
+
+    /// Get the venv path for a document URI from cache
+    fn venv_for_uri(&self, url: &url::Url) -> Option<PathBuf> {
+        self.state
+            .open_documents
+            .get(url)
+            .and_then(|doc| doc.venv.clone())
+    }
+
+    /// Handle didOpen: cache document, ensure backend in pool, forward
+    async fn handle_did_open(
+        &mut self,
+        msg: &RpcMessage,
+        count: usize,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+    ) -> Result<(), ProxyError> {
+        if let Some(params) = &msg.params {
+            if let Some(text_document) = params.get("textDocument") {
+                let text = text_document
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string());
+
+                if let Some(uri_value) = text_document.get("uri") {
+                    if let Some(uri_str) = uri_value.as_str() {
+                        if let Ok(url) = url::Url::parse(uri_str) {
+                            if let Ok(file_path) = url.to_file_path() {
+                                let language_id = text_document
+                                    .get("languageId")
+                                    .and_then(|l| l.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
+
+                                let version = text_document
+                                    .get("version")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(0)
+                                    as i32;
+
+                                tracing::info!(
+                                    count = count,
+                                    uri = uri_str,
+                                    path = %file_path.display(),
+                                    "didOpen received"
+                                );
+
+                                // Search for .venv
+                                let found_venv =
+                                    venv::find_venv(&file_path, self.state.git_toplevel.as_deref())
+                                        .await?;
+
+                                // Cache document
+                                if let Some(text_content) = &text {
+                                    let doc = crate::state::OpenDocument {
+                                        language_id: language_id.clone(),
+                                        version,
+                                        text: text_content.clone(),
+                                        venv: found_venv.clone(),
+                                    };
+                                    self.state.open_documents.insert(url.clone(), doc);
+                                }
+
+                                // Ensure backend in pool and forward didOpen
+                                if let Some(ref venv_path) = found_venv {
+                                    if !self.state.pool.contains(venv_path) {
+                                        // Need to create backend
+                                        if self.state.pool.is_full() {
+                                            self.evict_lru_backend(client_writer).await?;
+                                        }
+
+                                        match self
+                                            .create_backend_instance(venv_path, client_writer)
+                                            .await
+                                        {
+                                            Ok(instance) => {
+                                                self.state
+                                                    .pool
+                                                    .insert(venv_path.clone(), instance);
+                                                // didOpen was already restored during create_backend_instance
+                                                // (restore_documents_to_backend sends didOpen for matching docs)
+                                                return Ok(());
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    venv = %venv_path.display(),
+                                                    error = ?e,
+                                                    "Failed to create backend for didOpen"
+                                                );
+                                                return Ok(());
+                                            }
+                                        }
+                                    }
+
+                                    // Backend exists in pool — forward didOpen
+                                    if let Some(inst) = self.state.pool.get_mut(venv_path) {
+                                        inst.last_used = Instant::now();
+                                        if let Err(e) = inst.writer.write_message(msg).await {
+                                            tracing::warn!(
+                                                venv = %venv_path.display(),
+                                                error = ?e,
+                                                "Failed to forward didOpen to backend"
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    tracing::debug!(
+                                        uri = uri_str,
+                                        "No venv found for document, not forwarding didOpen"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Clear diagnostics for specified URIs (send empty array)
-    /// Best effort: continue even if one fails
     async fn clear_diagnostics_for_uris(
         &self,
         uris: &[url::Url],
@@ -774,373 +1175,22 @@ impl LspProxy {
         (ok, failed)
     }
 
-    /// Shutdown backend and transition to Disabled state (Strict venv mode)
-    async fn disable_backend(
-        &mut self,
-        backend: &mut PyrightBackend,
-        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
-        file_path: &std::path::Path,
-    ) -> Result<(), ProxyError> {
-        self.state.backend_session += 1;
-        let session = self.state.backend_session;
-
-        tracing::info!(
-            session = session,
-            file = %file_path.display(),
-            "Disabling backend (no .venv found)"
-        );
-
-        // Send empty diagnostics to all URIs in open_documents (clone first to avoid borrow issues)
-        let uris: Vec<url::Url> = self.state.open_documents.keys().cloned().collect();
-        let (ok, failed) = self.clear_diagnostics_for_uris(&uris, client_writer).await;
-
-        if failed == 0 {
-            tracing::info!(
-                session = session,
-                cleared_ok = ok,
-                "Diagnostics cleared for all open documents"
-            );
-        } else {
-            tracing::info!(
-                session = session,
-                cleared_ok = ok,
-                cleared_failed = failed,
-                "Diagnostics clear partially failed"
-            );
-        }
-
-        // Return RequestCancelled to unresolved requests
-        self.cancel_pending_requests(client_writer).await?;
-
-        // Shutdown backend
-        if let Err(e) = backend.shutdown_gracefully().await {
-            tracing::error!(error = ?e, "Failed to shutdown backend gracefully");
-        }
-
-        tracing::info!(session = session, "Backend disabled");
-
-        Ok(())
-    }
-
-    /// Spawn and initialize backend (for Disabled → Running revival)
-    async fn spawn_and_init_backend(
-        &mut self,
-        venv: &std::path::Path,
-        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
-    ) -> Result<PyrightBackend, ProxyError> {
-        self.state.backend_session += 1;
-        let session = self.state.backend_session;
-
-        tracing::info!(
-            session = session,
-            venv = %venv.display(),
-            "Spawning backend from Disabled state"
-        );
-
-        // 1. Start new backend
-        let mut new_backend = PyrightBackend::spawn(Some(venv)).await?;
-
-        // 2. Send initialize to backend
-        let init_params = self
-            .state
-            .client_initialize
-            .as_ref()
-            .and_then(|msg| msg.params.clone())
-            .ok_or_else(|| ProxyError::InvalidMessage("No initialize params cached".to_string()))?;
-
-        let init_msg = crate::message::RpcMessage {
-            jsonrpc: "2.0".to_string(),
-            id: Some(crate::message::RpcId::Number(1)),
-            method: Some("initialize".to_string()),
-            params: Some(init_params),
-            result: None,
-            error: None,
-        };
-
-        tracing::info!(session = session, "Sending initialize to new backend");
-        new_backend.send_message(&init_msg).await?;
-
-        // 3. Receive initialize response
-        let init_id = 1i64;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(ProxyError::Backend(
-                    crate::error::BackendError::InitializeTimeout(10),
-                ));
-            }
-
-            let wait_result = tokio::time::timeout(remaining, new_backend.read_message()).await;
-
-            match wait_result {
-                Ok(Ok(msg)) => {
-                    if msg.is_response() {
-                        if let Some(crate::message::RpcId::Number(id)) = &msg.id {
-                            if *id == init_id {
-                                if let Some(error) = &msg.error {
-                                    return Err(ProxyError::Backend(
-                                        crate::error::BackendError::InitializeResponseError(
-                                            format!(
-                                                "code={}, message={}",
-                                                error.code, error.message
-                                            ),
-                                        ),
-                                    ));
-                                }
-
-                                tracing::info!(
-                                    session = session,
-                                    response_id = ?msg.id,
-                                    "Received initialize response from backend"
-                                );
-
-                                break;
-                            }
-                        }
-                    } else {
-                        tracing::debug!(
-                            session = session,
-                            method = ?msg.method,
-                            "Received notification during initialize, ignoring"
-                        );
-                    }
-                }
-                Ok(Err(e)) => {
-                    return Err(ProxyError::Backend(
-                        crate::error::BackendError::InitializeFailed(format!(
-                            "Error reading initialize response: {}",
-                            e
-                        )),
-                    ));
-                }
-                Err(_) => {
-                    return Err(ProxyError::Backend(
-                        crate::error::BackendError::InitializeTimeout(10),
-                    ));
-                }
-            }
-        }
-
-        // 4. Send initialized notification
-        let initialized_msg = crate::message::RpcMessage {
-            jsonrpc: "2.0".to_string(),
-            id: None,
-            method: Some("initialized".to_string()),
-            params: Some(serde_json::json!({})),
-            result: None,
-            error: None,
-        };
-
-        tracing::info!(session = session, "Sending initialized to backend");
-        new_backend.send_message(&initialized_msg).await?;
-
-        // 5. Document restoration (only under venv's parent directory)
-        let venv_parent = venv.parent().map(|p| p.to_path_buf());
-        let total_docs = self.state.open_documents.len();
-        let mut restored = 0;
-        let mut skipped = 0;
-        let mut failed = 0;
-        let mut skipped_uris: Vec<url::Url> = Vec::new();
-
-        tracing::info!(
-            session = session,
-            total_docs = total_docs,
-            venv_parent = ?venv_parent.as_ref().map(|p| p.display().to_string()),
-            "Starting document restoration"
-        );
-
-        for (url, doc) in &self.state.open_documents {
-            let should_restore = match (url.to_file_path().ok(), &venv_parent) {
-                (Some(file_path), Some(venv_parent)) => file_path.starts_with(venv_parent),
-                _ => false,
-            };
-
-            if !should_restore {
-                skipped += 1;
-                skipped_uris.push(url.clone());
-                tracing::debug!(
-                    session = session,
-                    uri = %url,
-                    "Skipping document from different venv"
-                );
-                continue;
-            }
-
-            let uri_str = url.to_string();
-            let language_id = doc.language_id.clone();
-            let version = doc.version;
-            let text = doc.text.clone();
-            let text_len = text.len();
-
-            let didopen_msg = crate::message::RpcMessage {
-                jsonrpc: "2.0".to_string(),
-                id: None,
-                method: Some("textDocument/didOpen".to_string()),
-                params: Some(serde_json::json!({
-                    "textDocument": {
-                        "uri": uri_str,
-                        "languageId": language_id,
-                        "version": version,
-                        "text": text,
-                    }
-                })),
-                result: None,
-                error: None,
-            };
-
-            match new_backend.send_message(&didopen_msg).await {
-                Ok(_) => {
-                    restored += 1;
-                    tracing::info!(
-                        session = session,
-                        uri = %uri_str,
-                        version = version,
-                        text_len = text_len,
-                        "Successfully restored document"
-                    );
-                }
-                Err(e) => {
-                    failed += 1;
-                    tracing::error!(
-                        session = session,
-                        uri = %uri_str,
-                        error = ?e,
-                        "Failed to restore document, skipping"
-                    );
-                }
-            }
-        }
-
-        tracing::info!(
-            session = session,
-            restored = restored,
-            skipped = skipped,
-            failed = failed,
-            total = total_docs,
-            "Document restoration completed"
-        );
-
-        // Clear diagnostics for skipped URIs
-        if !skipped_uris.is_empty() {
-            let (ok, clear_failed) = self
-                .clear_diagnostics_for_uris(&skipped_uris, client_writer)
-                .await;
-
-            if clear_failed == 0 {
-                tracing::info!(
-                    session = session,
-                    cleared_ok = ok,
-                    "Diagnostics cleared for skipped documents"
-                );
-            } else {
-                tracing::info!(
-                    session = session,
-                    cleared_ok = ok,
-                    cleared_failed = clear_failed,
-                    "Diagnostics clear partially failed for skipped documents"
-                );
-            }
-        }
-
-        tracing::info!(
-            session = session,
-            venv = %venv.display(),
-            "Backend spawned and initialized successfully"
-        );
-
-        Ok(new_backend)
-    }
-
-    /// Return RequestCancelled to unresolved requests
-    async fn cancel_pending_requests(
-        &mut self,
-        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
-    ) -> Result<(), ProxyError> {
-        const REQUEST_CANCELLED: i64 = -32800;
-        let pending: Vec<_> = self
-            .state
-            .pending_requests
-            .drain()
-            .map(|(id, _)| id)
-            .collect();
-
-        for id in pending {
-            let msg = crate::message::RpcMessage {
-                jsonrpc: "2.0".to_string(),
-                id: Some(id),
-                method: None,
-                params: None,
-                result: None,
-                error: Some(crate::message::RpcError {
-                    code: REQUEST_CANCELLED,
-                    message: "Request cancelled".to_string(),
-                    data: None,
-                }),
-            };
-
-            client_writer.write_message(&msg).await?;
-        }
-
-        Ok(())
-    }
-
-    /// Cancel pending requests for specified session
-    async fn cancel_pending_requests_for_session(
-        &mut self,
-        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
-        old_session: u64,
-    ) -> Result<(), ProxyError> {
-        const REQUEST_CANCELLED: i64 = -32800;
-
-        let to_cancel: Vec<_> = self
-            .state
-            .pending_requests
-            .iter()
-            .filter(|(_, p)| p.backend_session == old_session)
-            .map(|(id, _)| id.clone())
-            .collect();
-
-        for id in to_cancel {
-            self.state.pending_requests.remove(&id);
-            let msg = crate::message::RpcMessage {
-                jsonrpc: "2.0".to_string(),
-                id: Some(id.clone()),
-                method: None,
-                params: None,
-                result: None,
-                error: Some(crate::message::RpcError {
-                    code: REQUEST_CANCELLED,
-                    message: "Request cancelled due to backend restart".to_string(),
-                    data: None,
-                }),
-            };
-            client_writer.write_message(&msg).await?;
-            tracing::info!(id = ?id, session = old_session, "Cancelled pending request");
-        }
-
-        Ok(())
-    }
-
     /// Handle didChange
     async fn handle_did_change(
         &mut self,
-        msg: &crate::message::RpcMessage,
+        msg: &RpcMessage,
     ) -> Result<(), ProxyError> {
         if let Some(params) = &msg.params {
             if let Some(text_document) = params.get("textDocument") {
                 if let Some(uri_str) = text_document.get("uri").and_then(|u| u.as_str()) {
                     if let Ok(url) = url::Url::parse(uri_str) {
-                        // Get version from textDocument (trust LSP version)
                         let version = text_document
                             .get("version")
                             .and_then(|v| v.as_i64())
                             .map(|v| v as i32);
 
-                        // Get text from contentChanges
                         if let Some(content_changes) = params.get("contentChanges") {
                             if let Some(changes_array) = content_changes.as_array() {
-                                // Check for empty contentChanges
                                 if changes_array.is_empty() {
                                     tracing::debug!(
                                         uri = %url,
@@ -1149,12 +1199,9 @@ impl LspProxy {
                                     return Ok(());
                                 }
 
-                                // Update only if document exists
                                 if let Some(doc) = self.state.open_documents.get_mut(&url) {
-                                    // Apply each change in order
                                     for change in changes_array {
                                         if let Some(range) = change.get("range") {
-                                            // Incremental sync: partial update using range
                                             if let Some(new_text) =
                                                 change.get("text").and_then(|t| t.as_str())
                                             {
@@ -1163,27 +1210,14 @@ impl LspProxy {
                                                     range,
                                                     new_text,
                                                 )?;
-                                                tracing::debug!(
-                                                    uri = %url,
-                                                    "Applied incremental change"
-                                                );
                                             }
-                                        } else {
-                                            // Full sync: replace entire text
-                                            if let Some(new_text) =
-                                                change.get("text").and_then(|t| t.as_str())
-                                            {
-                                                doc.text = new_text.to_string();
-                                                tracing::debug!(
-                                                    uri = %url,
-                                                    text_len = new_text.len(),
-                                                    "Applied full sync change"
-                                                );
-                                            }
+                                        } else if let Some(new_text) =
+                                            change.get("text").and_then(|t| t.as_str())
+                                        {
+                                            doc.text = new_text.to_string();
                                         }
                                     }
 
-                                    // Adopt LSP version
                                     if let Some(v) = version {
                                         doc.version = v;
                                     }
@@ -1213,7 +1247,7 @@ impl LspProxy {
     /// Handle didClose: remove document from cache
     async fn handle_did_close(
         &mut self,
-        msg: &crate::message::RpcMessage,
+        msg: &RpcMessage,
     ) -> Result<(), ProxyError> {
         if let Some(params) = &msg.params {
             if let Some(text_document) = params.get("textDocument") {
@@ -1245,7 +1279,6 @@ impl LspProxy {
         range: &serde_json::Value,
         new_text: &str,
     ) -> Result<(), ProxyError> {
-        // Get start/end from range
         let start = range.get("start").ok_or_else(|| {
             ProxyError::InvalidMessage("didChange range missing start".to_string())
         })?;
@@ -1275,11 +1308,9 @@ impl LspProxy {
                 ProxyError::InvalidMessage("didChange end missing character".to_string())
             })? as usize;
 
-        // Convert line/character to byte offset
         let start_offset = Self::position_to_offset(text, start_line, start_char)?;
         let end_offset = Self::position_to_offset(text, end_line, end_char)?;
 
-        // Validate range (start > end is invalid)
         if start_offset > end_offset {
             return Err(ProxyError::InvalidMessage(format!(
                 "Invalid range: start offset ({}) > end offset ({})",
@@ -1287,7 +1318,6 @@ impl LspProxy {
             )));
         }
 
-        // Replace range
         text.replace_range(start_offset..end_offset, new_text);
 
         Ok(())
@@ -1302,7 +1332,6 @@ impl LspProxy {
         for (idx, ch) in text.char_indices() {
             if ch == '\n' {
                 if current_line == line {
-                    // Reached end of target line (before newline character)
                     return Self::find_offset_in_line(text, line_start_offset, idx, character);
                 }
                 current_line += 1;
@@ -1310,12 +1339,10 @@ impl LspProxy {
             }
         }
 
-        // Last line (if not ending with newline) or first line of empty text
         if current_line == line {
             return Self::find_offset_in_line(text, line_start_offset, text.len(), character);
         }
 
-        // Line number out of range
         Err(ProxyError::InvalidMessage(format!(
             "Position out of range: line={} (max={}), character={}",
             line, current_line, character
@@ -1323,7 +1350,6 @@ impl LspProxy {
     }
 
     /// Count UTF-16 code units within line and return byte offset
-    /// Clamp to end of line if character exceeds line length
     fn find_offset_in_line(
         text: &str,
         line_start: usize,
@@ -1340,12 +1366,11 @@ impl LspProxy {
             utf16_offset += ch.len_utf16();
         }
 
-        // Clamp to end of line if character exceeds line length
         Ok(line_end)
     }
 }
 
-/// Create error response (returned for requests in Disabled state)
+/// Create error response
 fn create_error_response(request: &RpcMessage, message: &str) -> RpcMessage {
     RpcMessage {
         jsonrpc: "2.0".to_string(),
@@ -1354,7 +1379,7 @@ fn create_error_response(request: &RpcMessage, message: &str) -> RpcMessage {
         params: None,
         result: None,
         error: Some(crate::message::RpcError {
-            code: -32603, // Internal error (for compatibility)
+            code: -32603,
             message: message.to_string(),
             data: None,
         }),
@@ -1370,31 +1395,18 @@ mod tests {
     fn test_position_to_offset_simple() {
         let text = "hello\nworld\n";
 
-        // line 0, char 0 -> offset 0
         assert_eq!(LspProxy::position_to_offset(text, 0, 0).unwrap(), 0);
-
-        // line 0, char 5 -> offset 5 (end of "hello")
         assert_eq!(LspProxy::position_to_offset(text, 0, 5).unwrap(), 5);
-
-        // line 1, char 0 -> offset 6 (start of "world")
         assert_eq!(LspProxy::position_to_offset(text, 1, 0).unwrap(), 6);
-
-        // line 1, char 5 -> offset 11 (end of "world")
         assert_eq!(LspProxy::position_to_offset(text, 1, 5).unwrap(), 11);
     }
 
     #[test]
     fn test_position_to_offset_multibyte() {
-        // Text containing multibyte characters (Japanese: "hello")
         let text = "こんにちは\nworld\n";
 
-        // line 0, char 0 -> offset 0
         assert_eq!(LspProxy::position_to_offset(text, 0, 0).unwrap(), 0);
-
-        // line 0, char 1 -> offset 3 (after first Japanese character)
         assert_eq!(LspProxy::position_to_offset(text, 0, 1).unwrap(), 3);
-
-        // line 1, char 0 -> offset 16 (start of "world", after Japanese text + newline)
         assert_eq!(LspProxy::position_to_offset(text, 1, 0).unwrap(), 16);
     }
 
@@ -1418,7 +1430,6 @@ mod tests {
             "end": { "line": 0, "character": 5 }
         });
 
-        // Insert (empty range)
         LspProxy::apply_incremental_change(&mut text, &range, " beautiful").unwrap();
         assert_eq!(text, "hello beautiful world");
     }
@@ -1431,7 +1442,6 @@ mod tests {
             "end": { "line": 0, "character": 15 }
         });
 
-        // Delete (empty new_text)
         LspProxy::apply_incremental_change(&mut text, &range, "").unwrap();
         assert_eq!(text, "hello world");
     }
@@ -1444,7 +1454,6 @@ mod tests {
             "end": { "line": 1, "character": 16 }
         });
 
-        // Replace "hello" with "world"
         LspProxy::apply_incremental_change(&mut text, &range, "world").unwrap();
         assert_eq!(text, "def hello():\n    print('world')\n");
     }
@@ -1457,40 +1466,25 @@ mod tests {
             "end": { "line": 2, "character": 0 }
         });
 
-        // Delete spanning multiple lines
         LspProxy::apply_incremental_change(&mut text, &range, "").unwrap();
         assert_eq!(text, "line1line3\n");
     }
 
     #[test]
     fn test_position_to_offset_surrogate_pair() {
-        // Text containing surrogate pair (emoji)
-        // 😀 is U+1F600, 2 code units in UTF-16 (surrogate pair)
-        // 4 bytes in UTF-8
         let text = "a😀b\n";
 
-        // line 0, char 0 -> offset 0 (before 'a')
         assert_eq!(LspProxy::position_to_offset(text, 0, 0).unwrap(), 0);
-
-        // line 0, char 1 -> offset 1 (before '😀')
         assert_eq!(LspProxy::position_to_offset(text, 0, 1).unwrap(), 1);
-
-        // line 0, char 3 -> offset 5 (before 'b', emoji is 2 UTF-16 code units)
         assert_eq!(LspProxy::position_to_offset(text, 0, 3).unwrap(), 5);
-
-        // line 0, char 4 -> offset 6 (before '\n')
         assert_eq!(LspProxy::position_to_offset(text, 0, 4).unwrap(), 6);
     }
 
     #[test]
     fn test_position_to_offset_line_end_clamp() {
-        // Character exceeding line end is clamped to line end
         let text = "abc\ndef\n";
 
-        // line 0, char 100 -> offset 3 (clamped to line end)
         assert_eq!(LspProxy::position_to_offset(text, 0, 100).unwrap(), 3);
-
-        // line 1, char 100 -> offset 7 (clamped to line end)
         assert_eq!(LspProxy::position_to_offset(text, 1, 100).unwrap(), 7);
     }
 
@@ -1498,14 +1492,12 @@ mod tests {
     fn test_position_to_offset_line_out_of_range() {
         let text = "abc\ndef\n";
 
-        // line 10 is out of range
         let result = LspProxy::position_to_offset(text, 10, 0);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_apply_incremental_change_invalid_range() {
-        // Invalid range where start > end
         let mut text = "hello world".to_string();
         let range = json!({
             "start": { "line": 0, "character": 10 },
@@ -1518,9 +1510,7 @@ mod tests {
 
     #[test]
     fn test_apply_incremental_change_with_emoji() {
-        // Editing text containing emoji
         let mut text = "hello 😀 world".to_string();
-        // Delete "😀 " (position 6 to 9: 😀 is 2 UTF-16 code units + 1 space)
         let range = json!({
             "start": { "line": 0, "character": 6 },
             "end": { "line": 0, "character": 9 }
@@ -1534,13 +1524,11 @@ mod tests {
     fn test_position_to_offset_empty_text() {
         let text = "";
 
-        // line 0, char 0 is valid even for empty text
         assert_eq!(LspProxy::position_to_offset(text, 0, 0).unwrap(), 0);
     }
 
     #[test]
     fn test_position_to_offset_no_trailing_newline() {
-        // Text without trailing newline
         let text = "abc";
 
         assert_eq!(LspProxy::position_to_offset(text, 0, 0).unwrap(), 0);

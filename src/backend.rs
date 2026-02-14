@@ -6,6 +6,14 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+/// Components returned by `PyrightBackend::into_split()`
+pub struct BackendParts {
+    pub reader: LspFrameReader<ChildStdout>,
+    pub writer: LspFrameWriter<ChildStdin>,
+    pub child: Child,
+    pub next_id: u64,
+}
+
 pub struct PyrightBackend {
     child: Child,
     reader: LspFrameReader<ChildStdout>,
@@ -79,12 +87,24 @@ impl PyrightBackend {
             .map_err(|e| BackendError::SpawnFailed(std::io::Error::other(e)))
     }
 
+    /// Split backend into reader, writer, and child process.
+    /// Used after initialize handshake to separate reader (for spawned task) from writer.
+    pub fn into_split(self) -> BackendParts {
+        BackendParts {
+            reader: self.reader,
+            writer: self.writer,
+            child: self.child,
+            next_id: self.next_id,
+        }
+    }
+
     /// Gracefully shutdown backend
     ///
     /// 1. Send shutdown request (wait 1-2 seconds)
     /// 2. Send exit notification (wait 1 second)
     /// 3. Wait for process (1 second)
     /// 4. Kill if failed
+    #[allow(dead_code)]
     pub async fn shutdown_gracefully(&mut self) -> Result<(), BackendError> {
         let shutdown_id = self.next_id;
         self.next_id += 1;
@@ -185,6 +205,14 @@ impl PyrightBackend {
         self.kill_backend().await
     }
 
+    /// Get next ID (for external use, e.g. shutdown messages)
+    #[allow(dead_code)]
+    pub fn next_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
     /// Force kill backend process
     async fn kill_backend(&mut self) -> Result<(), BackendError> {
         tracing::warn!("Killing backend process");
@@ -218,4 +246,69 @@ impl PyrightBackend {
             }
         }
     }
+}
+
+/// Fire-and-forget shutdown using only writer + child (reader task is aborted by caller).
+/// Spawns a tokio task that:
+/// 1. Sends shutdown request → waits 100ms
+/// 2. Sends exit notification
+/// 3. Waits up to 2s for process exit
+/// 4. Kills if still alive
+pub fn shutdown_fire_and_forget(
+    mut writer: LspFrameWriter<ChildStdin>,
+    mut child: Child,
+    next_id: u64,
+    venv_display: String,
+) {
+    tokio::spawn(async move {
+        tracing::info!(venv = %venv_display, "Starting fire-and-forget shutdown");
+
+        // 1. Send shutdown request
+        let shutdown_msg = RpcMessage {
+            jsonrpc: "2.0".to_string(),
+            id: Some(RpcId::Number(next_id as i64)),
+            method: Some("shutdown".to_string()),
+            params: None,
+            result: None,
+            error: None,
+        };
+
+        if let Err(e) = writer.write_message(&shutdown_msg).await {
+            tracing::warn!(venv = %venv_display, error = ?e, "Failed to send shutdown, killing directly");
+            let _ = child.kill().await;
+            return;
+        }
+
+        // 2. Wait briefly for shutdown to be processed
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // 3. Send exit notification
+        let exit_msg = RpcMessage {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            method: Some("exit".to_string()),
+            params: None,
+            result: None,
+            error: None,
+        };
+
+        if let Err(e) = writer.write_message(&exit_msg).await {
+            tracing::warn!(venv = %venv_display, error = ?e, "Failed to send exit notification");
+        }
+
+        // 4. Wait up to 2s for process to exit
+        match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+            Ok(Ok(status)) => {
+                tracing::info!(venv = %venv_display, status = ?status, "Backend exited gracefully");
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(venv = %venv_display, error = ?e, "Error waiting for backend exit, killing");
+                let _ = child.kill().await;
+            }
+            Err(_) => {
+                tracing::warn!(venv = %venv_display, "Backend exit timeout, killing");
+                let _ = child.kill().await;
+            }
+        }
+    });
 }

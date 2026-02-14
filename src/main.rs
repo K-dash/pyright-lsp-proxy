@@ -1,5 +1,5 @@
 mod backend;
-mod backend_state;
+mod backend_pool;
 mod error;
 mod framing;
 mod message;
@@ -20,6 +20,11 @@ struct Args {
     /// Can also be set via PYRIGHT_LSP_PROXY_LOG_FILE environment variable
     #[arg(long, env = "PYRIGHT_LSP_PROXY_LOG_FILE")]
     log_file: Option<PathBuf>,
+
+    /// Maximum number of concurrent backend processes (default: 4)
+    /// Can also be set via PYRIGHT_LSP_PROXY_MAX_BACKENDS environment variable
+    #[arg(long, env = "PYRIGHT_LSP_PROXY_MAX_BACKENDS", default_value = "4")]
+    max_backends: usize,
 }
 
 #[tokio::main]
@@ -82,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Start proxy
-    let mut proxy = LspProxy::new();
+    let mut proxy = LspProxy::new(args.max_backends);
     proxy.run().await?;
 
     Ok(())
