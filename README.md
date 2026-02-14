@@ -39,10 +39,10 @@ typemux-cc restarts the LSP backend in the background and automatically restores
 | Backend | Command | Status |
 |---------|---------|--------|
 | [pyright](https://github.com/microsoft/pyright) | `pyright-langserver --stdio` | ✅ Stable (default) |
-| [ty](https://github.com/astral-sh/ty) | `ty server` | 🚧 Not yet verified |
+| [ty](https://github.com/astral-sh/ty) | `ty server` | 🧪 Experimental (verified) |
 | [pyrefly](https://github.com/facebook/pyrefly) | `pyrefly lsp` | 🚧 Not yet verified |
 
-> **Note**: ty and pyrefly support is implemented at the code level (`--backend ty` / `--backend pyrefly`), but has not been verified with actual backends yet. Only pyright is currently tested and supported. Contributions and bug reports for ty/pyrefly are welcome.
+> **Note**: pyrefly support is implemented at the code level (`--backend pyrefly`), but has not been verified with actual backends yet. Contributions and bug reports are welcome.
 
 Select with `--backend` flag or `TYPEMUX_CC_BACKEND` environment variable:
 
