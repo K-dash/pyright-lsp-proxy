@@ -9,7 +9,7 @@
       "name": "pyright-lsp-proxy",
       "source": "./",
       "description": "Pyright LSP proxy for monorepo with automatic .venv switching",
-      "version": "0.1.12",
+      "version": "0.1.13",
       "homepage": "https://github.com/K-dash/pyright-lsp-proxy",
       "repository": "https://github.com/K-dash/pyright-lsp-proxy",
       "strict": false
