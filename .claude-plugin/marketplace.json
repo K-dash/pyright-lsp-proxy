@@ -9,7 +9,7 @@
       "name": "typemux-cc",
       "source": "./",
       "description": "Python type-checker LSP multiplexer for Claude Code (pyright, ty, pyrefly)",
-      "version": "0.1.13",
+      "version": "0.2.0",
       "homepage": "https://github.com/K-dash/typemux-cc",
       "repository": "https://github.com/K-dash/typemux-cc",
       "strict": false
