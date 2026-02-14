@@ -32,7 +32,7 @@ typemux-cc breaks through this limitation, reflecting virtual environment change
 - **⚡ Dynamic .venv creation in worktrees** - When `.venv` is created later via hooks, etc., Claude Code restart was previously required
 - **🔀 Transparent switch on venv change** - LSP requests (hover, definition, etc.) are sent to the new backend after a switch, so the current request does not surface "Request cancelled"
 
-typemux-cc restarts the LSP backend in the background and automatically restores open documents. Claude Code always communicates with the proxy, so it doesn't notice backend switches.
+typemux-cc manages a pool of LSP backends (one per `.venv`) and routes requests to the correct one. Claude Code always communicates with the proxy, so it doesn't notice backend switches.
 
 ## Supported Backends
 
@@ -223,20 +223,25 @@ my-monorepo/
 | Action | Proxy Behavior |
 |--------|----------------|
 | 1. Start Claude Code | Search for fallback .venv (start without venv if not found) |
-| 2. Open `project-a/src/main.py` | Detect `project-a/.venv` → start session 1 |
-| 3. Open `project-b/src/main.py` | Detect `project-b/.venv` → switch to session 2 |
-| 4. Session 2 startup complete | Restore only documents under project-b |
+| 2. Open `project-a/src/main.py` | Detect `project-a/.venv` → spawn backend (session 1), add to pool |
+| 3. Open `project-b/src/main.py` | Detect `project-b/.venv` → spawn backend (session 2), add to pool |
+| 4. Return to `project-a/src/main.py` | `project-a/.venv` already in pool → route to session 1 (no restart) |
 
 ### What Actually Happens
 
-When you switch from `project-a/main.py` to `project-b/main.py`:
+When you move from `project-a/main.py` to `project-b/main.py`:
 
 1. Proxy detects different `.venv` (project-a/.venv → project-b/.venv)
-2. Gracefully shuts down old backend (session 1)
+2. Checks the backend pool — `project-b/.venv` not found
 3. Spawns new backend with `VIRTUAL_ENV=project-b/.venv` (session 2)
-4. Restores open documents under project-b/ to new backend
-5. Clears diagnostics for documents outside project-b/
-6. **All LSP requests now use project-b dependencies**
+4. **Session 1 (project-a) stays alive in the pool** — no restart
+5. Restores open documents under project-b/ to session 2
+6. Clears diagnostics for documents outside project-b/
+7. **All LSP requests for project-b files now use project-b dependencies**
+
+When you return to `project-a/main.py` later, session 1 is still in the pool — **zero restart overhead**.
+
+Backends are evicted only when the pool is full (LRU) or after idle timeout (TTL, default 30 min).
 
 From the user's perspective: **Nothing visible happens. LSP just works.**
 
@@ -254,6 +259,20 @@ to trigger venv detection for that file.
 which pyright-langserver              # Check if backend is in PATH (or: which ty, which pyrefly)
 cat ~/.claude/settings.json | grep typemux  # Check plugin settings
 tail -100 /tmp/typemux-cc.log        # Check logs
+```
+
+### Plugin Update Not Taking Effect
+
+Due to a [known Claude Code issue](https://github.com/anthropics/claude-code/issues/13799), `/plugin update` may not refresh the cached plugin files. If you still see the old version after updating, manually clear the cache:
+
+```bash
+# 1. Remove cached plugin
+rm -rf ~/.claude/plugins/cache/typemux-cc-marketplace/
+
+# 2. Reinstall
+/plugin install typemux-cc@typemux-cc-marketplace
+
+# 3. Restart Claude Code
 ```
 
 ### `.venv` Not Switching
