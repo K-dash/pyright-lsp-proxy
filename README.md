@@ -42,6 +42,8 @@ npm install -g pyright
 # 4. Restart Claude Code (initial installation only)
 ```
 
+> To use **ty** or **pyrefly** instead, see [Supported Backends](#supported-backends) and set `TYPEMUX_CC_BACKEND` in your [config file](#configuration).
+
 ## Problems Solved
 
 - **🔄 venv switching in monorepos** - Python type-checkers assume a single venv, causing incorrect type checking and completions when moving between projects
