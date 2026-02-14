@@ -1,6 +1,6 @@
 {
   "name": "typemux-cc",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Python type-checker LSP multiplexer for Claude Code (pyright, ty, pyrefly)",
   "author": {
     "name": "K-dash"
