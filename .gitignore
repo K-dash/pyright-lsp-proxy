@@ -33,3 +33,6 @@ bin/pyright-lsp-proxy-linux-x86_64
 
 # Local plugin development configuration
 plugins/
+
+# Override global gitignore to track project-specific Claude Code config
+!CLAUDE.md

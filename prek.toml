@@ -1,0 +1,7 @@
+#:schema https://www.schemastore.org/prek.json
+
+[[repos]]
+repo = "local"
+hooks = [
+    { id = "make-all", name = "make all (fmt + lint + test)", entry = "make all", language = "system", pass_filenames = false, always_run = true },
+]
