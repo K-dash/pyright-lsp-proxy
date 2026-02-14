@@ -53,7 +53,7 @@ echo "[typemux-cc] Detected platform: $OS $ARCH"
 echo "[typemux-cc] Binary to download: $BINARY_NAME"
 
 # Get latest version URL from GitHub Release
-REPO="K-dash/pyright-lsp-proxy"
+REPO="K-dash/typemux-cc"
 LATEST_RELEASE=$(curl -s "https://api.github.com/repos/${REPO}/releases/latest")
 DOWNLOAD_URL=$(echo "$LATEST_RELEASE" | grep "browser_download_url.*${BINARY_NAME}" | cut -d '"' -f 4)
 

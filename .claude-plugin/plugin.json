@@ -5,8 +5,8 @@
   "author": {
     "name": "K-dash"
   },
-  "homepage": "https://github.com/K-dash/pyright-lsp-proxy",
-  "repository": "https://github.com/K-dash/pyright-lsp-proxy",
+  "homepage": "https://github.com/K-dash/typemux-cc",
+  "repository": "https://github.com/K-dash/typemux-cc",
   "license": "MIT",
   "keywords": ["lsp", "pyright", "ty", "pyrefly", "proxy", "rust", "monorepo", "python"],
   "hooks": "./hooks.json",

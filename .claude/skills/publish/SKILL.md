@@ -62,4 +62,4 @@ git push origin v<NEW_VERSION>
 ### Step 5: Verify
 
 Inform the user the CI pipeline will build and create the GitHub Release. Link to:
-`https://github.com/K-dash/pyright-lsp-proxy/actions`
+`https://github.com/K-dash/typemux-cc/actions`

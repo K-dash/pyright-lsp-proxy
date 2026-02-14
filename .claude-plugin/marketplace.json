@@ -10,8 +10,8 @@
       "source": "./",
       "description": "Python type-checker LSP multiplexer for Claude Code (pyright, ty, pyrefly)",
       "version": "0.1.13",
-      "homepage": "https://github.com/K-dash/pyright-lsp-proxy",
-      "repository": "https://github.com/K-dash/pyright-lsp-proxy",
+      "homepage": "https://github.com/K-dash/typemux-cc",
+      "repository": "https://github.com/K-dash/typemux-cc",
       "strict": false
     }
   ]

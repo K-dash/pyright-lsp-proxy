@@ -5,8 +5,8 @@
 **Python type-checker LSP multiplexer for Claude Code — pyright, ty, pyrefly**
 
 <div align="center">
-  <a href="https://github.com/K-dash/pyright-lsp-proxy/graphs/commit-activity"><img alt="GitHub commit activity" src="https://img.shields.io/github/commit-activity/m/K-dash/pyright-lsp-proxy"/></a>
-  <a href="https://github.com/K-dash/pyright-lsp-proxy/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/LICENSE-MIT-green"/></a>
+  <a href="https://github.com/K-dash/typemux-cc/graphs/commit-activity"><img alt="GitHub commit activity" src="https://img.shields.io/github/commit-activity/m/K-dash/typemux-cc"/></a>
+  <a href="https://github.com/K-dash/typemux-cc/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/LICENSE-MIT-green"/></a>
   <a href="https://www.rust-lang.org/"><img alt="Rust" src="https://img.shields.io/badge/rust-1.75+-orange.svg"/></a>
 </div>
 
@@ -107,7 +107,7 @@ pip install pyrefly
 
 ```bash
 # 1. Add marketplace
-/plugin marketplace add K-dash/pyright-lsp-proxy
+/plugin marketplace add K-dash/typemux-cc
 
 # 2. Install plugin
 /plugin install typemux-cc@typemux-cc-marketplace
@@ -140,11 +140,11 @@ After installation, verify in `~/.claude/settings.json`:
 ### Method B: Local Build (For Developers)
 
 ```bash
-git clone https://github.com/K-dash/pyright-lsp-proxy.git
-cd pyright-lsp-proxy
+git clone https://github.com/K-dash/typemux-cc.git
+cd typemux-cc
 cargo build --release
 
-/plugin marketplace add /path/to/pyright-lsp-proxy
+/plugin marketplace add /path/to/typemux-cc
 /plugin install typemux-cc@typemux-cc-marketplace
 # Restart Claude Code (initial installation only)
 ```
