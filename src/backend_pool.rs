@@ -4,6 +4,7 @@ use crate::framing::{LspFrameReader, LspFrameWriter};
 use crate::message::RpcMessage;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -43,17 +44,19 @@ pub struct BackendPool {
     pub backend_msg_tx: mpsc::Sender<BackendMessage>,
     pub backend_msg_rx: mpsc::Receiver<BackendMessage>,
     max_backends: usize,
+    backend_ttl: Option<Duration>,
     next_session: u64,
 }
 
 impl BackendPool {
-    pub fn new(max_backends: usize) -> Self {
+    pub fn new(max_backends: usize, backend_ttl: Option<Duration>) -> Self {
         let (tx, rx) = mpsc::channel(1024);
         Self {
             backends: HashMap::new(),
             backend_msg_tx: tx,
             backend_msg_rx: rx,
             max_backends,
+            backend_ttl,
             next_session: 0,
         }
     }
@@ -130,6 +133,22 @@ impl BackendPool {
     /// Get max backends setting
     pub fn max_backends(&self) -> usize {
         self.max_backends
+    }
+
+    /// Return venv paths of backends whose last_used exceeds the TTL.
+    /// Only checks TTL/last_used; pending request filtering is the caller's responsibility.
+    pub fn expired_venvs(&self) -> Vec<PathBuf> {
+        let ttl = match self.backend_ttl {
+            Some(ttl) => ttl,
+            None => return Vec::new(),
+        };
+
+        let now = Instant::now();
+        self.backends
+            .iter()
+            .filter(|(_, inst)| now.duration_since(inst.last_used) >= ttl)
+            .map(|(venv, _)| venv.clone())
+            .collect()
     }
 
     /// Get a clone of the sender for spawning reader tasks

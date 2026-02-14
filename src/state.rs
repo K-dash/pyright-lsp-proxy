@@ -2,6 +2,7 @@ use crate::backend_pool::BackendPool;
 use crate::message::{RpcId, RpcMessage};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 use url::Url;
 
 /// Information about pending requests
@@ -60,7 +61,7 @@ pub struct ProxyState {
 }
 
 impl ProxyState {
-    pub fn new(max_backends: usize) -> Self {
+    pub fn new(max_backends: usize, backend_ttl: Option<Duration>) -> Self {
         Self {
             git_toplevel: None,
             client_initialize: None,
@@ -68,7 +69,7 @@ impl ProxyState {
             pending_requests: HashMap::new(),
             pending_backend_requests: HashMap::new(),
             next_proxy_request_id: -1, // Use negative IDs to avoid collision with client IDs
-            pool: BackendPool::new(max_backends),
+            pool: BackendPool::new(max_backends, backend_ttl),
         }
     }
 

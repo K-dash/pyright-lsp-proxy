@@ -21,10 +21,15 @@ struct Args {
     #[arg(long, env = "PYRIGHT_LSP_PROXY_LOG_FILE")]
     log_file: Option<PathBuf>,
 
-    /// Maximum number of concurrent backend processes (default: 4)
+    /// Maximum number of concurrent backend processes (default: 8, minimum: 1)
     /// Can also be set via PYRIGHT_LSP_PROXY_MAX_BACKENDS environment variable
-    #[arg(long, env = "PYRIGHT_LSP_PROXY_MAX_BACKENDS", default_value = "4")]
-    max_backends: usize,
+    #[arg(long, env = "PYRIGHT_LSP_PROXY_MAX_BACKENDS", default_value = "8", value_parser = clap::value_parser!(u64).range(1..))]
+    max_backends: u64,
+
+    /// Backend TTL in seconds (default: 1800 = 30 minutes). Set to 0 to disable TTL eviction.
+    /// Can also be set via PYRIGHT_LSP_PROXY_BACKEND_TTL environment variable
+    #[arg(long, env = "PYRIGHT_LSP_PROXY_BACKEND_TTL", default_value = "1800")]
+    backend_ttl: u64,
 }
 
 #[tokio::main]
@@ -86,8 +91,15 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Starting pyright-lsp-proxy (logging to stderr only)");
     }
 
+    // Convert TTL: 0 means disabled (None), otherwise Some(Duration)
+    let backend_ttl = if args.backend_ttl == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(args.backend_ttl))
+    };
+
     // Start proxy
-    let mut proxy = LspProxy::new(args.max_backends);
+    let mut proxy = LspProxy::new(args.max_backends as usize, backend_ttl);
     proxy.run().await?;
 
     Ok(())

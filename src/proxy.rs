@@ -8,17 +8,20 @@ use crate::message::{RpcId, RpcMessage};
 use crate::state::ProxyState;
 use crate::venv;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::io::{stdin, stdout};
-use tokio::time::Instant;
+use tokio::time::{Instant, MissedTickBehavior};
 
 pub struct LspProxy {
     state: ProxyState,
+    backend_ttl: Option<Duration>,
 }
 
 impl LspProxy {
-    pub fn new(max_backends: usize) -> Self {
+    pub fn new(max_backends: usize, backend_ttl: Option<Duration>) -> Self {
         Self {
-            state: ProxyState::new(max_backends),
+            state: ProxyState::new(max_backends, backend_ttl),
+            backend_ttl,
         }
     }
 
@@ -27,7 +30,12 @@ impl LspProxy {
         let mut client_writer = LspFrameWriter::new(stdout());
 
         let cwd = std::env::current_dir()?;
-        tracing::info!(cwd = %cwd.display(), max_backends = self.state.pool.max_backends(), "Starting pyright-lsp-proxy");
+        tracing::info!(
+            cwd = %cwd.display(),
+            max_backends = self.state.pool.max_backends(),
+            backend_ttl = ?self.backend_ttl.map(|d| format!("{}s", d.as_secs())),
+            "Starting pyright-lsp-proxy"
+        );
 
         // Get and cache git toplevel
         self.state.git_toplevel = venv::get_git_toplevel(&cwd).await?;
@@ -49,6 +57,12 @@ impl LspProxy {
         };
 
         let mut didopen_count = 0;
+
+        // TTL sweep timer: checks every 60 seconds for expired backends
+        let mut ttl_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        ttl_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // Consume the first immediate tick so the first real tick fires after 60s
+        ttl_interval.tick().await;
 
         loop {
             tokio::select! {
@@ -490,6 +504,11 @@ impl LspProxy {
                         }
                     }
                 }
+
+                // TTL-based auto-eviction sweep
+                _ = ttl_interval.tick(), if self.backend_ttl.is_some() => {
+                    self.evict_expired_backends(&mut client_writer).await?;
+                }
             }
         }
     }
@@ -882,6 +901,79 @@ impl LspProxy {
                     .await;
 
                 // Shutdown
+                shutdown_backend_instance(instance);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Evict all expired backends (TTL-based auto-eviction).
+    /// Skips backends that have pending client→backend or backend→client requests.
+    async fn evict_expired_backends(
+        &mut self,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+    ) -> Result<(), ProxyError> {
+        let expired = self.state.pool.expired_venvs();
+        if expired.is_empty() {
+            return Ok(());
+        }
+
+        for venv_path in expired {
+            let session = match self.state.pool.get(&venv_path) {
+                Some(inst) => inst.session,
+                None => continue,
+            };
+
+            // Skip if there are pending client→backend requests
+            let pending_count = self
+                .state
+                .pending_requests
+                .values()
+                .filter(|p| p.venv_path == venv_path && p.backend_session == session)
+                .count();
+            if pending_count > 0 {
+                tracing::debug!(
+                    venv = %venv_path.display(),
+                    pending_count = pending_count,
+                    "Skipping TTL eviction: has pending client requests"
+                );
+                continue;
+            }
+
+            // Skip if there are pending backend→client requests
+            let pending_backend_count = self
+                .state
+                .pending_backend_requests
+                .values()
+                .filter(|p| p.venv_path == venv_path && p.session == session)
+                .count();
+            if pending_backend_count > 0 {
+                tracing::debug!(
+                    venv = %venv_path.display(),
+                    pending_backend_count = pending_backend_count,
+                    "Skipping TTL eviction: has pending backend requests"
+                );
+                continue;
+            }
+
+            tracing::info!(
+                venv = %venv_path.display(),
+                pool_size = self.state.pool.len(),
+                "Evicting expired backend (TTL)"
+            );
+
+            if let Some(instance) = self.state.pool.remove(&venv_path) {
+                let evict_session = instance.session;
+
+                self.cancel_pending_requests_for_backend(client_writer, &venv_path, evict_session)
+                    .await?;
+
+                self.clean_pending_backend_requests(&venv_path, evict_session);
+
+                self.clear_diagnostics_for_venv(&venv_path, client_writer)
+                    .await;
+
                 shutdown_backend_instance(instance);
             }
         }
