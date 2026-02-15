@@ -309,6 +309,7 @@ rm -rf ~/.claude/plugins/cache/typemux-cc-marketplace/
 | Fixed venv name | Only `.venv` with `pyvenv.cfg` — intentionally strict to avoid silently wrong environments (poetry/conda/etc. not supported) | Rename to `.venv` or create a `.venv` symlink |
 | Symlinks | May fail to detect `pyvenv.cfg` if `.venv` is a symlink | Use actual directory |
 | Late `.venv` creation | venv cached as `None` if `.venv` didn't exist when file was opened | Reopen the file after creating `.venv` |
+| setuptools editable installs | Not a typemux-cc bug. All LSP backends (pyright, ty, pyrefly) cannot resolve imports from setuptools-style editable installs that use import hooks ([ty#475](https://github.com/astral-sh/ty/issues/475)) | Switch build backend to hatchling/flit, or add source paths to `extra-paths` in backend config |
 
 ## Architecture
 
