@@ -145,6 +145,7 @@ impl super::LspProxy {
         // 2. Initialize handshake
         let init_params = self.cached_init_params()?;
         perform_initialize_handshake(&mut backend, init_params, venv).await?;
+        tracing::info!(session = session, venv = %venv.display(), "Backend initialized");
 
         // 3. Document restoration for this venv
         self.restore_documents_to_backend(&mut backend, venv, session, client_writer)
