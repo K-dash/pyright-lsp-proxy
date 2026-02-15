@@ -111,6 +111,8 @@ impl super::LspProxy {
                         error = ?e,
                         "Failed to create backend for didOpen"
                     );
+                    self.notify_backend_error(venv_path, &e, client_writer)
+                        .await;
                     return Ok(());
                 }
             }

@@ -1,8 +1,40 @@
+use crate::error::ProxyError;
 use crate::framing::LspFrameWriter;
 use crate::message::RpcMessage;
 use std::path::Path;
 
 impl super::LspProxy {
+    /// Send window/showMessage error to client when backend creation fails
+    pub(crate) async fn notify_backend_error(
+        &self,
+        venv_path: &Path,
+        error: &ProxyError,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+    ) {
+        let msg = RpcMessage {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            method: Some("window/showMessage".to_string()),
+            params: Some(serde_json::json!({
+                "type": 1,
+                "message": format!(
+                    "typemux-cc: Failed to start LSP backend for {}: {}",
+                    venv_path.display(),
+                    error
+                )
+            })),
+            result: None,
+            error: None,
+        };
+
+        if let Err(e) = client_writer.write_message(&msg).await {
+            tracing::warn!(
+                error = ?e,
+                "Failed to send backend error notification to client"
+            );
+        }
+    }
+
     /// Clear diagnostics for all documents belonging to a venv
     pub(crate) async fn clear_diagnostics_for_venv(
         &self,
