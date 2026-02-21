@@ -342,6 +342,10 @@ For design philosophy, state transitions, and internal implementation details, s
 
 **[ARCHITECTURE.md](./ARCHITECTURE.md)**
 
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
 ## License
 
 This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
