@@ -51,7 +51,7 @@ jobs:
           chmod +x ${{ matrix.binary_name }}
 
       - name: Upload to release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           files: ${{ matrix.binary_name }}
           generate_release_notes: true
