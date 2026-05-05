@@ -106,12 +106,10 @@ impl LspProxy {
                             tracing::info!("Received exit notification, terminating proxy");
                             return Ok(());
                         }
-                        _ if msg.is_response() => {
-                            if self.dispatch_client_response(&msg).await? {
-                                continue;
-                            }
-                            // Fall through: not a pending backend request
-                            // (original code fell through to didOpen check etc.)
+                        _ if msg.is_response()
+                            && self.dispatch_client_response(&msg).await? =>
+                        {
+                            continue;
                         }
                         Some("textDocument/didOpen") => {
                             didopen_count += 1;
