@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # typemux-cc wrapper script
 # Loads configuration from ~/.config/typemux-cc/config if it exists
 
