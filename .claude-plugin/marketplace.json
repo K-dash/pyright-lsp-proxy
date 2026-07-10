@@ -1,6 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "typemux-cc-marketplace",
+  "description": "Marketplace for typemux-cc, a Python type-checker LSP multiplexer for Claude Code: per-venv backend pooling, late .venv detection, and environment change tracking for pyright, ty, and pyrefly.",
   "owner": {
     "name": "K-dash"
   },
