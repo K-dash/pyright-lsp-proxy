@@ -3,7 +3,7 @@
 > This document explains _why_ typemux-cc is built this way.
 
 Design philosophy, state transitions, and internal implementation details.
-For usage, see [README.md](./README.md).
+For usage, see [README.md](../README.md).
 
 ## Non-goals
 
