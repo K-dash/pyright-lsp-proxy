@@ -29,8 +29,7 @@ pub fn warmup_timeout() -> Duration {
     std::env::var("TYPEMUX_CC_WARMUP_TIMEOUT")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_WARMUP_TIMEOUT)
+        .map_or(DEFAULT_WARMUP_TIMEOUT, Duration::from_secs)
 }
 
 /// Default fan-out timeout; overridable via `TYPEMUX_CC_FANOUT_TIMEOUT` env var.
@@ -42,8 +41,7 @@ pub fn fanout_timeout() -> Duration {
     std::env::var("TYPEMUX_CC_FANOUT_TIMEOUT")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_FANOUT_TIMEOUT)
+        .map_or(DEFAULT_FANOUT_TIMEOUT, Duration::from_secs)
 }
 
 /// Message from a backend reader task
@@ -232,8 +230,8 @@ impl BackendPool {
         self.max_backends
     }
 
-    /// Return venv paths of backends whose last_used exceeds the TTL.
-    /// Only checks TTL/last_used; pending request filtering is the caller's responsibility.
+    /// Return venv paths of backends whose `last_used` exceeds the TTL.
+    /// Only checks `TTL/last_used`; pending request filtering is the caller's responsibility.
     pub fn expired_venvs(&self) -> Vec<PathBuf> {
         let ttl = match self.backend_ttl {
             Some(ttl) => ttl,

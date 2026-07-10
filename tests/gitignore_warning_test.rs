@@ -12,6 +12,9 @@ use support::{PackageConfig, ProxyUnderTest, WorkspaceConfig};
 /// `pkg/`), so the fallback venv is not found and the backend for `pkg`
 /// spawns lazily on the first `didOpen`.
 #[tokio::test]
+// `file_a`/`file_b` (and their `_uri` variants) are deliberately parallel names
+// for the two test fixtures this scenario exercises.
+#[allow(clippy::similar_names)]
 async fn warns_when_project_root_is_gitignored() {
     let scenario = serde_json::json!({
         "on_startup": [],

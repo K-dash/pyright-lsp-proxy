@@ -134,6 +134,7 @@ pub fn load_config_file() -> ConfigLoadReport {
             skipped_keys.push(key);
         } else {
             // SAFETY: called before any threads are spawned (before tokio runtime)
+            #[allow(unsafe_code)]
             unsafe {
                 std::env::set_var(&key, &value);
             }

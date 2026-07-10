@@ -94,6 +94,7 @@ pub struct ProxyUnderTest {
     writer: LspFrameWriter<tokio::process::ChildStdin>,
     #[allow(dead_code)]
     temp_dir: TempDir,
+    #[allow(dead_code)] // Read via `root()`, used by some but not all integration test binaries.
     root: PathBuf,
     next_id: i64,
 }
@@ -131,6 +132,7 @@ impl ProxyUnderTest {
     }
 
     /// Return the canonical workspace root path.
+    #[allow(dead_code)] // Used by some but not all integration test binaries.
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -233,6 +235,7 @@ impl ProxyUnderTest {
     /// Reads messages until `expected_diag_count` publishDiagnostics notifications
     /// with empty diagnostics arrays are received, or the absolute deadline expires.
     /// Panics if a non-notification message (response) is received unexpectedly.
+    #[allow(dead_code)] // Used by some but not all integration test binaries.
     pub async fn wait_for_crash_cleanup(
         &mut self,
         expected_diag_count: usize,
@@ -244,12 +247,16 @@ impl ProxyUnderTest {
 
         while diag_count < expected_diag_count {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                panic!(
-                    "wait_for_crash_cleanup: timed out after {}ms, got {}/{} diagnostics",
-                    timeout_ms, diag_count, expected_diag_count
-                );
-            }
+            assert!(
+                !remaining.is_zero(),
+                "wait_for_crash_cleanup: timed out after {}ms, got {}/{} diagnostics",
+                timeout_ms,
+                diag_count,
+                expected_diag_count
+            );
+            // The outer `Err` case is `tokio::time::error::Elapsed`, which carries no
+            // information beyond "timed out" — already covered by the panic message below.
+            #[allow(clippy::match_wild_err_arm)]
             match tokio::time::timeout(remaining, self.reader.read_message()).await {
                 Ok(Ok(msg)) => {
                     assert!(
@@ -260,7 +267,7 @@ impl ProxyUnderTest {
                     if msg.method.as_deref() == Some("textDocument/publishDiagnostics") {
                         if let Some(params) = &msg.params {
                             if let Some(diags) = params.get("diagnostics") {
-                                if diags.as_array().is_some_and(|a| a.is_empty()) {
+                                if diags.as_array().is_some_and(std::vec::Vec::is_empty) {
                                     diag_count += 1;
                                 }
                             }
@@ -290,14 +297,13 @@ impl ProxyUnderTest {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                panic!(
-                    "wait_for_notification: timed out after {timeout_ms}ms waiting for {method:?}"
-                );
-            }
+            assert!(
+                !remaining.is_zero(),
+                "wait_for_notification: timed out after {timeout_ms}ms waiting for {method:?}"
+            );
             match tokio::time::timeout(remaining, self.reader.read_message()).await {
                 Ok(Ok(msg)) if msg.method.as_deref() == Some(method) => return msg,
-                Ok(Ok(_)) => continue, // Not the notification we're waiting for.
+                Ok(Ok(_)) => {} // Not the notification we're waiting for.
                 Ok(Err(e)) => {
                     let stderr = self.dump_stderr().await;
                     panic!("wait_for_notification: read error: {e}\n--- stderr ---\n{stderr}");

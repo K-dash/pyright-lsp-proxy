@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 impl super::LspProxy {
     /// Ensure a backend for the given URI's venv is in the pool.
-    /// Returns Some(venv_path) if a backend is available, None if no venv found.
+    /// Returns `Some(venv_path)` if a backend is available, None if no venv found.
     pub(crate) async fn ensure_backend_in_pool(
         &mut self,
         url: &url::Url,
@@ -26,7 +26,7 @@ impl super::LspProxy {
             Some(None) => {
                 // venv was not found when the document was opened.
                 // Re-search in case .venv was created after didOpen.
-                let found = venv::find_venv(file_path, self.state.git_toplevel.as_deref()).await?;
+                let found = venv::find_venv(file_path, self.state.git_toplevel.as_deref());
                 if let Some(ref venv_path) = found {
                     if let Some(doc) = self.state.open_documents.get_mut(url) {
                         doc.venv = Some(venv_path.clone());
@@ -37,7 +37,7 @@ impl super::LspProxy {
             }
             None => {
                 tracing::debug!(uri = %url, "URI not in cache, searching venv");
-                venv::find_venv(file_path, self.state.git_toplevel.as_deref()).await?
+                venv::find_venv(file_path, self.state.git_toplevel.as_deref())
             }
         };
 
@@ -105,6 +105,12 @@ impl super::LspProxy {
 
     /// Evict all expired backends (TTL-based auto-eviction).
     /// Skips backends that have pending client→backend or backend→client requests.
+    ///
+    /// The removed instance holds a child-process handle with a custom `Drop`,
+    /// so its drop order will change under Edition 2024. Deferred to the
+    /// eventual edition migration rather than restructured here to satisfy
+    /// the lint.
+    #[allow(tail_expr_drop_order)]
     pub(crate) async fn evict_expired_backends(
         &mut self,
         client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
@@ -242,7 +248,7 @@ impl super::LspProxy {
         Ok(())
     }
 
-    /// Cancel pending requests for a specific backend (identified by venv_path + session).
+    /// Cancel pending requests for a specific backend (identified by `venv_path` + session).
     /// Also handles fan-out sub-requests: removes them from pending fanouts and
     /// completes any fanouts that have no remaining sub-requests.
     pub(crate) async fn cancel_pending_requests_for_backend(
@@ -283,7 +289,7 @@ impl super::LspProxy {
         Ok(())
     }
 
-    /// Clean up pending_backend_requests entries for a specific backend
+    /// Clean up `pending_backend_requests` entries for a specific backend
     pub(crate) fn clean_pending_backend_requests(&mut self, venv_path: &PathBuf, session: u64) {
         self.state
             .pending_backend_requests
@@ -304,7 +310,7 @@ impl super::LspProxy {
                 self.state
                     .pool
                     .get(venv)
-                    .is_some_and(|inst| inst.warmup_expired())
+                    .is_some_and(super::super::backend_pool::BackendInstance::warmup_expired)
             })
             .collect();
 

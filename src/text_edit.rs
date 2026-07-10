@@ -15,24 +15,24 @@ pub(crate) fn apply_incremental_change(
 
     let start_line = start
         .get("line")
-        .and_then(|l| l.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| ProxyError::InvalidMessage("didChange start missing line".to_string()))?
         as usize;
     let start_char = start
         .get("character")
-        .and_then(|c| c.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| {
             ProxyError::InvalidMessage("didChange start missing character".to_string())
         })? as usize;
 
     let end_line = end
         .get("line")
-        .and_then(|l| l.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| ProxyError::InvalidMessage("didChange end missing line".to_string()))?
         as usize;
     let end_char = end
         .get("character")
-        .and_then(|c| c.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| ProxyError::InvalidMessage("didChange end missing character".to_string()))?
         as usize;
 
@@ -64,7 +64,7 @@ pub(crate) fn position_to_offset(
     for (idx, ch) in text.char_indices() {
         if ch == '\n' {
             if current_line == line {
-                return find_offset_in_line(text, line_start_offset, idx, character);
+                return Ok(find_offset_in_line(text, line_start_offset, idx, character));
             }
             current_line += 1;
             line_start_offset = idx + 1;
@@ -72,7 +72,12 @@ pub(crate) fn position_to_offset(
     }
 
     if current_line == line {
-        return find_offset_in_line(text, line_start_offset, text.len(), character);
+        return Ok(find_offset_in_line(
+            text,
+            line_start_offset,
+            text.len(),
+            character,
+        ));
     }
 
     Err(ProxyError::InvalidMessage(format!(
@@ -82,23 +87,18 @@ pub(crate) fn position_to_offset(
 }
 
 /// Count UTF-16 code units within line and return byte offset
-fn find_offset_in_line(
-    text: &str,
-    line_start: usize,
-    line_end: usize,
-    character: usize,
-) -> Result<usize, ProxyError> {
+fn find_offset_in_line(text: &str, line_start: usize, line_end: usize, character: usize) -> usize {
     let line_text = &text[line_start..line_end];
     let mut utf16_offset = 0;
 
     for (idx, ch) in line_text.char_indices() {
         if utf16_offset >= character {
-            return Ok(line_start + idx);
+            return line_start + idx;
         }
         utf16_offset += ch.len_utf16();
     }
 
-    Ok(line_end)
+    line_end
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
-.PHONY: all check fmt lint test build clean
+.PHONY: all check fmt lint doc test build clean
 
 # Default target: run all
-all: fmt lint test
+all: fmt lint doc test
 
 # Format
 fmt:
@@ -11,9 +11,13 @@ fmt:
 fmt-check:
 	cargo fmt --check
 
-# Lint (clippy)
+# Lint (clippy, including test/bin targets)
 lint:
-	cargo clippy -- -D warnings
+	cargo clippy --workspace --all-targets --locked -- -D warnings
+
+# Doc (rustdoc lints; matches [lints.rustdoc] in Cargo.toml)
+doc:
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --lib --no-deps --locked
 
 # Test
 test:
@@ -35,5 +39,5 @@ check:
 clean:
 	cargo clean
 
-# For CI: fmt-check + lint + test
-ci: fmt-check lint test
+# For CI: fmt-check + lint + doc + test
+ci: fmt-check lint doc test

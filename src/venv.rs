@@ -31,9 +31,9 @@ pub async fn get_git_toplevel(working_dir: &Path) -> Result<Option<PathBuf>, Ven
     }
 }
 
-/// Execute git check-ignore -q <path> and check whether it is gitignored from cwd
+/// Execute `git check-ignore -q <path>` and check whether it is gitignored from cwd
 ///
-/// Clears GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE so the check always resolves
+/// Clears `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE` so the check always resolves
 /// against `cwd` as requested, instead of silently deferring to an ambient
 /// repository override (e.g. when the proxy is launched from inside a
 /// git hook environment).
@@ -64,10 +64,7 @@ pub async fn is_path_git_ignored(path: &Path, cwd: &Path) -> bool {
 /// # Arguments
 /// * `file_path` - Starting file path
 /// * `git_toplevel` - Search boundary (if None, search up to root)
-pub async fn find_venv(
-    file_path: &Path,
-    git_toplevel: Option<&Path>,
-) -> Result<Option<PathBuf>, VenvError> {
+pub fn find_venv(file_path: &Path, git_toplevel: Option<&Path>) -> Option<PathBuf> {
     tracing::debug!(
         file = %file_path.display(),
         toplevel = ?git_toplevel.map(|p| p.display().to_string()),
@@ -107,7 +104,7 @@ pub async fn find_venv(
                 depth = depth,
                 ".venv found"
             );
-            return Ok(Some(venv_path));
+            return Some(venv_path);
         }
 
         // Move to parent directory
@@ -120,7 +117,7 @@ pub async fn find_venv(
         depth = depth,
         "No .venv found"
     );
-    Ok(None)
+    None
 }
 
 /// Search for fallback env (.venv search from cwd at startup)
@@ -202,7 +199,7 @@ mod tests {
         let file = subdir.join("test.py");
         fs::write(&file, "# test").await.unwrap();
 
-        let result = find_venv(&file, None).await.unwrap();
+        let result = find_venv(&file, None);
         assert_eq!(result, Some(venv));
     }
 
@@ -212,7 +209,7 @@ mod tests {
         let file = temp.path().join("test.py");
         fs::write(&file, "# test").await.unwrap();
 
-        let result = find_venv(&file, None).await.unwrap();
+        let result = find_venv(&file, None);
         assert_eq!(result, None);
     }
 

@@ -7,6 +7,9 @@ use support::{PackageConfig, ProxyUnderTest, WorkspaceConfig};
 /// - `pkg-a` has `.venv` → backend auto-spawns on didOpen, hover works
 /// - `pkg-b` has no `.venv` → hover returns error (strict mode, no fallback)
 #[tokio::test]
+// `file_a`/`file_b` (and their `_uri` variants) are deliberately parallel names
+// for the two test fixtures this scenario exercises.
+#[allow(clippy::similar_names)]
 async fn venv_detection_routing() {
     let scenario_a = serde_json::json!({
         "on_startup": [],
