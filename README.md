@@ -197,6 +197,7 @@ Settings priority: **CLI flag > environment variable > config file > default**
 | `TYPEMUX_CC_MAX_BACKENDS` | Max concurrent backend processes | `8` |
 | `TYPEMUX_CC_BACKEND_TTL` | Backend TTL in seconds (0 = disabled) | `1800` |
 | `TYPEMUX_CC_FANOUT_TIMEOUT` | Fan-out timeout in seconds for `workspace/symbol` (0 = no timeout) | `5` |
+| `TYPEMUX_CC_VENV_CHECK_INTERVAL` | Interval in seconds between venv identity checks (0 = disable venv identity tracking) | `5` |
 | `RUST_LOG` | Log level | `typemux_cc=debug` |
 
 ## Typical Use Case
@@ -349,6 +350,9 @@ rm -rf ~/.claude/plugins/cache/typemux-cc-marketplace/
 
 > [!Note]
 > If `.venv` didn't exist when a file was first opened, typemux-cc automatically re-searches for it on the next LSP request. No need to reopen the file.
+
+> [!Note]
+> If `.venv` is **replaced** (e.g. `uv sync` recreating it), typemux-cc detects the change on the next LSP request and restarts the backend with the new environment automatically. If `.venv` is removed and not recreated, the backend is evicted after a short grace period and requests return an explicit error instead of stale results.
 
 ### "Project root is gitignored" Warning
 

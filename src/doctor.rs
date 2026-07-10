@@ -223,6 +223,13 @@ pub async fn collect_doctor_report(
         source: env_only_source("TYPEMUX_CC_FANOUT_TIMEOUT", config_report),
     };
 
+    let venv_check_interval = backend_pool::venv_check_interval();
+    let venv_check_interval_item = ConfigItem {
+        name: "venv_check_interval".to_string(),
+        value: venv_check_interval.as_secs().to_string(),
+        source: env_only_source("TYPEMUX_CC_VENV_CHECK_INTERVAL", config_report),
+    };
+
     let log_file_value: String = matches
         .get_one::<PathBuf>("log_file")
         .map_or_else(|| "<not set>".to_string(), |p| p.display().to_string());
@@ -246,6 +253,7 @@ pub async fn collect_doctor_report(
             backend_ttl_item,
             warmup_timeout_item,
             fanout_timeout_item,
+            venv_check_interval_item,
             log_file_item,
         ],
     };

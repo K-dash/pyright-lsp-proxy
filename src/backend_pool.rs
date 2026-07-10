@@ -2,6 +2,7 @@ use crate::backend::{shutdown_fire_and_forget, BackendParts};
 use crate::error::BackendError;
 use crate::framing::{LspFrameReader, LspFrameWriter};
 use crate::message::{RpcId, RpcMessage};
+use crate::venv::VenvToken;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -44,6 +45,19 @@ pub fn fanout_timeout() -> Duration {
         .map_or(DEFAULT_FANOUT_TIMEOUT, Duration::from_secs)
 }
 
+/// Default venv staleness check interval (debounce); overridable via
+/// `TYPEMUX_CC_VENV_CHECK_INTERVAL` env var.
+const DEFAULT_VENV_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Returns the debounce interval for pooled-backend venv identity checks.
+/// `TYPEMUX_CC_VENV_CHECK_INTERVAL=0` disables venv identity tracking entirely.
+pub fn venv_check_interval() -> Duration {
+    std::env::var("TYPEMUX_CC_VENV_CHECK_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(DEFAULT_VENV_CHECK_INTERVAL, Duration::from_secs)
+}
+
 /// Message from a backend reader task
 pub struct BackendMessage {
     pub venv_path: PathBuf,
@@ -63,6 +77,15 @@ pub struct BackendInstance {
     pub warmup_state: WarmupState,
     pub warmup_deadline: Instant,
     pub warmup_queue: Vec<RpcMessage>,
+    /// Identity token captured at spawn (`None` if capture raced a `.venv`
+    /// rebuild; adopted lazily on the first successful staleness check).
+    pub venv_token: Option<VenvToken>,
+    /// Debounce marker for `check_pooled_venv_staleness`.
+    pub last_venv_check: Instant,
+    /// Set when `pyvenv.cfg` was first observed missing; cleared once it
+    /// reappears. Used to bound how long a backend serves without a venv
+    /// before being treated as removed.
+    pub venv_missing_since: Option<Instant>,
 }
 
 impl BackendInstance {
@@ -73,6 +96,7 @@ impl BackendInstance {
         venv_path: PathBuf,
         session: u64,
         msg_sender: mpsc::Sender<BackendMessage>,
+        venv_token: Option<VenvToken>,
     ) -> Self {
         let reader_task = spawn_reader_task(parts.reader, msg_sender, venv_path.clone(), session);
         let timeout = warmup_timeout();
@@ -91,6 +115,9 @@ impl BackendInstance {
             },
             warmup_deadline: Instant::now() + timeout,
             warmup_queue: Vec::new(),
+            venv_token,
+            last_venv_check: Instant::now(),
+            venv_missing_since: None,
         }
     }
 
