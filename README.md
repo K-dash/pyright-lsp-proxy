@@ -397,6 +397,10 @@ For design philosophy, state transitions, and internal implementation details, s
 
 **[ARCHITECTURE.md](./ARCHITECTURE.md)**
 
+## Privacy
+
+typemux-cc runs entirely locally and collects no data. The only network access is the version-pinned, checksum-verified binary download from GitHub Releases at install time. See [PRIVACY.md](./PRIVACY.md).
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
