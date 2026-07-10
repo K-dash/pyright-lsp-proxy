@@ -489,7 +489,7 @@ RUST_LOG=debug ./target/release/typemux-cc
 
 ### Method 2: Config File (Persistent)
 
-When running as a Claude Code plugin, the wrapper script loads config from:
+typemux-cc reads config from:
 
 ```bash
 ~/.config/typemux-cc/config

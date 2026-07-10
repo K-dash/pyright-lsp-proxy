@@ -129,10 +129,4 @@ fi
 
 mv "${TMP_PATH}" "${BINARY_PATH}"
 
-# The wrapper script ships with the plugin (tracked in bin/); just make
-# sure it is executable.
-if [ -f "${BIN_DIR}/typemux-cc-wrapper.sh" ]; then
-  chmod +x "${BIN_DIR}/typemux-cc-wrapper.sh"
-fi
-
 echo "[typemux-cc] Successfully installed ${EXPECTED_VERSION} to ${BINARY_PATH}"
