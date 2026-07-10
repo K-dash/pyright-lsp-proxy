@@ -342,6 +342,15 @@ rm -rf ~/.claude/plugins/cache/typemux-cc-marketplace/
 # 3. Restart Claude Code
 ```
 
+If the binary version still lags behind the plugin version (`typemux-cc --version` inside the cache disagrees with the cache directory name), a stale gitignored binary in the marketplace clone is shadowing the download. Remove it once:
+
+```bash
+rm ~/.claude/plugins/marketplaces/typemux-cc-marketplace/bin/typemux-cc
+# Restart Claude Code — the installer re-downloads the matching version
+```
+
+Since v0.2.14 the installer verifies the installed binary's version against the plugin manifest and re-downloads on mismatch, so this cleanup is only needed once for installations created with older versions.
+
 ### `.venv` Not Switching
 
 - Verify `.venv/pyvenv.cfg` exists
