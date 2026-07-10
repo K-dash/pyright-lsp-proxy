@@ -31,6 +31,34 @@ pub async fn get_git_toplevel(working_dir: &Path) -> Result<Option<PathBuf>, Ven
     }
 }
 
+/// Execute git check-ignore -q <path> and check whether it is gitignored from cwd
+///
+/// Clears GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE so the check always resolves
+/// against `cwd` as requested, instead of silently deferring to an ambient
+/// repository override (e.g. when the proxy is launched from inside a
+/// git hook environment).
+pub async fn is_path_git_ignored(path: &Path, cwd: &Path) -> bool {
+    let output = match Command::new("git")
+        .arg("check-ignore")
+        .arg("-q")
+        .arg(path)
+        .current_dir(cwd)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .await
+    {
+        Ok(output) => output,
+        Err(e) => {
+            tracing::warn!(error = ?e, "git command failed (git not installed or not executable), treating path as not ignored");
+            return false;
+        }
+    };
+
+    output.status.success()
+}
+
 /// Search for .venv by traversing parent directories from file path
 ///
 /// # Arguments
@@ -186,5 +214,58 @@ mod tests {
 
         let result = find_venv(&file, None).await.unwrap();
         assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_is_path_git_ignored_matches_gitignore() {
+        // Canonicalize to resolve symlinks (e.g., /var → /private/var on macOS).
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .current_dir(&root)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), "ignored-dir/\n")
+            .await
+            .unwrap();
+        let ignored_dir = root.join("ignored-dir");
+        fs::create_dir(&ignored_dir).await.unwrap();
+
+        assert!(is_path_git_ignored(&ignored_dir, &root).await);
+    }
+
+    #[tokio::test]
+    async fn test_is_path_git_ignored_not_matched() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .current_dir(&root)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), "ignored-dir/\n")
+            .await
+            .unwrap();
+        let other_dir = root.join("other-dir");
+        fs::create_dir(&other_dir).await.unwrap();
+
+        assert!(!is_path_git_ignored(&other_dir, &root).await);
+    }
+
+    #[tokio::test]
+    async fn test_is_path_git_ignored_no_git_repo() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let some_dir = root.join("some-dir");
+        fs::create_dir(&some_dir).await.unwrap();
+
+        assert!(!is_path_git_ignored(&some_dir, &root).await);
     }
 }

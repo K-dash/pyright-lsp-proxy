@@ -1,9 +1,69 @@
 use crate::error::ProxyError;
 use crate::framing::LspFrameWriter;
 use crate::message::RpcMessage;
+use crate::venv;
 use std::path::Path;
 
 impl super::LspProxy {
+    /// Warn the client if a venv's project root is gitignored from the proxy's cwd.
+    ///
+    /// Claude Code's LSP tool filters goToDefinition/findReferences/etc. results
+    /// through `git check-ignore` run in the session cwd, silently dropping
+    /// locations under gitignored paths (anthropics/claude-code#76371). Checked
+    /// at most once per venv per proxy lifetime.
+    pub(crate) async fn warn_if_project_root_ignored(
+        &mut self,
+        venv_path: &Path,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+    ) {
+        if self.state.ignore_checked_venvs.contains(venv_path) {
+            return;
+        }
+        self.state
+            .ignore_checked_venvs
+            .insert(venv_path.to_path_buf());
+
+        let Some(project_root) = venv_path.parent() else {
+            return;
+        };
+
+        let cwd = match std::env::current_dir() {
+            Ok(cwd) => cwd,
+            Err(e) => {
+                tracing::warn!(error = ?e, "Failed to get current directory for gitignore check");
+                return;
+            }
+        };
+
+        if !venv::is_path_git_ignored(project_root, &cwd).await {
+            return;
+        }
+
+        tracing::warn!(
+            venv = %venv_path.display(),
+            project_root = %project_root.display(),
+            "Project root is gitignored from session cwd; Claude Code will silently hide goToDefinition/findReferences results"
+        );
+
+        let msg = RpcMessage::notification(
+            "window/showMessage",
+            Some(serde_json::json!({
+                "type": 2,
+                "message": format!(
+                    "typemux-cc: project root {} is gitignored from the session working directory. Claude Code silently hides goToDefinition/findReferences results for gitignored paths (anthropics/claude-code#76371). Launch Claude Code inside this directory to avoid this.",
+                    project_root.display()
+                )
+            })),
+        );
+
+        if let Err(e) = client_writer.write_message(&msg).await {
+            tracing::warn!(
+                error = ?e,
+                "Failed to send gitignored project root warning to client"
+            );
+        }
+    }
+
     /// Send window/showMessage error to client when backend creation fails
     pub(crate) async fn notify_backend_error(
         &self,
