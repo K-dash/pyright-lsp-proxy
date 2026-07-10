@@ -17,7 +17,7 @@
 # typemux-cc - Python Type-Checker LSP Multiplexer for Claude Code
 
 See @README.md for project overview.
-See @ARCHITECTURE.md for architecture details.
+See @docs/ARCHITECTURE.md for architecture details.
 
 ## Build & Quality
 
@@ -100,7 +100,7 @@ For small, well-scoped changes (single-file fixes, typo corrections, simple bug 
 
 ## Project Structure
 
-See @ARCHITECTURE.md for source code structure.
+See @docs/ARCHITECTURE.md for source code structure.
 
 ---
 
