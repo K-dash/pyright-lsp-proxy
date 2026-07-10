@@ -350,6 +350,10 @@ rm -rf ~/.claude/plugins/cache/typemux-cc-marketplace/
 > [!Note]
 > If `.venv` didn't exist when a file was first opened, typemux-cc automatically re-searches for it on the next LSP request. No need to reopen the file.
 
+### "Project root is gitignored" Warning
+
+Claude Code's LSP tool filters `goToDefinition`/`findReferences` results through `git check-ignore` run in the session's working directory, silently dropping results whose paths are gitignored there ([anthropics/claude-code#76371](https://github.com/anthropics/claude-code/issues/76371)). When a backend's project root is gitignored from where Claude Code is running (e.g. a project nested inside a `.claude/worktrees/` directory), typemux-cc shows a `window/showMessage` warning so missing results don't look like an LSP failure. Launch Claude Code from inside the project directory to avoid this.
+
 ## Known Limitations
 
 | Item | Limitation | Workaround |

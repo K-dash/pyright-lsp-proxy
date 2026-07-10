@@ -1,7 +1,7 @@
 use crate::backend::BackendKind;
 use crate::backend_pool::BackendPool;
 use crate::message::{RpcId, RpcMessage};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -87,6 +87,11 @@ pub struct ProxyState {
 
     /// Pending fan-out requests (keyed by client request ID)
     pub pending_fanouts: HashMap<RpcId, PendingFanout>,
+
+    /// Venvs already checked for a gitignored project root (checked at most
+    /// once per venv per proxy lifetime, even if the backend is later
+    /// TTL-evicted and respawned).
+    pub ignore_checked_venvs: HashSet<PathBuf>,
 }
 
 impl ProxyState {
@@ -105,6 +110,7 @@ impl ProxyState {
             next_proxy_request_id: -1, // Use negative IDs to avoid collision with client IDs
             pool: BackendPool::new(max_backends, backend_ttl),
             pending_fanouts: HashMap::new(),
+            ignore_checked_venvs: HashSet::new(),
         }
     }
 

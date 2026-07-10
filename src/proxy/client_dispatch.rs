@@ -44,11 +44,13 @@ impl super::LspProxy {
                     let parts = backend.into_split();
                     let tx = self.state.pool.msg_sender();
                     let instance = BackendInstance::from_parts(parts, venv.clone(), session, tx);
-                    self.state.pool.insert(venv, instance);
+                    self.state.pool.insert(venv.clone(), instance);
 
                     // Send initialize response to client
                     client_writer.write_message(&init_response).await?;
                     tracing::info!("Initial backend inserted into pool");
+                    self.warn_if_project_root_ignored(&venv, client_writer)
+                        .await;
                 }
                 Err(e) => {
                     tracing::error!(error = ?e, "Failed to initialize fallback backend, returning minimal response");

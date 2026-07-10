@@ -61,6 +61,8 @@ impl super::LspProxy {
             .create_backend_instance(&target_venv, client_writer)
             .await?;
         self.state.pool.insert(target_venv.clone(), instance);
+        self.warn_if_project_root_ignored(&target_venv, client_writer)
+            .await;
 
         Ok(Some(target_venv))
     }

@@ -193,6 +193,33 @@ impl ProxyUnderTest {
         }
     }
 
+    /// Send a request and wait for the response, collecting any notifications
+    /// observed in the meantime (with timeout).
+    #[allow(dead_code)] // Used by some but not all integration test binaries.
+    pub async fn request_collecting(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> (RpcMessage, Vec<RpcMessage>) {
+        let id = self.next_id;
+        self.next_id += 1;
+        let msg = RpcMessage::request(RpcId::Number(id), method, Some(params));
+        self.write(&msg).await;
+        let mut notifications = Vec::new();
+        loop {
+            let resp = self.read_next().await;
+            if resp.is_response() {
+                if let Some(RpcId::Number(resp_id)) = &resp.id {
+                    if *resp_id == id {
+                        return (resp, notifications);
+                    }
+                }
+            } else {
+                notifications.push(resp);
+            }
+        }
+    }
+
     /// Perform shutdown + exit sequence. Returns the shutdown response.
     pub async fn shutdown_and_exit(&mut self) -> RpcMessage {
         let resp = self.request("shutdown", Value::Null).await;
@@ -254,6 +281,35 @@ impl ProxyUnderTest {
             }
         }
         collected
+    }
+
+    /// Wait for a notification with the given method, discarding any other
+    /// notifications observed in the meantime. Panics on timeout.
+    #[allow(dead_code)] // Used by some but not all integration test binaries.
+    pub async fn wait_for_notification(&mut self, method: &str, timeout_ms: u64) -> RpcMessage {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                panic!(
+                    "wait_for_notification: timed out after {timeout_ms}ms waiting for {method:?}"
+                );
+            }
+            match tokio::time::timeout(remaining, self.reader.read_message()).await {
+                Ok(Ok(msg)) if msg.method.as_deref() == Some(method) => return msg,
+                Ok(Ok(_)) => continue, // Not the notification we're waiting for.
+                Ok(Err(e)) => {
+                    let stderr = self.dump_stderr().await;
+                    panic!("wait_for_notification: read error: {e}\n--- stderr ---\n{stderr}");
+                }
+                Err(_) => {
+                    let stderr = self.dump_stderr().await;
+                    panic!(
+                        "wait_for_notification: timed out after {timeout_ms}ms waiting for {method:?}\n--- stderr ---\n{stderr}"
+                    );
+                }
+            }
+        }
     }
 
     /// Read the next LSP message (with timeout).
