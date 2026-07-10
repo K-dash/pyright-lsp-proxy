@@ -6,11 +6,15 @@
 
 **WORKFLOW:**
 
-1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - `make all`
-3. **Commit changes** - Conventional commits on feature branch
-4. **Ask user about push** - Confirm before pushing to remote
-5. **Hand off** - Provide context for next session
+1. **Run quality gates** (if code changed) - `make all`
+2. **Report remaining work** - Describe follow-up work without creating issues unless the user explicitly authorizes issue creation
+3. **Report the working tree** - Summarize changed files and verification results
+4. **Hand off** - Provide context for the next session
+
+Creating issues, committing, pushing, and opening pull requests are separate external
+mutations. Perform each one only when the user explicitly authorizes that action. An
+instruction to commit does not authorize a push or pull request, and an instruction to
+push does not authorize opening a pull request.
 
 ---
 
@@ -44,10 +48,13 @@ make test         # cargo test
    make all  # format + lint + test
    ```
 3. **Update documentation**: If user-facing behavior changes, update README.md
-4. **Commit**: Use conventional commits (feat:, fix:, docs:, etc.)
-5. **Push and create PR**: Never merge directly to main
+4. **Commit, when explicitly authorized**: Use conventional commits (feat:, fix:, docs:, etc.)
+5. **Push, when explicitly authorized**: Never merge directly to main
    ```bash
    git push -u origin <branch-name>
+   ```
+6. **Create a pull request, when explicitly authorized**
+   ```bash
    gh pr create
    ```
 
@@ -57,13 +64,14 @@ Before committing, verify:
 - [ ] On a feature branch (not main)?
 - [ ] `make all` passes?
 - [ ] README.md updated if needed?
-- [ ] PR will be created?
+- [ ] The user explicitly authorized the commit?
 
 ## Instructions for AI Agents
 
 - **All code comments, commit messages, PR titles, PR descriptions, and review comments MUST be written in English.** No exceptions.
 - Before committing, ALWAYS re-read this Workflow section
 - When user says "commit", first check current branch and create feature branch if on main
+- Treat authorization for issue creation, commits, pushes, and pull requests separately; never infer one from another
 - When user-facing behavior changes, proactively update README.md before committing
 - **No implicit fallbacks** — Never add silent fallback logic that masks errors. Let it fail loudly so unintended behavior is caught early. An explicit error is always better than a silent wrong result.
 - **No backward compatibility** — Do not preserve backward compatibility unless the user explicitly requests it. Breaking changes are the default; do not add compatibility shims, re-exports, or deprecation wrappers.
@@ -107,4 +115,3 @@ See @docs/ARCHITECTURE.md for source code structure.
 ## Known Mistakes & Lessons Learned
 
 <!-- Reverse-chronological. Format: ### YYYY-MM-DD: Description / What happened / Root cause / Rule -->
-
