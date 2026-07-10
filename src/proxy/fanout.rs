@@ -138,14 +138,14 @@ impl super::LspProxy {
 
         // Remove the sub-request entry
         let fanout = self.state.pending_fanouts.get_mut(&client_id).unwrap();
-        let (_venv_path, _session) = fanout.sub_requests.remove(response_id).unwrap();
+        let (venv_path, _session) = fanout.sub_requests.remove(response_id).unwrap();
 
         // Clean up from pending_requests
         self.state.pending_requests.remove(response_id);
 
         // Process the response
         if msg.error.is_some() {
-            fanout.failed_backends.push(_venv_path);
+            fanout.failed_backends.push(venv_path);
         } else if let Some(result) = &msg.result {
             // workspace/symbol returns an array of SymbolInformation
             if let Some(arr) = result.as_array() {
@@ -306,7 +306,7 @@ impl super::LspProxy {
 
     /// Cancel fan-out sub-requests for a specific backend (venv + session).
     /// Called when a backend crashes or is evicted.
-    /// Returns client_ids of affected fan-outs that need convergence checks.
+    /// Returns `client_ids` of affected fan-outs that need convergence checks.
     pub(crate) fn cancel_fanout_sub_requests(
         &mut self,
         venv_path: &PathBuf,
@@ -314,7 +314,7 @@ impl super::LspProxy {
     ) -> Vec<RpcId> {
         let mut affected_client_ids = Vec::new();
 
-        for (client_id, fanout) in self.state.pending_fanouts.iter_mut() {
+        for (client_id, fanout) in &mut self.state.pending_fanouts {
             let matching_proxy_ids: Vec<RpcId> = fanout
                 .sub_requests
                 .iter()
@@ -367,7 +367,7 @@ pub fn dedupe_symbol_results(results: Vec<serde_json::Value>) -> Vec<serde_json:
     deduped
 }
 
-/// Extract dedup key from a SymbolInformation value.
+/// Extract dedup key from a `SymbolInformation` value.
 fn extract_dedupe_key(item: &serde_json::Value) -> Option<(String, u64, u64, String, u64)> {
     let name = item.get("name")?.as_str()?;
     let kind = item.get("kind")?.as_u64()?;

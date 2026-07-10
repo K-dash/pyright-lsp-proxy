@@ -32,6 +32,10 @@ impl super::LspProxy {
         tracing::info!("Caching initialize message for backend initialization");
         self.state.client_initialize = Some(msg.clone());
 
+        // `backend` holds a child-process handle with a custom `Drop`, so its
+        // scope will change under Edition 2024. Deferred to the eventual edition
+        // migration rather than restructured here to satisfy the lint.
+        #[allow(if_let_rescope)]
         if let Some((mut backend, venv)) = pending_initial_backend.take() {
             // Forward initialize to the pre-spawned backend
             match self
@@ -229,25 +233,21 @@ impl super::LspProxy {
                 target_venv = self.venv_for_uri(&url);
 
                 if target_venv.is_none() {
-                    let file_path = match url.to_file_path() {
-                        Ok(p) => p,
-                        Err(_) => {
-                            // Non-file URI (e.g., untitled:, vscode-notebook-cell:)
-                            tracing::warn!(
-                                method = ?msg.method_name(),
-                                uri = %url,
-                                "Cannot resolve venv for non-file URI"
-                            );
-                            let error_response = RpcMessage::error_response(
-                                msg,
-                                &format!(
-                                    "lsp-proxy: cannot resolve venv for non-file URI: {}",
-                                    url
-                                ),
-                            );
-                            client_writer.write_message(&error_response).await?;
-                            return Ok(());
-                        }
+                    let file_path = if let Ok(p) = url.to_file_path() {
+                        p
+                    } else {
+                        // Non-file URI (e.g., untitled:, vscode-notebook-cell:)
+                        tracing::warn!(
+                            method = ?msg.method_name(),
+                            uri = %url,
+                            "Cannot resolve venv for non-file URI"
+                        );
+                        let error_response = RpcMessage::error_response(
+                            msg,
+                            &format!("lsp-proxy: cannot resolve venv for non-file URI: {}", url),
+                        );
+                        client_writer.write_message(&error_response).await?;
+                        return Ok(());
                     };
 
                     match self
@@ -543,9 +543,8 @@ impl super::LspProxy {
 fn extract_cancel_id(msg: &RpcMessage) -> Option<RpcId> {
     let params = msg.params.as_ref()?;
     let id_value = params.get("id")?;
-    if let Some(n) = id_value.as_i64() {
-        Some(RpcId::Number(n))
-    } else {
-        id_value.as_str().map(|s| RpcId::String(s.to_string()))
-    }
+    id_value.as_i64().map_or_else(
+        || id_value.as_str().map(|s| RpcId::String(s.to_string())),
+        |n| Some(RpcId::Number(n)),
+    )
 }

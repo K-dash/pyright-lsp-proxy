@@ -36,7 +36,7 @@ pub struct PendingFanout {
     pub expected_count: usize,
     /// Collected results from successful backends
     pub results: Vec<serde_json::Value>,
-    /// Maps proxy_id → (venv_path, session) for each sub-request
+    /// Maps `proxy_id` → (`venv_path`, session) for each sub-request
     pub sub_requests: HashMap<RpcId, (PathBuf, u64)>,
     /// Deadline for the fan-out (partial results returned after this).
     /// None means no timeout (wait forever).
@@ -75,8 +75,8 @@ pub struct ProxyState {
     /// Pending requests (client → backend)
     pub pending_requests: HashMap<RpcId, PendingRequest>,
 
-    /// Pending backend requests (backend → client, keyed by proxy_id)
-    /// Maps proxy_id → PendingBackendRequest to route client responses back to correct backend
+    /// Pending backend requests (backend → client, keyed by `proxy_id`)
+    /// Maps `proxy_id` → `PendingBackendRequest` to route client responses back to correct backend
     pub pending_backend_requests: HashMap<RpcId, PendingBackendRequest>,
 
     /// Next proxy ID for server→client requests (monotonically increasing to avoid collisions)

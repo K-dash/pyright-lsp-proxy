@@ -38,7 +38,7 @@ impl super::LspProxy {
         let text = text_document
             .get("text")
             .and_then(|t| t.as_str())
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
 
         let Some(uri_str) = text_document.get("uri").and_then(|u| u.as_str()) else {
             return Ok(());
@@ -58,7 +58,7 @@ impl super::LspProxy {
 
         let version = text_document
             .get("version")
-            .and_then(|v| v.as_i64())
+            .and_then(serde_json::Value::as_i64)
             .unwrap_or(0) as i32;
 
         tracing::info!(
@@ -69,7 +69,7 @@ impl super::LspProxy {
         );
 
         // Search for .venv
-        let found_venv = venv::find_venv(&file_path, self.state.git_toplevel.as_deref()).await?;
+        let found_venv = venv::find_venv(&file_path, self.state.git_toplevel.as_deref());
 
         // Cache document
         if let Some(text_content) = &text {
@@ -92,6 +92,9 @@ impl super::LspProxy {
         };
 
         if !self.state.pool.contains(venv_path) {
+            // `Some`/`None` both just mean "handled, nothing left to forward here" but
+            // for distinct reasons, so keep them as separate documented arms.
+            #[allow(clippy::match_same_arms)]
             match self
                 .ensure_backend_in_pool(&url, &file_path, client_writer)
                 .await
@@ -113,7 +116,7 @@ impl super::LspProxy {
     }
 
     /// Handle didChange
-    pub(crate) async fn handle_did_change(&mut self, msg: &RpcMessage) -> Result<(), ProxyError> {
+    pub(crate) fn handle_did_change(&mut self, msg: &RpcMessage) -> Result<(), ProxyError> {
         let Some(params) = &msg.params else {
             return Ok(());
         };
@@ -129,7 +132,7 @@ impl super::LspProxy {
 
         let version = text_document
             .get("version")
-            .and_then(|v| v.as_i64())
+            .and_then(serde_json::Value::as_i64)
             .map(|v| v as i32);
 
         let Some(content_changes) = params.get("contentChanges") else {
@@ -180,9 +183,9 @@ impl super::LspProxy {
     }
 
     /// Handle didClose: remove document from cache
-    pub(crate) async fn handle_did_close(&mut self, msg: &RpcMessage) -> Result<(), ProxyError> {
+    pub(crate) fn handle_did_close(&mut self, msg: &RpcMessage) {
         let Some(url) = Self::extract_text_document_uri(msg) else {
-            return Ok(());
+            return;
         };
 
         if self.state.open_documents.remove(&url).is_some() {
@@ -197,7 +200,5 @@ impl super::LspProxy {
                 "didClose for unknown document"
             );
         }
-
-        Ok(())
     }
 }

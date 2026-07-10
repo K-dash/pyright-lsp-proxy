@@ -157,7 +157,7 @@ impl super::LspProxy {
         perform_initialize_handshake(backend, init_params, venv).await
     }
 
-    /// Create a new backend, initialize it, split it, and return a BackendInstance.
+    /// Create a new backend, initialize it, split it, and return a `BackendInstance`.
     /// Does NOT insert into the pool — caller is responsible for that.
     pub(crate) async fn create_backend_instance(
         &mut self,
@@ -173,7 +173,7 @@ impl super::LspProxy {
         );
 
         // 1. Spawn
-        let mut backend = LspBackend::spawn(self.state.backend_kind, Some(venv)).await?;
+        let mut backend = LspBackend::spawn(self.state.backend_kind, Some(venv))?;
 
         // 2. Initialize handshake
         let init_params = self.cached_init_params()?;
@@ -203,7 +203,7 @@ impl super::LspProxy {
         session: u64,
         _client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
     ) -> Result<(), ProxyError> {
-        let venv_parent = venv.parent().map(|p| p.to_path_buf());
+        let venv_parent = venv.parent().map(std::path::Path::to_path_buf);
         let total_docs = self.state.open_documents.len();
         let mut restored = 0;
         let mut skipped = 0;
@@ -248,7 +248,7 @@ impl super::LspProxy {
             );
 
             match backend.send_message(&didopen_msg).await {
-                Ok(_) => {
+                Ok(()) => {
                     restored += 1;
                     tracing::info!(
                         session = session,

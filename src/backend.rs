@@ -16,7 +16,7 @@ pub enum BackendKind {
 
 impl BackendKind {
     /// Short name for logging (matches CLI value)
-    pub fn display_name(&self) -> &'static str {
+    pub fn display_name(self) -> &'static str {
         match self {
             Self::Pyright => "pyright",
             Self::Ty => "ty",
@@ -24,7 +24,7 @@ impl BackendKind {
         }
     }
 
-    pub fn command(&self) -> &'static str {
+    pub fn command(self) -> &'static str {
         match self {
             Self::Pyright => "pyright-langserver",
             Self::Ty => "ty",
@@ -34,7 +34,7 @@ impl BackendKind {
 
     /// Command name used for `--version` detection.
     /// pyright-langserver does not support `--version`, so we use `pyright` instead.
-    pub fn version_command(&self) -> &'static str {
+    pub fn version_command(self) -> &'static str {
         match self {
             Self::Pyright => "pyright",
             Self::Ty => "ty",
@@ -42,7 +42,7 @@ impl BackendKind {
         }
     }
 
-    fn args(&self) -> &'static [&'static str] {
+    fn args(self) -> &'static [&'static str] {
         match self {
             Self::Pyright => &["--stdio"],
             Self::Ty => &["server"],
@@ -51,9 +51,10 @@ impl BackendKind {
     }
 
     /// Apply backend-specific environment variables to the command.
-    /// Currently all backends use VIRTUAL_ENV + PATH, but this method
+    /// Currently all backends use `VIRTUAL_ENV` + PATH, but this method
     /// provides the extension point for future backend-specific env setup.
-    pub fn apply_env(&self, cmd: &mut Command, venv: &Path) {
+    #[allow(clippy::unused_self)] // Intentional extension point; see doc comment above.
+    pub fn apply_env(self, cmd: &mut Command, venv: &Path) {
         let venv_str = venv.to_string_lossy();
         cmd.env("VIRTUAL_ENV", venv_str.as_ref());
 
@@ -87,8 +88,8 @@ pub struct LspBackend {
 impl LspBackend {
     /// Spawn an LSP backend process.
     ///
-    /// When venv_path is Some, apply backend-specific environment variables.
-    pub async fn spawn(kind: BackendKind, venv_path: Option<&Path>) -> Result<Self, BackendError> {
+    /// When `venv_path` is Some, apply backend-specific environment variables.
+    pub fn spawn(kind: BackendKind, venv_path: Option<&Path>) -> Result<Self, BackendError> {
         let mut cmd = Command::new(kind.command());
         for arg in kind.args() {
             cmd.arg(arg);

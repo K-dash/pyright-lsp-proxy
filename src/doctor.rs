@@ -5,6 +5,7 @@ use crate::venv;
 use clap::parser::ValueSource;
 use clap::ArgMatches;
 use serde::Serialize;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 /// Top-level doctor report.
@@ -71,7 +72,6 @@ fn arg_source(matches: &ArgMatches, id: &str, config_report: &ConfigLoadReport) 
                 format!("env: {}", env_name)
             }
         }
-        Some(ValueSource::DefaultValue) => "default".to_string(),
         _ => "default".to_string(),
     }
 }
@@ -100,7 +100,7 @@ fn env_only_source(env_var: &str, config_report: &ConfigLoadReport) -> String {
     }
 }
 
-/// Search for a binary in PATH directories using std::env::split_paths + metadata.
+/// Search for a binary in PATH directories using `std::env::split_paths` + metadata.
 /// Returns the first match that is a file with execute permission.
 pub fn find_binary_in_path(binary_name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
@@ -163,7 +163,7 @@ async fn detect_backend_version(command: &str) -> Option<String> {
     }
 }
 
-/// Collect all diagnostic information into a DoctorReport.
+/// Collect all diagnostic information into a `DoctorReport`.
 pub async fn collect_doctor_report(
     backend: &BackendKind,
     matches: &ArgMatches,
@@ -193,8 +193,7 @@ pub async fn collect_doctor_report(
 
     let max_backends_value: String = matches
         .get_one::<u64>("max_backends")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "8".to_string());
+        .map_or_else(|| "8".to_string(), std::string::ToString::to_string);
     let max_backends_item = ConfigItem {
         name: "max_backends".to_string(),
         value: max_backends_value,
@@ -203,8 +202,7 @@ pub async fn collect_doctor_report(
 
     let backend_ttl_value: String = matches
         .get_one::<u64>("backend_ttl")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "1800".to_string());
+        .map_or_else(|| "1800".to_string(), std::string::ToString::to_string);
     let backend_ttl_item = ConfigItem {
         name: "backend_ttl".to_string(),
         value: backend_ttl_value,
@@ -227,8 +225,7 @@ pub async fn collect_doctor_report(
 
     let log_file_value: String = matches
         .get_one::<PathBuf>("log_file")
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "<not set>".to_string());
+        .map_or_else(|| "<not set>".to_string(), |p| p.display().to_string());
     let log_file_source = if matches.value_source("log_file") == Some(ValueSource::DefaultValue)
         || matches.value_source("log_file").is_none()
     {
@@ -295,10 +292,19 @@ fn os_version() -> String {
     #[cfg(unix)]
     {
         let mut utsname = std::mem::MaybeUninit::<libc::utsname>::uninit();
+        // SAFETY: `utsname.as_mut_ptr()` points to valid, writable memory sized
+        // for `libc::utsname`; `uname` only writes into it.
+        #[allow(unsafe_code)]
         let ret = unsafe { libc::uname(utsname.as_mut_ptr()) };
         if ret == 0 {
+            // SAFETY: `ret == 0` confirms `uname` fully initialized `utsname`.
+            #[allow(unsafe_code)]
             let utsname = unsafe { utsname.assume_init() };
+            // SAFETY: `sysname`/`release` are nul-terminated C strings written
+            // by the successful `uname` call above, valid for `utsname`'s scope.
+            #[allow(unsafe_code)]
             let sysname = unsafe { std::ffi::CStr::from_ptr(utsname.sysname.as_ptr()) };
+            #[allow(unsafe_code)]
             let release = unsafe { std::ffi::CStr::from_ptr(utsname.release.as_ptr()) };
             return format!(
                 "{} {}",
@@ -314,26 +320,24 @@ fn os_version() -> String {
 pub fn render_human(report: &DoctorReport) -> String {
     let mut out = String::new();
 
-    out.push_str(&format!("typemux-cc v{}\n", report.version));
+    let _ = writeln!(out, "typemux-cc v{}", report.version);
 
     // Config file info
     out.push_str("\nConfig file:\n");
-    out.push_str(&format!(
-        "  Path              {}\n",
-        report.config_file.path
-    ));
-    out.push_str(&format!(
-        "  Status            {}\n",
+    let _ = writeln!(out, "  Path              {}", report.config_file.path);
+    let _ = writeln!(
+        out,
+        "  Status            {}",
         if report.config_file.exists {
             "loaded"
         } else {
             "not found"
         }
-    ));
+    );
     if !report.config_file.parse_errors.is_empty() {
         out.push_str("  Warnings:\n");
         for err in &report.config_file.parse_errors {
-            out.push_str(&format!("    ⚠ {}\n", err));
+            let _ = writeln!(out, "    ⚠ {err}");
         }
     }
 
@@ -356,59 +360,61 @@ pub fn render_human(report: &DoctorReport) -> String {
         .unwrap_or(0);
 
     for item in &report.configuration.items {
-        out.push_str(&format!(
-            "  {:<kw$}  {:<vw$}  ({})\n",
-            item.name,
-            item.value,
-            item.source,
-            kw = max_key,
-            vw = max_val,
-        ));
+        let _ = writeln!(
+            out,
+            "  {:<max_key$}  {:<max_val$}  ({})",
+            item.name, item.value, item.source,
+        );
     }
 
     out.push_str("\nEnvironment:\n");
-    out.push_str(&format!(
-        "  Backend binary    {}\n",
+    let _ = writeln!(
+        out,
+        "  Backend binary    {}",
         report.environment.backend_binary.command
-    ));
-    out.push_str(&format!(
-        "    Path            {}\n",
+    );
+    let _ = writeln!(
+        out,
+        "    Path            {}",
         report
             .environment
             .backend_binary
             .path
             .as_deref()
             .unwrap_or("<not found>")
-    ));
-    out.push_str(&format!(
-        "    Version         {}\n",
+    );
+    let _ = writeln!(
+        out,
+        "    Version         {}",
         report
             .environment
             .backend_binary
             .version
             .as_deref()
             .unwrap_or("<unknown>")
-    ));
-    out.push_str(&format!(
-        "  Git toplevel      {}\n",
+    );
+    let _ = writeln!(
+        out,
+        "  Git toplevel      {}",
         report
             .environment
             .git_toplevel
             .as_deref()
             .unwrap_or("<not in a git repo>")
-    ));
-    out.push_str(&format!(
-        "  Fallback venv     {}\n",
+    );
+    let _ = writeln!(
+        out,
+        "  Fallback venv     {}",
         report
             .environment
             .fallback_venv
             .as_deref()
             .unwrap_or("<not found>")
-    ));
+    );
 
     out.push_str("\nSystem:\n");
-    out.push_str(&format!("  OS                {}\n", report.system.os));
-    out.push_str(&format!("  Arch              {}\n", report.system.arch));
+    let _ = writeln!(out, "  OS                {}", report.system.os);
+    let _ = writeln!(out, "  Arch              {}", report.system.arch);
 
     out
 }

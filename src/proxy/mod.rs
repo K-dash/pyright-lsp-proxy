@@ -58,7 +58,7 @@ impl LspProxy {
             fallback_venv
         {
             tracing::info!(venv = %venv.display(), "Using fallback .venv, pre-spawning backend");
-            let backend = LspBackend::spawn(self.state.backend_kind, Some(&venv)).await?;
+            let backend = LspBackend::spawn(self.state.backend_kind, Some(&venv))?;
             Some((backend, venv))
         } else {
             tracing::warn!("No fallback .venv found, starting with empty pool");
@@ -108,15 +108,13 @@ impl LspProxy {
                         }
                         _ if msg.is_response()
                             && self.dispatch_client_response(&msg).await? =>
-                        {
-                            continue;
-                        }
+                        {}
                         Some("textDocument/didOpen") => {
                             didopen_count += 1;
                             self.handle_did_open(&msg, didopen_count, &mut client_writer).await?;
                         }
                         Some("textDocument/didChange") => {
-                            self.handle_did_change(&msg).await?;
+                            self.handle_did_change(&msg)?;
                             // Forward to appropriate backend
                             if let Some(url) = Self::extract_text_document_uri(&msg) {
                                 if let Some(venv_path) = self.venv_for_uri(&url) {
@@ -129,7 +127,7 @@ impl LspProxy {
                             let venv_for_close = Self::extract_text_document_uri(&msg)
                                 .and_then(|url| self.venv_for_uri(&url));
 
-                            self.handle_did_close(&msg).await?;
+                            self.handle_did_close(&msg);
 
                             // Forward to appropriate backend
                             if let Some(venv_path) = venv_for_close {
@@ -160,7 +158,7 @@ impl LspProxy {
                 }
 
                 // Warmup timeout: fail-open transition for warming backends
-                _ = async {
+                () = async {
                     match warmup_deadline {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
                         None => std::future::pending::<()>().await,
@@ -170,7 +168,7 @@ impl LspProxy {
                 }
 
                 // Fan-out timeout: return partial results for timed-out fan-out requests
-                _ = async {
+                () = async {
                     match fanout_deadline {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
                         None => std::future::pending::<()>().await,

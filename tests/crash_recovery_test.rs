@@ -8,6 +8,9 @@ use support::{PackageConfig, ProxyUnderTest, WorkspaceConfig};
 /// 1st lifetime: hover succeeds, then didOpen triggers crash (exit 1)
 /// 2nd lifetime: scenario rewritten on disk, hover succeeds with new backend
 #[tokio::test]
+// `file_a`/`file_b` (and their `_uri` variants) are deliberately parallel names
+// for the two test fixtures this scenario exercises.
+#[allow(clippy::similar_names)]
 async fn backend_crash_recovery() {
     // First lifetime scenario: hover works, then crash on didOpen.
     let scenario_life1 = serde_json::json!({

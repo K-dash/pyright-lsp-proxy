@@ -140,7 +140,7 @@ impl super::LspProxy {
             );
 
             match client_writer.write_message(&clear_msg).await {
-                Ok(_) => ok += 1,
+                Ok(()) => ok += 1,
                 Err(e) => {
                     failed += 1;
                     tracing::warn!(uri = %uri, error = ?e, "Failed to clear diagnostics");

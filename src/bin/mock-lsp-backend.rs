@@ -126,6 +126,9 @@ async fn main() {
 
 fn load_scenario() -> Scenario {
     // Try inline JSON first, then file path.
+    // A `map_or_else` rewrite here would nest an if/else inside a closure for no
+    // readability gain over this plain three-way if/else-if/else.
+    #[allow(clippy::option_if_let_else)]
     let json = if let Ok(s) = std::env::var("MOCK_LSP_SCENARIO") {
         s
     } else if let Ok(path) = std::env::var("MOCK_LSP_SCENARIO_FILE") {

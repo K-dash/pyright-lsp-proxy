@@ -8,6 +8,9 @@ use support::{PackageConfig, ProxyUnderTest, WorkspaceConfig};
 /// - proj-b hover → "hover from backend-b"
 /// - proj-a hover again → still "hover from backend-a" (no cross-contamination)
 #[tokio::test]
+// `file_a`/`file_b` (and their `_uri` variants) are deliberately parallel names
+// for the two test fixtures this scenario exercises.
+#[allow(clippy::similar_names)]
 async fn multi_venv_switching() {
     let scenario_a = serde_json::json!({
         "on_startup": [],
