@@ -1,3 +1,4 @@
+use super::pool_management::StaleOutcome;
 use crate::error::ProxyError;
 use crate::framing::LspFrameWriter;
 use crate::message::RpcMessage;
@@ -109,8 +110,19 @@ impl super::LspProxy {
             }
         }
 
-        // Backend exists in pool — forward didOpen
-        self.forward_to_backend(venv_path, msg).await?;
+        // Backend exists in pool — verify its venv identity before forwarding.
+        match self
+            .check_pooled_venv_staleness(venv_path, client_writer)
+            .await?
+        {
+            StaleOutcome::Fresh => {
+                self.forward_to_backend(venv_path, msg).await?;
+            }
+            // Respawned: document restoration already replayed this didOpen
+            // to the new backend. Removed: cache-only revival mode, nothing
+            // to forward to.
+            StaleOutcome::Respawned | StaleOutcome::Removed => {}
+        }
 
         Ok(())
     }

@@ -91,6 +91,32 @@ impl super::LspProxy {
         }
     }
 
+    /// Notify the client that a pooled backend's venv was replaced (e.g. by
+    /// `uv sync` recreating `.venv`) and the backend is being restarted.
+    pub(crate) async fn notify_venv_replaced(
+        &self,
+        venv_path: &Path,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+    ) {
+        let msg = RpcMessage::notification(
+            "window/showMessage",
+            Some(serde_json::json!({
+                "type": 3,
+                "message": format!(
+                    "typemux-cc: {} was replaced with a new environment; restarting the LSP backend.",
+                    venv_path.display()
+                )
+            })),
+        );
+
+        if let Err(e) = client_writer.write_message(&msg).await {
+            tracing::warn!(
+                error = ?e,
+                "Failed to send venv-replaced notification to client"
+            );
+        }
+    }
+
     /// Clear diagnostics for all documents belonging to a venv
     pub(crate) async fn clear_diagnostics_for_venv(
         &self,

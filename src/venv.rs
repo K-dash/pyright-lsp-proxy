@@ -1,9 +1,37 @@
 use crate::error::VenvError;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use tokio::process::Command;
 
 const VENV_DIR: &str = ".venv";
 const PYVENV_CFG: &str = "pyvenv.cfg";
+
+/// Identity token for a `.venv`, derived from `.venv/pyvenv.cfg` metadata.
+///
+/// `uv sync` recreating `.venv` allocates a new inode (`dev`/`ino` change);
+/// in-place edits change `mtime`/`size`. `size` hardens against the rare case
+/// of inode reuse combined with a coarse mtime collision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VenvToken {
+    dev: u64,
+    ino: u64,
+    mtime: SystemTime,
+    size: u64,
+}
+
+/// Stat `.venv/pyvenv.cfg` and capture its identity token.
+/// Returns `None` if the file cannot be stat'd (missing, permission error, etc.).
+pub async fn venv_token(venv: &Path) -> Option<VenvToken> {
+    let meta = tokio::fs::metadata(venv.join(PYVENV_CFG)).await.ok()?;
+    let mtime = meta.modified().ok()?;
+    Some(VenvToken {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        mtime,
+        size: meta.len(),
+    })
+}
 
 /// Execute git rev-parse --show-toplevel and get result
 pub async fn get_git_toplevel(working_dir: &Path) -> Result<Option<PathBuf>, VenvError> {
@@ -264,5 +292,50 @@ mod tests {
         fs::create_dir(&some_dir).await.unwrap();
 
         assert!(!is_path_git_ignored(&some_dir, &root).await);
+    }
+
+    #[tokio::test]
+    async fn test_venv_token_stable_across_restat() {
+        let temp = tempdir().unwrap();
+        let venv = temp.path().join(".venv");
+        fs::create_dir(&venv).await.unwrap();
+        fs::write(venv.join("pyvenv.cfg"), "home = /usr/bin")
+            .await
+            .unwrap();
+
+        let token1 = venv_token(&venv).await;
+        let token2 = venv_token(&venv).await;
+        assert!(token1.is_some());
+        assert_eq!(token1, token2);
+    }
+
+    #[tokio::test]
+    async fn test_venv_token_changes_on_recreate() {
+        let temp = tempdir().unwrap();
+        let venv = temp.path().join(".venv");
+        fs::create_dir(&venv).await.unwrap();
+        fs::write(venv.join("pyvenv.cfg"), "home = /usr/bin")
+            .await
+            .unwrap();
+        let token1 = venv_token(&venv).await;
+
+        // Recreate with different content (different size and inode).
+        fs::remove_file(venv.join("pyvenv.cfg")).await.unwrap();
+        fs::write(venv.join("pyvenv.cfg"), "home = /usr/bin\nversion = 2")
+            .await
+            .unwrap();
+        let token2 = venv_token(&venv).await;
+
+        assert!(token1.is_some());
+        assert!(token2.is_some());
+        assert_ne!(token1, token2);
+    }
+
+    #[tokio::test]
+    async fn test_venv_token_missing_is_none() {
+        let temp = tempdir().unwrap();
+        let venv = temp.path().join(".venv");
+
+        assert!(venv_token(&venv).await.is_none());
     }
 }

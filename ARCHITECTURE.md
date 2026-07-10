@@ -206,9 +206,53 @@ Strict Venv Mode implements this philosophy.
 
 ### Cache Limitation (Important)
 
-When a document is already cached, its venv is not re-searched on request.
-This means creating `.venv` **after** opening a file will not take effect for that file
-until it is reopened (or the document cache is refreshed).
+Two distinct caches can go stale, and they fail differently:
+
+1. **Document venv cache** (`open_documents[uri].venv`): resolved at `didOpen`.
+   If no venv existed then (`venv: None`), it **is** re-searched on the next
+   URI-bearing request, so a late-created `.venv` is picked up without
+   reopening the file. A cached `Some(venv)` is trusted as long as the venv's
+   identity is unchanged.
+2. **Backend pool identity** (`pool[venv_path]`): keyed by path only. Without
+   identity tracking (below), a backend would keep serving after its `.venv`
+   was replaced or deleted — the "silently lying LSP" failure mode.
+
+## Venv Identity Tracking
+
+### Problem
+
+`uv sync` deletes and recreates `.venv`. The pool key (the venv *path*) is
+unchanged, so without an identity check the old backend — indexed against the
+old environment — keeps answering. Per the design principles, this is the
+worst possible failure mode: results look plausible and are wrong.
+
+### Identity Token
+
+Each backend captures a `VenvToken` at spawn: `dev`/`ino`/`mtime`/`size` of
+`.venv/pyvenv.cfg`. Recreation allocates a new inode; in-place edits change
+mtime/size.
+
+### Check Triggers and Outcomes
+
+Checks are debounced to once per `TYPEMUX_CC_VENV_CHECK_INTERVAL` seconds
+(default 5; `0` disables tracking). Triggers: `ensure_backend_in_pool`
+(all venv-checked request methods), `didOpen`/`didChange` forwarding, and a
+60s background sweep (shared with the TTL timer, armed even when TTL is
+disabled).
+
+| Observation | Behavior |
+|-------------|----------|
+| Token unchanged | Serve as usual |
+| Token mismatch (venv replaced) | Evict old backend (cancel pending, clear diagnostics, shutdown), notify client via `window/showMessage`, respawn with the new environment — exactly once per change |
+| `pyvenv.cfg` missing < grace (2 × interval) | Keep serving the old backend (transient `uv sync` window) |
+| `pyvenv.cfg` missing ≥ grace | Evict without respawn; reset affected documents' cached venv so the next request re-resolves it — usually the strict-mode ".venv not found" error |
+
+The background sweep evicts without respawning (the next request lazily
+respawns), so an idle stale backend is corrected within ~60s even if no
+request ever targets it again.
+
+Staleness eviction reuses the standard eviction path, so the session-id
+mechanism guarantees late messages from the evicted process are discarded.
 
 ## Fan-Out for URI-less Requests
 
@@ -431,6 +475,7 @@ Documents under project-a/ are skipped. Skipped documents get empty diagnostics 
 | `$/cancelRequest` handling | Cancel warmup-queued requests without forwarding |
 | Fan-out requests | `workspace/symbol` dispatched to all backends with merged, deduplicated results |
 | Strict venv mode | Return errors when no venv found |
+| Venv identity tracking | Detect replaced/removed `.venv` (pyvenv.cfg identity token) and restart/evict the backend |
 | Diagnostics cleanup | Clear stale diagnostics on backend eviction |
 
 ## Logging Configuration

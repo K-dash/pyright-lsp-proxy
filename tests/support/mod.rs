@@ -50,39 +50,48 @@ pub fn setup_test_workspace(config: &WorkspaceConfig) -> (TempDir, PathBuf) {
     std::fs::create_dir_all(root.join(".git/refs/heads")).unwrap();
     std::fs::create_dir_all(root.join(".git/objects")).unwrap();
 
-    let mock_backend_bin = env!("CARGO_BIN_EXE_mock-lsp-backend");
-
     for pkg in &config.packages {
         let pkg_dir = root.join(&pkg.name);
         std::fs::create_dir_all(&pkg_dir).unwrap();
 
         if pkg.has_venv {
-            let venv_dir = pkg_dir.join(".venv");
-            std::fs::create_dir_all(venv_dir.join("bin")).unwrap();
-            std::fs::write(venv_dir.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
-
-            // Write scenario file into the venv.
-            let scenario_json = serde_json::to_string_pretty(&pkg.scenario).unwrap();
-            std::fs::write(venv_dir.join("scenario.json"), &scenario_json).unwrap();
-
-            // Fake pyright-langserver that bridges to mock-lsp-backend.
-            let script = format!(
-                "#!/bin/sh\nexport MOCK_LSP_SCENARIO_FILE=\"$VIRTUAL_ENV/scenario.json\"\nexec \"{}\" \"$@\"\n",
-                mock_backend_bin
-            );
-            let script_path = venv_dir.join("bin/pyright-langserver");
-            std::fs::write(&script_path, &script).unwrap();
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
-                    .unwrap();
-            }
+            write_venv_fixture(&pkg_dir, &pkg.scenario);
         }
     }
 
     (temp, root)
+}
+
+/// Create (or recreate) `<pkg_dir>/.venv` with a `pyvenv.cfg`, a
+/// `scenario.json` for the mock backend, and a fake `pyright-langserver`
+/// shim that bridges to `mock-lsp-backend`.
+///
+/// Used both by `setup_test_workspace` (initial fixture) and by tests that
+/// simulate `uv sync` recreating `.venv` mid-run (venv identity tracking).
+pub fn write_venv_fixture(pkg_dir: &Path, scenario: &Value) {
+    let mock_backend_bin = env!("CARGO_BIN_EXE_mock-lsp-backend");
+
+    let venv_dir = pkg_dir.join(".venv");
+    std::fs::create_dir_all(venv_dir.join("bin")).unwrap();
+    std::fs::write(venv_dir.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+
+    // Write scenario file into the venv.
+    let scenario_json = serde_json::to_string_pretty(scenario).unwrap();
+    std::fs::write(venv_dir.join("scenario.json"), &scenario_json).unwrap();
+
+    // Fake pyright-langserver that bridges to mock-lsp-backend.
+    let script = format!(
+        "#!/bin/sh\nexport MOCK_LSP_SCENARIO_FILE=\"$VIRTUAL_ENV/scenario.json\"\nexec \"{}\" \"$@\"\n",
+        mock_backend_bin
+    );
+    let script_path = venv_dir.join("bin/pyright-langserver");
+    std::fs::write(&script_path, &script).unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }
 
 // ── ProxyUnderTest ──────────────────────────────────────────────────
@@ -101,7 +110,19 @@ pub struct ProxyUnderTest {
 
 impl ProxyUnderTest {
     /// Spawn the proxy binary with the given workspace as cwd.
+    #[allow(dead_code)] // Used by some but not all integration test binaries.
     pub fn spawn(temp_dir: TempDir, root: PathBuf, cwd: &Path) -> Self {
+        Self::spawn_with_env(temp_dir, root, cwd, &[])
+    }
+
+    /// Spawn the proxy binary with the given workspace as cwd and additional
+    /// environment variables (e.g. `TYPEMUX_CC_VENV_CHECK_INTERVAL`).
+    pub fn spawn_with_env(
+        temp_dir: TempDir,
+        root: PathBuf,
+        cwd: &Path,
+        envs: &[(&str, &str)],
+    ) -> Self {
         let proxy_bin = env!("CARGO_BIN_EXE_typemux-cc");
         let mut child = Command::new(proxy_bin)
             .current_dir(cwd)
@@ -111,6 +132,7 @@ impl ProxyUnderTest {
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")
+            .envs(envs.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

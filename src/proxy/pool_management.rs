@@ -4,6 +4,30 @@ use crate::framing::LspFrameWriter;
 use crate::message::{RpcId, RpcMessage};
 use crate::venv;
 use std::path::{Path, PathBuf};
+use tokio::time::Instant;
+
+/// Outcome of a pooled-backend venv identity check
+/// (`check_pooled_venv_staleness`). See ARCHITECTURE.md's
+/// "Venv Identity Tracking" section for the full design.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StaleOutcome {
+    /// Venv identity unchanged (or the check was skipped/debounced).
+    Fresh,
+    /// The venv was replaced; the old backend was evicted and a new one spawned.
+    Respawned,
+    /// The venv was removed (missing beyond grace); the old backend was
+    /// evicted with no respawn.
+    Removed,
+}
+
+/// Result of inspecting a pooled backend's current venv identity, computed
+/// with the pool borrow released so eviction/respawn can follow.
+enum StaleDecision {
+    Fresh,
+    StillMissing,
+    Mismatch,
+    Removed,
+}
 
 impl super::LspProxy {
     /// Ensure a backend for the given URI's venv is in the pool.
@@ -46,25 +70,205 @@ impl super::LspProxy {
             None => return Ok(None),
         };
 
-        // Already in pool?
+        // Already in pool? Verify its venv identity hasn't gone stale before reusing it.
         if self.state.pool.contains(&target_venv) {
-            return Ok(Some(target_venv));
+            return match self
+                .check_pooled_venv_staleness(&target_venv, client_writer)
+                .await?
+            {
+                // Respawned: the new backend is in the pool under the same
+                // key; the caller still forwards its request to it. Restoration
+                // did not replay this specific request.
+                StaleOutcome::Fresh | StaleOutcome::Respawned => Ok(Some(target_venv)),
+                // Removed: no backend left for this venv; caller falls back
+                // to strict-mode ".venv not found" handling.
+                StaleOutcome::Removed => Ok(None),
+            };
         }
 
-        // Need to create a new backend. Evict if full.
+        // Need to create a new backend.
+        self.spawn_and_insert_backend(&target_venv, client_writer)
+            .await?;
+
+        Ok(Some(target_venv))
+    }
+
+    /// Evict-if-full, spawn a new backend for `venv`, insert it into the pool,
+    /// and warn if its project root is gitignored. Shared by pool-miss
+    /// resolution and venv-replacement respawn.
+    async fn spawn_and_insert_backend(
+        &mut self,
+        venv: &Path,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+    ) -> Result<(), ProxyError> {
         if self.state.pool.is_full() {
             self.evict_lru_backend(client_writer).await?;
         }
 
-        // Create backend instance
-        let instance = self
-            .create_backend_instance(&target_venv, client_writer)
-            .await?;
-        self.state.pool.insert(target_venv.clone(), instance);
-        self.warn_if_project_root_ignored(&target_venv, client_writer)
-            .await;
+        let instance = self.create_backend_instance(venv, client_writer).await?;
+        self.state.pool.insert(venv.to_path_buf(), instance);
+        self.warn_if_project_root_ignored(venv, client_writer).await;
 
-        Ok(Some(target_venv))
+        Ok(())
+    }
+
+    /// Debounced check for whether a pooled backend's venv identity (derived
+    /// from `.venv/pyvenv.cfg` metadata) has changed since it was last
+    /// observed. Debounced to once per `venv_check_interval()`; disabled
+    /// entirely when the interval is `0`.
+    ///
+    /// - Token mismatch: the venv was replaced. Evicts the old backend
+    ///   (cancelling pending requests, clearing diagnostics, shutting down)
+    ///   and respawns a new one via the same path pool-miss resolution uses.
+    /// - `pyvenv.cfg` missing: served as-is until `2 * venv_check_interval()`
+    ///   (grace) elapses, then evicted with no respawn; affected open
+    ///   documents' cached venv is reset so the next request re-resolves it.
+    pub(crate) async fn check_pooled_venv_staleness(
+        &mut self,
+        venv: &Path,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+    ) -> Result<StaleOutcome, ProxyError> {
+        let interval = crate::backend_pool::venv_check_interval();
+        if interval.is_zero() {
+            return Ok(StaleOutcome::Fresh);
+        }
+
+        let venv_path = venv.to_path_buf();
+        let now = Instant::now();
+        let due = self
+            .state
+            .pool
+            .get(&venv_path)
+            .is_some_and(|inst| now.duration_since(inst.last_venv_check) >= interval);
+        if !due {
+            return Ok(StaleOutcome::Fresh);
+        }
+
+        // Stat before taking the pool borrow: `venv_token` is async and the
+        // borrow must not be held across an `.await`.
+        let current_token = venv::venv_token(venv).await;
+        let grace = interval * 2;
+
+        let decision = {
+            let Some(inst) = self.state.pool.get_mut(&venv_path) else {
+                // Backend disappeared mid-check (race with another eviction path).
+                return Ok(StaleOutcome::Fresh);
+            };
+            inst.last_venv_check = Instant::now();
+
+            if let Some(token) = current_token {
+                inst.venv_missing_since = None;
+                if inst.venv_token.is_some_and(|old| old != token) {
+                    StaleDecision::Mismatch
+                } else {
+                    // Either it matches, or this is the first successful
+                    // stat after a spawn-time capture race — adopt it.
+                    inst.venv_token = Some(token);
+                    StaleDecision::Fresh
+                }
+            } else {
+                let missing_since = *inst.venv_missing_since.get_or_insert(now);
+                if now.duration_since(missing_since) >= grace {
+                    StaleDecision::Removed
+                } else {
+                    StaleDecision::StillMissing
+                }
+            }
+        };
+
+        match decision {
+            StaleDecision::Fresh | StaleDecision::StillMissing => Ok(StaleOutcome::Fresh),
+            StaleDecision::Mismatch => {
+                self.evict_pooled_backend(&venv_path, client_writer).await?;
+                self.notify_venv_replaced(&venv_path, client_writer).await;
+                self.spawn_and_insert_backend(&venv_path, client_writer)
+                    .await?;
+                Ok(StaleOutcome::Respawned)
+            }
+            StaleDecision::Removed => {
+                // Clear diagnostics (filtered by `doc.venv == venv_path`)
+                // BEFORE resetting `doc.venv` below — ordering is load-bearing.
+                self.evict_pooled_backend(&venv_path, client_writer).await?;
+                self.reset_doc_venv_for(&venv_path);
+                Ok(StaleOutcome::Removed)
+            }
+        }
+    }
+
+    /// Remove and clean up the pooled backend for `venv_path`, if present.
+    async fn evict_pooled_backend(
+        &mut self,
+        venv_path: &PathBuf,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+    ) -> Result<(), ProxyError> {
+        if let Some(instance) = self.state.pool.remove(venv_path) {
+            let session = instance.session;
+            self.cleanup_evicted_backend(instance, venv_path, session, client_writer, true)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Reset the cached venv of all open documents pointing at `venv_path`
+    /// to `None`, so the next request re-resolves it via `find_venv`.
+    fn reset_doc_venv_for(&mut self, venv_path: &Path) {
+        for doc in self.state.open_documents.values_mut() {
+            if doc.venv.as_deref() == Some(venv_path) {
+                doc.venv = None;
+            }
+        }
+    }
+
+    /// TTL-sweep-adjacent staleness pass: evict (without respawning) any
+    /// pooled backend whose venv was replaced or has been missing beyond
+    /// grace. Log-only — no `window/showMessage`, no restoration. The next
+    /// request lazily respawns via `ensure_backend_in_pool`. Skipped when
+    /// venv identity tracking is disabled (`venv_check_interval() == 0`).
+    pub(crate) async fn sweep_stale_venvs(
+        &mut self,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+    ) -> Result<(), ProxyError> {
+        let interval = crate::backend_pool::venv_check_interval();
+        if interval.is_zero() {
+            return Ok(());
+        }
+        let grace = interval * 2;
+        let now = Instant::now();
+
+        for venv_path in self.state.pool.backends_keys() {
+            let current_token = venv::venv_token(&venv_path).await;
+
+            let should_evict = {
+                let Some(inst) = self.state.pool.get_mut(&venv_path) else {
+                    continue;
+                };
+                if let Some(token) = current_token {
+                    let mismatch = inst.venv_token.is_some_and(|old| old != token);
+                    inst.venv_missing_since = None;
+                    mismatch
+                } else {
+                    let missing_since = *inst.venv_missing_since.get_or_insert(now);
+                    now.duration_since(missing_since) >= grace
+                }
+            };
+
+            if !should_evict {
+                continue;
+            }
+
+            tracing::info!(
+                venv = %venv_path.display(),
+                reason = if current_token.is_some() { "replaced" } else { "removed" },
+                "Sweep: evicting stale pooled backend"
+            );
+
+            self.evict_pooled_backend(&venv_path, client_writer).await?;
+            if current_token.is_none() {
+                self.reset_doc_venv_for(&venv_path);
+            }
+        }
+
+        Ok(())
     }
 
     /// Evict the LRU backend from the pool

@@ -45,9 +45,11 @@ impl super::LspProxy {
                 Ok(init_response) => {
                     // Split and insert into pool
                     let session = self.state.pool.next_session_id();
+                    let venv_token = crate::venv::venv_token(&venv).await;
                     let parts = backend.into_split();
                     let tx = self.state.pool.msg_sender();
-                    let instance = BackendInstance::from_parts(parts, venv.clone(), session, tx);
+                    let instance =
+                        BackendInstance::from_parts(parts, venv.clone(), session, tx, venv_token);
                     self.state.pool.insert(venv.clone(), instance);
 
                     // Send initialize response to client

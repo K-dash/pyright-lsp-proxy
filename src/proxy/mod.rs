@@ -11,6 +11,7 @@ use crate::error::ProxyError;
 use crate::framing::{LspFrameReader, LspFrameWriter};
 use crate::state::ProxyState;
 use crate::venv;
+use pool_management::StaleOutcome;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{stdin, stdout};
@@ -115,10 +116,23 @@ impl LspProxy {
                         }
                         Some("textDocument/didChange") => {
                             self.handle_did_change(&msg)?;
-                            // Forward to appropriate backend
+                            // Forward to appropriate backend, after verifying
+                            // its venv identity hasn't gone stale.
                             if let Some(url) = Self::extract_text_document_uri(&msg) {
                                 if let Some(venv_path) = self.venv_for_uri(&url) {
-                                    self.forward_to_backend(&venv_path, &msg).await?;
+                                    match self
+                                        .check_pooled_venv_staleness(&venv_path, &mut client_writer)
+                                        .await?
+                                    {
+                                        StaleOutcome::Fresh => {
+                                            self.forward_to_backend(&venv_path, &msg).await?;
+                                        }
+                                        // Respawned: restoration already replayed the
+                                        // post-change cached text (handle_did_change
+                                        // updated the cache above). Removed:
+                                        // revival-preparation mode, nothing to forward to.
+                                        StaleOutcome::Respawned | StaleOutcome::Removed => {}
+                                    }
                                 }
                             }
                         }
@@ -152,9 +166,16 @@ impl LspProxy {
                     self.dispatch_backend_message(backend_msg, &mut client_writer).await?;
                 }
 
-                // TTL-based auto-eviction sweep
-                _ = ttl_interval.tick(), if self.backend_ttl.is_some() => {
-                    self.evict_expired_backends(&mut client_writer).await?;
+                // TTL-based auto-eviction and venv-identity staleness sweep.
+                // Always armed (not gated on backend_ttl) so the staleness
+                // sweep runs even when TTL eviction is disabled.
+                _ = ttl_interval.tick() => {
+                    if self.backend_ttl.is_some() {
+                        self.evict_expired_backends(&mut client_writer).await?;
+                    }
+                    if !crate::backend_pool::venv_check_interval().is_zero() {
+                        self.sweep_stale_venvs(&mut client_writer).await?;
+                    }
                 }
 
                 // Warmup timeout: fail-open transition for warming backends

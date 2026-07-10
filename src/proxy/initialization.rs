@@ -184,7 +184,10 @@ impl super::LspProxy {
         self.restore_documents_to_backend(&mut backend, venv, session, client_writer)
             .await?;
 
-        // 4. Split and create instance
+        // 4. Capture venv identity token (None if capture raced a rebuild)
+        let venv_token = crate::venv::venv_token(venv).await;
+
+        // 5. Split and create instance
         let parts = backend.into_split();
         let tx = self.state.pool.msg_sender();
         Ok(BackendInstance::from_parts(
@@ -192,6 +195,7 @@ impl super::LspProxy {
             venv.to_path_buf(),
             session,
             tx,
+            venv_token,
         ))
     }
 
