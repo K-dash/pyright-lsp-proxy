@@ -122,6 +122,11 @@ impl super::LspProxy {
             // to the new backend. Removed: cache-only revival mode, nothing
             // to forward to.
             StaleOutcome::Respawned | StaleOutcome::Removed => {}
+            // Respawn failure is contained (mirrors the pool-miss arm above).
+            StaleOutcome::RespawnFailed(e) => {
+                self.notify_backend_error(venv_path, &e, client_writer)
+                    .await;
+            }
         }
 
         Ok(())

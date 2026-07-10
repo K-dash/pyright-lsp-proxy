@@ -9,7 +9,7 @@ use tokio::time::Instant;
 /// Outcome of a pooled-backend venv identity check
 /// (`check_pooled_venv_staleness`). See ARCHITECTURE.md's
 /// "Venv Identity Tracking" section for the full design.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum StaleOutcome {
     /// Venv identity unchanged (or the check was skipped/debounced).
     Fresh,
@@ -18,6 +18,10 @@ pub(crate) enum StaleOutcome {
     /// The venv was removed (missing beyond grace); the old backend was
     /// evicted with no respawn.
     Removed,
+    /// The venv was replaced and the old backend evicted, but spawning the
+    /// replacement failed. The pool entry is gone, so the next request for
+    /// this venv retries via the pool-miss path.
+    RespawnFailed(ProxyError),
 }
 
 /// Result of inspecting a pooled backend's current venv identity, computed
@@ -83,6 +87,10 @@ impl super::LspProxy {
                 // Removed: no backend left for this venv; caller falls back
                 // to strict-mode ".venv not found" handling.
                 StaleOutcome::Removed => Ok(None),
+                // RespawnFailed: surface the creation error through the
+                // callers' existing containment (didOpen notifies, requests
+                // get a JSON-RPC error response).
+                StaleOutcome::RespawnFailed(e) => Err(e),
             };
         }
 
@@ -120,6 +128,8 @@ impl super::LspProxy {
     /// - Token mismatch: the venv was replaced. Evicts the old backend
     ///   (cancelling pending requests, clearing diagnostics, shutting down)
     ///   and respawns a new one via the same path pool-miss resolution uses.
+    ///   A failed respawn is contained as `StaleOutcome::RespawnFailed` —
+    ///   never propagated as a fatal error.
     /// - `pyvenv.cfg` missing: served as-is until `2 * venv_check_interval()`
     ///   (grace) elapses, then evicted with no respawn; affected open
     ///   documents' cached venv is reset so the next request re-resolves it.
@@ -181,9 +191,23 @@ impl super::LspProxy {
             StaleDecision::Mismatch => {
                 self.evict_pooled_backend(&venv_path, client_writer).await?;
                 self.notify_venv_replaced(&venv_path, client_writer).await;
-                self.spawn_and_insert_backend(&venv_path, client_writer)
-                    .await?;
-                Ok(StaleOutcome::Respawned)
+                // One venv's failed respawn must not take down the whole
+                // proxy: the old backend is already evicted, so return the
+                // error as an outcome and let the next request retry lazily.
+                match self
+                    .spawn_and_insert_backend(&venv_path, client_writer)
+                    .await
+                {
+                    Ok(()) => Ok(StaleOutcome::Respawned),
+                    Err(e) => {
+                        tracing::error!(
+                            venv = %venv_path.display(),
+                            error = ?e,
+                            "Respawn after venv replacement failed"
+                        );
+                        Ok(StaleOutcome::RespawnFailed(e))
+                    }
+                }
             }
             StaleDecision::Removed => {
                 // Clear diagnostics (filtered by `doc.venv == venv_path`)
