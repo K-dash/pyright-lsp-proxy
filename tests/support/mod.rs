@@ -297,14 +297,13 @@ impl ProxyUnderTest {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                panic!(
-                    "wait_for_notification: timed out after {timeout_ms}ms waiting for {method:?}"
-                );
-            }
+            assert!(
+                !remaining.is_zero(),
+                "wait_for_notification: timed out after {timeout_ms}ms waiting for {method:?}"
+            );
             match tokio::time::timeout(remaining, self.reader.read_message()).await {
                 Ok(Ok(msg)) if msg.method.as_deref() == Some(method) => return msg,
-                Ok(Ok(_)) => continue, // Not the notification we're waiting for.
+                Ok(Ok(_)) => {} // Not the notification we're waiting for.
                 Ok(Err(e)) => {
                     let stderr = self.dump_stderr().await;
                     panic!("wait_for_notification: read error: {e}\n--- stderr ---\n{stderr}");

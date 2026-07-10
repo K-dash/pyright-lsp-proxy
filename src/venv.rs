@@ -31,9 +31,9 @@ pub async fn get_git_toplevel(working_dir: &Path) -> Result<Option<PathBuf>, Ven
     }
 }
 
-/// Execute git check-ignore -q <path> and check whether it is gitignored from cwd
+/// Execute `git check-ignore -q <path>` and check whether it is gitignored from cwd
 ///
-/// Clears GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE so the check always resolves
+/// Clears `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE` so the check always resolves
 /// against `cwd` as requested, instead of silently deferring to an ambient
 /// repository override (e.g. when the proxy is launched from inside a
 /// git hook environment).
