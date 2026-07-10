@@ -20,6 +20,14 @@ binary_version() {
   "$1" --version 2>/dev/null | awk '{print $2}'
 }
 
+file_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
 # Skip only when the existing binary matches the plugin version. A bare
 # existence check is not enough: a gitignored binary left in the
 # marketplace clone gets copied into every new plugin version's cache
@@ -89,6 +97,20 @@ if ! curl -fsSL -o "${TMP_PATH}" "${DOWNLOAD_URL}"; then
   fi
   echo "[typemux-cc] ERROR: Failed to download binary from ${DOWNLOAD_URL}" >&2
   echo "[typemux-cc] Please check https://github.com/${REPO}/releases for available binaries" >&2
+  exit 1
+fi
+
+# Verify integrity against the release's checksum asset BEFORE executing
+# the downloaded binary. No checksum, no install.
+EXPECTED_SHA=$(curl -fsSL "${DOWNLOAD_URL}.sha256" 2>/dev/null | awk '{print $1}' || true)
+ACTUAL_SHA=$(file_sha256 "${TMP_PATH}")
+if [ -z "${EXPECTED_SHA}" ] || [ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]; then
+  rm -f "${TMP_PATH}"
+  if [ -f "${BINARY_PATH}" ]; then
+    echo "[typemux-cc] WARNING: checksum verification failed (expected ${EXPECTED_SHA:-unavailable}, got ${ACTUAL_SHA}); keeping existing binary" >&2
+    exit 0
+  fi
+  echo "[typemux-cc] ERROR: checksum verification failed for ${DOWNLOAD_URL} (expected ${EXPECTED_SHA:-unavailable}, got ${ACTUAL_SHA})" >&2
   exit 1
 fi
 

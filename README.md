@@ -155,6 +155,15 @@ After installation, verify in `~/.claude/settings.json`:
 /plugin marketplace remove typemux-cc-marketplace
 ```
 
+### How the Installer Verifies Binaries
+
+The plugin's SessionStart hook downloads the prebuilt binary for your platform from this repository's GitHub Releases over HTTPS, pinned to the plugin's own version tag (never "latest"). Before the downloaded binary is executed or activated, the installer:
+
+1. Verifies its SHA256 checksum against the `.sha256` asset published alongside it by the [release workflow](.github/workflows/release.yml)
+2. Confirms the binary reports the expected version
+
+On any failure it keeps the previously working binary and prints an explicit warning, or fails loudly if no binary exists yet. Binaries are built from the tagged commit by GitHub Actions — nothing is built or fetched from anywhere else.
+
 ### Method B: Local Build (For Developers)
 
 > Requires Rust 1.75 or later.
