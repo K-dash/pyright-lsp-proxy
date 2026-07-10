@@ -244,6 +244,7 @@ disabled).
 |-------------|----------|
 | Token unchanged | Serve as usual |
 | Token mismatch (venv replaced) | Evict old backend (cancel pending, clear diagnostics, shutdown), notify client via `window/showMessage`, respawn with the new environment — exactly once per change |
+| Token mismatch, respawn fails (e.g. broken interpreter mid-`uv sync`) | Contained, never fatal: notify the client via `window/showMessage`, keep serving other venvs; the next request for this venv retries backend creation via the pool-miss path |
 | `pyvenv.cfg` missing < grace (2 × interval) | Keep serving the old backend (transient `uv sync` window) |
 | `pyvenv.cfg` missing ≥ grace | Evict without respawn; reset affected documents' cached venv so the next request re-resolves it — usually the strict-mode ".venv not found" error |
 
@@ -489,7 +490,7 @@ RUST_LOG=debug ./target/release/typemux-cc
 
 ### Method 2: Config File (Persistent)
 
-When running as a Claude Code plugin, the wrapper script loads config from:
+typemux-cc reads config from:
 
 ```bash
 ~/.config/typemux-cc/config

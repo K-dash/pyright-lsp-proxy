@@ -94,6 +94,31 @@ pub fn write_venv_fixture(pkg_dir: &Path, scenario: &Value) {
     }
 }
 
+/// Create (or recreate) `<pkg_dir>/.venv` whose fake `pyright-langserver`
+/// exits immediately, so backend creation fails deterministically at the
+/// initialize handshake. Used to exercise respawn-failure containment.
+#[allow(dead_code)] // Used by some but not all integration test binaries.
+pub fn write_broken_venv_fixture(pkg_dir: &Path) {
+    let venv_dir = pkg_dir.join(".venv");
+    std::fs::create_dir_all(venv_dir.join("bin")).unwrap();
+    // Different content from `write_venv_fixture`'s pyvenv.cfg so the
+    // identity token differs even under an inode/mtime collision.
+    std::fs::write(
+        venv_dir.join("pyvenv.cfg"),
+        "home = /usr/bin\nbroken = marker\n",
+    )
+    .unwrap();
+
+    let script_path = venv_dir.join("bin/pyright-langserver");
+    std::fs::write(&script_path, "#!/bin/sh\nexit 1\n").unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
 // ── ProxyUnderTest ──────────────────────────────────────────────────
 
 /// A running proxy process with LSP framing readers/writers attached.
@@ -192,6 +217,19 @@ impl ProxyUnderTest {
                     "version": 1,
                     "text": text
                 }
+            })),
+        );
+        self.write(&msg).await;
+    }
+
+    /// Send `textDocument/didChange` notification (full-sync single change).
+    #[allow(dead_code)] // Used by some but not all integration test binaries.
+    pub async fn did_change(&mut self, uri: &str, version: i64, text: &str) {
+        let msg = RpcMessage::notification(
+            "textDocument/didChange",
+            Some(serde_json::json!({
+                "textDocument": { "uri": uri, "version": version },
+                "contentChanges": [ { "text": text } ]
             })),
         );
         self.write(&msg).await;

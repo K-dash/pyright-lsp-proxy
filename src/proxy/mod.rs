@@ -132,6 +132,11 @@ impl LspProxy {
                                         // updated the cache above). Removed:
                                         // revival-preparation mode, nothing to forward to.
                                         StaleOutcome::Respawned | StaleOutcome::Removed => {}
+                                        // Respawn failure is contained: notify the
+                                        // client; the next request retries lazily.
+                                        StaleOutcome::RespawnFailed(e) => {
+                                            self.notify_backend_error(&venv_path, &e, &mut client_writer).await;
+                                        }
                                     }
                                 }
                             }
