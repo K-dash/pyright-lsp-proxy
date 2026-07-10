@@ -50,10 +50,15 @@ jobs:
           cp target/${{ matrix.target }}/release/typemux-cc ${{ matrix.binary_name }}
           chmod +x ${{ matrix.binary_name }}
 
+      - name: Generate checksum
+        run: shasum -a 256 ${{ matrix.binary_name }} > ${{ matrix.binary_name }}.sha256
+
       - name: Upload to release
         uses: softprops/action-gh-release@v3
         with:
-          files: ${{ matrix.binary_name }}
+          files: |
+            ${{ matrix.binary_name }}
+            ${{ matrix.binary_name }}.sha256
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
