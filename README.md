@@ -32,6 +32,8 @@ This is especially painful with **git worktrees**, now common in AI-assisted dev
 
 typemux-cc is a Python LSP proxy that fixes this — `.venv` changes are reflected **within your running session**, no restarts required.
 
+This is a recurring, unresolved pain in the Claude Code ecosystem: worktree/venv breakage keeps being reported upstream — [anthropics/claude-code#31391](https://github.com/anthropics/claude-code/issues/31391) (closed as *not planned*), [astral-sh/claude-code-plugins#18](https://github.com/astral-sh/claude-code-plugins/issues/18) (open), [anthropics/claude-code#58365](https://github.com/anthropics/claude-code/issues/58365) — while the official pyright plugin remains a single `pyright-langserver` spawn with no environment handling. typemux-cc exists to solve the environment-lifecycle side of this problem for Python.
+
 ## Quickstart
 
 ```bash
