@@ -5,14 +5,35 @@ set -e
 PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT}"
 BIN_DIR="${PLUGIN_ROOT}/bin"
 BINARY_PATH="${BIN_DIR}/typemux-cc"
+REPO="K-dash/typemux-cc"
 
-# Skip if binary already exists
-if [ -f "${BINARY_PATH}" ]; then
-  echo "[typemux-cc] Binary already installed at ${BINARY_PATH}"
-  exit 0
+# The expected version comes from the plugin manifest, so the installed
+# binary always matches the plugin version (never whatever "latest" is).
+EXPECTED_VERSION=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+  "${PLUGIN_ROOT}/.claude-plugin/plugin.json" | head -1)
+if [ -z "${EXPECTED_VERSION}" ]; then
+  echo "[typemux-cc] ERROR: cannot read version from ${PLUGIN_ROOT}/.claude-plugin/plugin.json" >&2
+  exit 1
 fi
 
-echo "[typemux-cc] Installing binary..."
+binary_version() {
+  "$1" --version 2>/dev/null | awk '{print $2}'
+}
+
+# Skip only when the existing binary matches the plugin version. A bare
+# existence check is not enough: a gitignored binary left in the
+# marketplace clone gets copied into every new plugin version's cache
+# directory and would shadow newer releases forever.
+if [ -f "${BINARY_PATH}" ]; then
+  CURRENT_VERSION=$(binary_version "${BINARY_PATH}" || true)
+  if [ "${CURRENT_VERSION}" = "${EXPECTED_VERSION}" ]; then
+    echo "[typemux-cc] Binary ${EXPECTED_VERSION} already installed at ${BINARY_PATH}"
+    exit 0
+  fi
+  echo "[typemux-cc] Installed binary is ${CURRENT_VERSION:-unknown}, expected ${EXPECTED_VERSION} — reinstalling"
+fi
+
+echo "[typemux-cc] Installing binary ${EXPECTED_VERSION}..."
 
 # Create bin directory
 mkdir -p "${BIN_DIR}"
@@ -50,39 +71,46 @@ case "$OS" in
 esac
 
 echo "[typemux-cc] Detected platform: $OS $ARCH"
-echo "[typemux-cc] Binary to download: $BINARY_NAME"
 
-# Get latest version URL from GitHub Release
-REPO="K-dash/typemux-cc"
-LATEST_RELEASE=$(curl -s "https://api.github.com/repos/${REPO}/releases/latest")
-DOWNLOAD_URL=$(echo "$LATEST_RELEASE" | grep "browser_download_url.*${BINARY_NAME}" | cut -d '"' -f 4)
+# Download the asset for the plugin's own version tag (no "latest" API
+# call: avoids GitHub API rate limits and version skew).
+DOWNLOAD_URL="https://github.com/${REPO}/releases/download/v${EXPECTED_VERSION}/${BINARY_NAME}"
+echo "[typemux-cc] Downloading from: ${DOWNLOAD_URL}"
 
-if [ -z "$DOWNLOAD_URL" ]; then
-  echo "[typemux-cc] ERROR: Failed to find binary for ${BINARY_NAME}" >&2
+# Download to a temp path and verify before replacing the binary, keeping
+# a working (if outdated) binary usable when the download fails. The
+# degradation is explicit: a WARNING is always printed.
+TMP_PATH="${BINARY_PATH}.download"
+if ! curl -fsSL -o "${TMP_PATH}" "${DOWNLOAD_URL}"; then
+  rm -f "${TMP_PATH}"
+  if [ -f "${BINARY_PATH}" ]; then
+    echo "[typemux-cc] WARNING: download failed; keeping existing binary ($(binary_version "${BINARY_PATH}" || echo unknown))" >&2
+    exit 0
+  fi
+  echo "[typemux-cc] ERROR: Failed to download binary from ${DOWNLOAD_URL}" >&2
   echo "[typemux-cc] Please check https://github.com/${REPO}/releases for available binaries" >&2
   exit 1
 fi
 
-echo "[typemux-cc] Downloading from: $DOWNLOAD_URL"
+chmod +x "${TMP_PATH}"
 
-# Download and grant execute permission
-if ! curl -L -o "${BINARY_PATH}" "$DOWNLOAD_URL"; then
-  echo "[typemux-cc] ERROR: Failed to download binary" >&2
+DOWNLOADED_VERSION=$(binary_version "${TMP_PATH}" || true)
+if [ "${DOWNLOADED_VERSION}" != "${EXPECTED_VERSION}" ]; then
+  rm -f "${TMP_PATH}"
+  if [ -f "${BINARY_PATH}" ]; then
+    echo "[typemux-cc] WARNING: downloaded binary reports ${DOWNLOADED_VERSION:-unknown}, expected ${EXPECTED_VERSION}; keeping existing binary" >&2
+    exit 0
+  fi
+  echo "[typemux-cc] ERROR: downloaded binary reports ${DOWNLOADED_VERSION:-unknown}, expected ${EXPECTED_VERSION}" >&2
   exit 1
 fi
 
-chmod +x "${BINARY_PATH}"
+mv "${TMP_PATH}" "${BINARY_PATH}"
 
-# Copy wrapper script
-WRAPPER_SRC="${PLUGIN_ROOT}/bin/typemux-cc-wrapper.sh"
-WRAPPER_DST="${BIN_DIR}/typemux-cc-wrapper.sh"
-
-if [ -f "${WRAPPER_SRC}" ]; then
-  cp "${WRAPPER_SRC}" "${WRAPPER_DST}"
-  chmod +x "${WRAPPER_DST}"
-  echo "[typemux-cc] Wrapper script installed at ${WRAPPER_DST}"
+# The wrapper script ships with the plugin (tracked in bin/); just make
+# sure it is executable.
+if [ -f "${BIN_DIR}/typemux-cc-wrapper.sh" ]; then
+  chmod +x "${BIN_DIR}/typemux-cc-wrapper.sh"
 fi
 
-echo "[typemux-cc] Successfully installed to ${BINARY_PATH}"
-echo "[typemux-cc] Version:"
-"${BINARY_PATH}" --version || true
+echo "[typemux-cc] Successfully installed ${EXPECTED_VERSION} to ${BINARY_PATH}"
