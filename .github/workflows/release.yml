@@ -25,6 +25,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
+      - name: Check version consistency & release tag
+        run: ./scripts/check-versions.sh --release "$GITHUB_REF_NAME"
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
