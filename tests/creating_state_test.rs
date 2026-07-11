@@ -1,7 +1,7 @@
 mod support;
 
 use support::{PackageConfig, ProxyUnderTest, WorkspaceConfig};
-use typemux_cc::message::RpcId;
+use typemux_cc::message::{RpcId, RpcMessage};
 
 /// Mirrors `MAX_CREATING_QUEUE_LEN` in `src/backend_pool.rs`. Not exported
 /// from the lib crate (the E2E harness only links `framing`/`message` and
@@ -1786,6 +1786,575 @@ async fn didclose_overflow_prevents_ghost_replay_on_respawn_e2e() {
         replaced_notice,
         "expected a window/showMessage about the replaced venv, got: {notifications:?}"
     );
+
+    let shutdown_resp = proxy.shutdown_and_exit().await;
+    assert!(
+        shutdown_resp.error.is_none(),
+        "shutdown should not return an error"
+    );
+}
+
+/// Text length used to force OS pipe backpressure for the two tests below:
+/// comfortably larger than any platform's default pipe buffer (16KB-1MB
+/// range), so a restoration `didOpen` carrying this much text can't have its
+/// `write_message` complete until the mock has actively drained most of it.
+const BACKPRESSURE_TEXT_LEN: usize = 1_000_000;
+
+/// E2E (#134 AC1): a server-initiated request (`workspace/configuration`)
+/// emitted during the Creating window — in reaction to the restoration
+/// `didOpen`, exactly like real pyright 1.1.407's `workspace/configuration`
+/// burst right after `initialized` — is queued (not dropped) and forwarded
+/// to the client once creation completes, with a rewritten (proxy-assigned)
+/// id. The client's response then routes back to the now-pooled backend
+/// through the ordinary `pending_backend_requests` machinery
+/// (`client_dispatch::dispatch_client_response`) — proven by a synchronizing
+/// `window/logMessage` marker the mock only emits after successfully
+/// matching a `"<response>"` step: if the response were lost, malformed, or
+/// misrouted, the mock's step sequence would desync and crash instead of
+/// reaching the marker, which `wait_for_notification` would then time out
+/// waiting for.
+///
+/// Two large (`BACKPRESSURE_TEXT_LEN`) documents are restored: whichever the
+/// mock reads first triggers the request, and while the creation task is
+/// then busy writing the SECOND large document (backpressure — see
+/// `write_restored_documents`), the venv is provably still `Creating`
+/// (`creation_tx.send()` cannot have run yet), so the request is
+/// deterministically dispatched via `dispatch_creating_backend_message`, not
+/// racing the outcome like a single small document would (verified
+/// empirically not to reliably land in this window — the same reason
+/// `restoration_diagnostics_reach_client_during_creating_e2e` uses a burst
+/// instead of one notification). Both documents are opened before `.venv`
+/// exists (`should_restore_document`'s `doc_venv.is_none()` clause) so both
+/// land in the SAME creation's restoration snapshot — `open_documents` is a
+/// `HashMap`, so which one the creation task writes first isn't otherwise
+/// controllable, hence both are large.
+#[tokio::test]
+// `file_a`/`file_b` (and their `_uri` variants) are deliberately parallel
+// names for the two test fixtures this scenario exercises.
+#[allow(clippy::similar_names)]
+async fn workspace_configuration_during_creating_is_answered_e2e() {
+    let scenario = serde_json::json!({
+        "on_startup": [],
+        "steps": [
+            {
+                "expect": { "method": "initialize" },
+                "actions": [{ "type": "respond", "body": { "capabilities": { "hoverProvider": true } } }]
+            },
+            { "expect": { "method": "initialized" }, "actions": [] },
+            {
+                "expect": { "method": "textDocument/didOpen" },
+                "actions": [
+                    { "type": "request", "id": 9, "method": "workspace/configuration", "params": { "items": [{ "section": "python" }] } }
+                ]
+            },
+            { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
+            {
+                "expect": { "method": "<response>" },
+                "actions": [
+                    { "type": "notify", "method": "window/logMessage", "params": { "type": 3, "message": "config response received" } }
+                ]
+            },
+            {
+                "expect": { "method": "textDocument/hover" },
+                "actions": [{ "type": "respond", "body": { "contents": { "kind": "plaintext", "value": "hover after config" } } }]
+            },
+            {
+                "expect": { "method": "shutdown" },
+                "actions": [{ "type": "respond", "body": null }]
+            }
+        ]
+    });
+
+    let config = WorkspaceConfig {
+        packages: vec![PackageConfig {
+            name: "pkg".to_string(),
+            scenario: scenario.clone(),
+            has_venv: false,
+        }],
+    };
+
+    let (temp_dir, root) = support::setup_test_workspace(&config);
+    let pkg_dir = root.join("pkg");
+    let mut proxy = ProxyUnderTest::spawn(temp_dir, root.clone(), &root);
+
+    let root_uri = support::path_to_uri(&root);
+    let init_resp = proxy.initialize(&root_uri).await;
+    assert!(
+        init_resp.error.is_none(),
+        "initialize should not return an error"
+    );
+    proxy.send_initialized().await;
+
+    let large_text = "x".repeat(BACKPRESSURE_TEXT_LEN);
+
+    let file_a = pkg_dir.join("a.py");
+    std::fs::write(&file_a, "a = 1\n").unwrap();
+    let file_a_uri = support::path_to_uri(&file_a);
+    let file_b = pkg_dir.join("b.py");
+    std::fs::write(&file_b, "b = 1\n").unwrap();
+    let file_b_uri = support::path_to_uri(&file_b);
+
+    // No `.venv` yet: both cache with `venv: None`, neither triggers creation.
+    proxy.did_open(&file_a_uri, &large_text).await;
+    proxy.did_open(&file_b_uri, &large_text).await;
+
+    // Synchronizing round-trip: `did_open` is a fire-and-forget notification,
+    // so awaiting its write only proves the bytes left the harness, not that
+    // the proxy has dispatched (parsed, cached) either 1MB message yet. A
+    // hover here forces a full round trip through the same FIFO
+    // `client_msg_rx`, guaranteeing both prior didOpens are fully processed
+    // (and hence cached with `venv: None`) before `.venv` is written below —
+    // otherwise `write_venv_fixture` can race ahead of the harness's own
+    // writes and get observed by `find_venv` on the SECOND didOpen already,
+    // starting creation from the wrong place with a 1-document snapshot.
+    let presync = proxy
+        .request(
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": &file_a_uri },
+                "position": { "line": 0, "character": 0 }
+            }),
+        )
+        .await;
+    assert!(
+        presync.error.is_some(),
+        "hover before .venv exists should error (no backend yet)"
+    );
+
+    // `.venv` now exists.
+    support::write_venv_fixture(&pkg_dir, &scenario);
+
+    // Re-open a.py: `find_venv` now succeeds, starting creation. Its
+    // restoration snapshot captures a.py (freshly resolved) AND b.py (still
+    // cached with `venv: None`, matched via `should_restore_document`'s
+    // second clause) — both large.
+    proxy.did_open(&file_a_uri, &large_text).await;
+
+    let config_req = proxy.read_next().await;
+    assert_eq!(
+        config_req.method.as_deref(),
+        Some("workspace/configuration"),
+        "expected the backend's workspace/configuration request, got: {config_req:?}"
+    );
+    assert!(
+        matches!(&config_req.id, Some(RpcId::Number(n)) if *n < 0),
+        "server-initiated request must arrive with a proxy-assigned (negative) id, got: {:?}",
+        config_req.id
+    );
+    assert_ne!(
+        config_req.id,
+        Some(RpcId::Number(9)),
+        "the backend's own id must never reach the client directly"
+    );
+
+    proxy
+        .respond_to_backend_request(&config_req, serde_json::json!([{ "tabSize": 4 }]))
+        .await;
+
+    // Only arrives if the mock's `"<response>"` step actually matched the
+    // routed-back response — proves the backend received it.
+    let marker = proxy.wait_for_notification("window/logMessage", 5000).await;
+    assert_eq!(
+        marker.params.as_ref().unwrap()["message"],
+        "config response received"
+    );
+
+    let hover = proxy
+        .request(
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": &file_a_uri },
+                "position": { "line": 0, "character": 0 }
+            }),
+        )
+        .await;
+    assert!(hover.error.is_none(), "hover failed: {:?}", hover.error);
+    assert_eq!(
+        hover.result.as_ref().unwrap()["contents"]["value"],
+        "hover after config"
+    );
+
+    let shutdown_resp = proxy.shutdown_and_exit().await;
+    assert!(
+        shutdown_resp.error.is_none(),
+        "shutdown should not return an error"
+    );
+}
+
+/// E2E (#134 AC2): a server-initiated request queued during Creating must
+/// not leak into `pending_backend_requests` when that creation FAILS.
+/// `pending_backend_requests` registration only ever happens at forward
+/// time, inside the SUCCESS arm (`handle_creation_outcome`) — the failure
+/// arm never calls it, so there is nothing to leak by construction; that
+/// structural guarantee is what actually rules out a leak, not anything
+/// this test observes directly (a leaked entry, being keyed by its own
+/// proxy id in an unrelated map, wouldn't block or corrupt an unrelated
+/// request either way). What this test DOES show observably: no response
+/// for the dropped request ever reaches the client, and the proxy keeps
+/// working normally afterward (a subsequent, unrelated request completes) —
+/// i.e. the failure path doesn't crash or wedge the event loop.
+///
+/// Deterministic failure (unlike `dead_backend_during_creation_does_not_pool_as_zombie_e2e`,
+/// which tolerates a race between two failure paths): two large
+/// (`BACKPRESSURE_TEXT_LEN`) documents are restored. The mock reacts to the
+/// FIRST one it reads with `[request, crash]`; backpressure guarantees it
+/// has fully read, reacted, and exited before the creation task's write of
+/// the SECOND document is even attempted, so that write hits a closed pipe
+/// and fails. `write_restored_documents` returns `Err` directly —
+/// `handle_creation_outcome` takes the failure arm without ever calling
+/// `child.try_wait()`, so the zombie-insertion race this test's sibling
+/// tolerates cannot happen here: the success arm (which would forward
+/// `server_requests` to the client) never runs.
+#[tokio::test]
+// `file_a`/`file_b` (and their `_uri` variants) are deliberately parallel
+// names for the two test fixtures this scenario exercises.
+#[allow(clippy::similar_names)]
+async fn queued_server_request_dropped_on_creation_failure_e2e() {
+    let scenario_dying = serde_json::json!({
+        "on_startup": [],
+        "steps": [
+            {
+                "expect": { "method": "initialize" },
+                "actions": [{ "type": "respond", "body": { "capabilities": { "hoverProvider": true } } }]
+            },
+            { "expect": { "method": "initialized" }, "actions": [] },
+            {
+                "expect": { "method": "textDocument/didOpen" },
+                "actions": [
+                    { "type": "request", "id": 1, "method": "workspace/configuration", "params": { "items": [{ "section": "python" }] } },
+                    { "type": "sleep_ms", "ms": 200 },
+                    { "type": "crash" }
+                ]
+            }
+        ]
+    });
+
+    let scenario_good = serde_json::json!({
+        "on_startup": [],
+        "steps": [
+            {
+                "expect": { "method": "initialize" },
+                "actions": [{ "type": "respond", "body": { "capabilities": { "hoverProvider": true } } }]
+            },
+            { "expect": { "method": "initialized" }, "actions": [] },
+            { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
+            {
+                "expect": { "method": "textDocument/hover" },
+                "actions": [{ "type": "respond", "body": { "contents": { "kind": "plaintext", "value": "hover good" } } }]
+            },
+            {
+                "expect": { "method": "shutdown" },
+                "actions": [{ "type": "respond", "body": null }]
+            }
+        ]
+    });
+
+    let config = WorkspaceConfig {
+        packages: vec![
+            PackageConfig {
+                name: "dying".to_string(),
+                scenario: scenario_dying.clone(),
+                has_venv: false,
+            },
+            PackageConfig {
+                name: "good".to_string(),
+                scenario: scenario_good,
+                has_venv: true,
+            },
+        ],
+    };
+
+    let (temp_dir, root) = support::setup_test_workspace(&config);
+    let dying_dir = root.join("dying");
+    let mut proxy = ProxyUnderTest::spawn(temp_dir, root.clone(), &root);
+
+    let root_uri = support::path_to_uri(&root);
+    let init_resp = proxy.initialize(&root_uri).await;
+    assert!(
+        init_resp.error.is_none(),
+        "initialize should not return an error"
+    );
+    proxy.send_initialized().await;
+
+    let large_text = "x".repeat(BACKPRESSURE_TEXT_LEN);
+
+    let file_a = dying_dir.join("a.py");
+    std::fs::write(&file_a, "a = 1\n").unwrap();
+    let file_a_uri = support::path_to_uri(&file_a);
+    let file_b = dying_dir.join("b.py");
+    std::fs::write(&file_b, "b = 1\n").unwrap();
+    let file_b_uri = support::path_to_uri(&file_b);
+
+    // No `.venv` yet: both cache with `venv: None`, neither triggers creation.
+    proxy.did_open(&file_a_uri, &large_text).await;
+    proxy.did_open(&file_b_uri, &large_text).await;
+
+    // Synchronizing round-trip — see the sibling AC1 test's identical step
+    // for why this is required before writing `.venv` below (both didOpens
+    // must be fully dispatched first, not just written to the harness's own
+    // pipe).
+    let presync = proxy
+        .request(
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": &file_a_uri },
+                "position": { "line": 0, "character": 0 }
+            }),
+        )
+        .await;
+    assert!(
+        presync.error.is_some(),
+        "hover before .venv exists should error (no backend yet)"
+    );
+
+    // `.venv` now exists (the dying scenario).
+    support::write_venv_fixture(&dying_dir, &scenario_dying);
+
+    // Re-open a.py: starts creation. Restoration snapshot captures both
+    // large documents — see this test's doc comment for why the write of
+    // whichever one goes second is guaranteed to fail.
+    proxy.did_open(&file_a_uri, &large_text).await;
+
+    // The dying venv's creation failure is reported via a dedup'd
+    // window/showMessage (#26/#92 containment) — synchronizing round-trip:
+    // by the time this arrives, `handle_creation_outcome` has already run
+    // for the dying venv, so any leaked `pending_backend_requests` entry
+    // would already exist. `_collecting` (not `wait_for_notification`,
+    // which silently discards non-matching messages): the dropped
+    // workspace/configuration request, if wrongly forwarded, would likely
+    // arrive BEFORE this failure notification — a plain discard-based wait
+    // would eat it before the check below ever saw it.
+    let (failure, before_failure) = proxy
+        .wait_for_notification_collecting("window/showMessage", 5000)
+        .await;
+    let failure_msg = failure.params.as_ref().unwrap()["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        failure_msg.contains("Failed to start LSP backend"),
+        "expected a backend-start failure message, got: {failure_msg}"
+    );
+    assert!(
+        before_failure.is_empty(),
+        "no message should have arrived before the failure notification, got: {before_failure:?}"
+    );
+
+    // No response for the dropped workspace/configuration request ever
+    // reaches the client: give it a bounded window to (wrongly) show up.
+    let stray = proxy.drain_notifications(300).await;
+    assert!(
+        stray.is_empty(),
+        "no message should have arrived for the dropped server request, got: {stray:?}"
+    );
+
+    // A subsequent, unrelated request (different venv) must complete
+    // normally — shows the failure path didn't crash or wedge the proxy.
+    // (Not itself proof of no `pending_backend_requests` leak: a leaked
+    // entry there wouldn't affect an unrelated venv's request either way —
+    // the no-leak guarantee is structural, see this test's doc comment.)
+    let file_good = root.join("good/main.py");
+    std::fs::write(&file_good, "g = 1\n").unwrap();
+    let file_good_uri = support::path_to_uri(&file_good);
+    proxy.did_open(&file_good_uri, "g = 1\n").await;
+
+    let hover_good = proxy
+        .request(
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": &file_good_uri },
+                "position": { "line": 0, "character": 0 }
+            }),
+        )
+        .await;
+    assert!(
+        hover_good.error.is_none(),
+        "hover(good) failed: {:?}",
+        hover_good.error
+    );
+    assert_eq!(
+        hover_good.result.as_ref().unwrap()["contents"]["value"],
+        "hover good"
+    );
+
+    let shutdown_resp = proxy.shutdown_and_exit().await;
+    assert!(
+        shutdown_resp.error.is_none(),
+        "shutdown should not return an error"
+    );
+}
+
+/// E2E (#134 external review follow-up): a `window/workDoneProgress/create`
+/// request emitted during the Creating window must stay dropped — the #104
+/// carve-out, unchanged — NOT queued and forwarded like #134's generic
+/// server-initiated requests are.
+///
+/// Why: `$/progress` notifications for the same token are forwarded to the
+/// client LIVE, on the spot, during Creating (the existing #104/#130
+/// notification path, the arm right above the `create` handling in
+/// `dispatch_creating_backend_message`). If `create` were queued instead
+/// (like #134's generic requests), it would only reach the client after
+/// `pool.insert` on success — arbitrarily later than the `$/progress`
+/// stream it's supposed to introduce. A backend that sends
+/// create→begin→end during this window without waiting for the create ack
+/// (pyright 1.1.407 doesn't — #104's capture) would then produce
+/// client-visible order begin→end→create: a work-done-progress lifecycle
+/// violation even though every token value still matches. The complete fix
+/// (queue the create AND every subsequent same-token `$/progress` together,
+/// replayed in order once Ready) would collide with #93's requirement that
+/// notifications drain live during Creating, so it's out of scope — this
+/// test only proves the narrower, already-shipped mitigation: never invert
+/// the order by queuing the create alone.
+///
+/// Two large (`BACKPRESSURE_TEXT_LEN`) documents are restored, same
+/// technique as the sibling tests above: the create→begin→report→end
+/// burst reacts to the FIRST restored document, while the creation task is
+/// then provably still blocked writing the SECOND large document — so the
+/// burst is deterministically dispatched via `dispatch_creating_backend_message`
+/// while genuinely `Creating`, not racing the outcome.
+///
+/// Detection power: reverting the create-drop back to #134's queue-and-
+/// forward behavior makes the create request eventually reach the client
+/// (after creation succeeds, alongside the hover reply). `request_collecting`
+/// collects anything that isn't the awaited hover's own response — a
+/// request equally as well as a notification — so a wrongly-forwarded
+/// create lands in `extra` and fails the `create_requests.is_empty()`
+/// assertion below.
+#[tokio::test]
+// `file_a`/`file_b` (and their `_uri` variants) are deliberately parallel
+// names for the two test fixtures this scenario exercises.
+#[allow(clippy::similar_names)]
+async fn create_progress_during_creating_stays_dropped_not_queued_e2e() {
+    const TOKEN: &str = "indexing-token-134";
+
+    let scenario = serde_json::json!({
+        "on_startup": [],
+        "steps": [
+            {
+                "expect": { "method": "initialize" },
+                "actions": [{ "type": "respond", "body": { "capabilities": { "hoverProvider": true } } }]
+            },
+            { "expect": { "method": "initialized" }, "actions": [] },
+            {
+                "expect": { "method": "textDocument/didOpen" },
+                "actions": [
+                    { "type": "request", "id": 3, "method": "window/workDoneProgress/create", "params": { "token": TOKEN } },
+                    { "type": "notify", "method": "$/progress", "params": { "token": TOKEN, "value": { "kind": "begin", "title": "" } } },
+                    { "type": "notify", "method": "$/progress", "params": { "token": TOKEN, "value": { "kind": "report", "message": "indexing" } } },
+                    { "type": "notify", "method": "$/progress", "params": { "token": TOKEN, "value": { "kind": "end" } } }
+                ]
+            },
+            { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
+            {
+                "expect": { "method": "textDocument/hover" },
+                "actions": [{ "type": "respond", "body": { "contents": { "kind": "plaintext", "value": "hover after create" } } }]
+            },
+            {
+                "expect": { "method": "shutdown" },
+                "actions": [{ "type": "respond", "body": null }]
+            }
+        ]
+    });
+
+    let config = WorkspaceConfig {
+        packages: vec![PackageConfig {
+            name: "pkg".to_string(),
+            scenario: scenario.clone(),
+            has_venv: false,
+        }],
+    };
+
+    let (temp_dir, root) = support::setup_test_workspace(&config);
+    let pkg_dir = root.join("pkg");
+    let mut proxy = ProxyUnderTest::spawn(temp_dir, root.clone(), &root);
+
+    let root_uri = support::path_to_uri(&root);
+    let init_resp = proxy.initialize(&root_uri).await;
+    assert!(
+        init_resp.error.is_none(),
+        "initialize should not return an error"
+    );
+    proxy.send_initialized().await;
+
+    let large_text = "x".repeat(BACKPRESSURE_TEXT_LEN);
+
+    let file_a = pkg_dir.join("a.py");
+    std::fs::write(&file_a, "a = 1\n").unwrap();
+    let file_a_uri = support::path_to_uri(&file_a);
+    let file_b = pkg_dir.join("b.py");
+    std::fs::write(&file_b, "b = 1\n").unwrap();
+    let file_b_uri = support::path_to_uri(&file_b);
+
+    // No `.venv` yet: both cache with `venv: None`, neither triggers creation.
+    proxy.did_open(&file_a_uri, &large_text).await;
+    proxy.did_open(&file_b_uri, &large_text).await;
+
+    // Synchronizing round-trip — see the sibling tests' identical step for
+    // why this is required before writing `.venv` below.
+    let presync = proxy
+        .request(
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": &file_a_uri },
+                "position": { "line": 0, "character": 0 }
+            }),
+        )
+        .await;
+    assert!(
+        presync.error.is_some(),
+        "hover before .venv exists should error (no backend yet)"
+    );
+
+    // `.venv` now exists.
+    support::write_venv_fixture(&pkg_dir, &scenario);
+
+    // Re-open a.py: starts creation. Restoration snapshot captures both
+    // large documents — see this test's doc comment for why the create
+    // reaction is guaranteed to land while still Creating.
+    proxy.did_open(&file_a_uri, &large_text).await;
+
+    let (hover, extra) = proxy
+        .request_collecting(
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": &file_a_uri },
+                "position": { "line": 0, "character": 0 }
+            }),
+        )
+        .await;
+    assert!(hover.error.is_none(), "hover failed: {:?}", hover.error);
+    assert_eq!(
+        hover.result.as_ref().unwrap()["contents"]["value"],
+        "hover after create"
+    );
+
+    let create_requests: Vec<&RpcMessage> = extra
+        .iter()
+        .filter(|m| m.method.as_deref() == Some("window/workDoneProgress/create"))
+        .collect();
+    assert!(
+        create_requests.is_empty(),
+        "window/workDoneProgress/create must never reach the client (dropped per #104, not queued) — got: {create_requests:?}"
+    );
+
+    let progress_notifications: Vec<&RpcMessage> = extra
+        .iter()
+        .filter(|m| m.method.as_deref() == Some("$/progress"))
+        .collect();
+    assert_eq!(
+        progress_notifications.len(),
+        3,
+        "expected begin+report+end to reach the client live during Creating, got: {progress_notifications:?}"
+    );
+    for notif in &progress_notifications {
+        let token = notif.params.as_ref().unwrap()["token"]
+            .as_str()
+            .expect("token must be a string once namespaced");
+        assert_ne!(
+            token, TOKEN,
+            "token must be namespaced, not passed through raw"
+        );
+    }
 
     let shutdown_resp = proxy.shutdown_and_exit().await;
     assert!(

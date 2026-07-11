@@ -401,6 +401,17 @@ impl ProxyUnderTest {
         }
     }
 
+    /// Respond to a server-initiated (backend→client) request previously
+    /// observed via `read_next`/`request_collecting` — e.g. a forwarded
+    /// `workspace/configuration` or `window/workDoneProgress/create`. Uses
+    /// `request`'s (proxy-rewritten) id, so the proxy's `dispatch_client_response`
+    /// routes it back to the originating backend.
+    #[allow(dead_code)] // Used by some but not all integration test binaries.
+    pub async fn respond_to_backend_request(&mut self, request: &RpcMessage, result: Value) {
+        let response = RpcMessage::success_response(request, result);
+        self.write(&response).await;
+    }
+
     /// Perform shutdown + exit sequence. Returns the shutdown response.
     #[allow(dead_code)] // Used by some but not all integration test binaries.
     pub async fn shutdown_and_exit(&mut self) -> RpcMessage {
@@ -468,6 +479,42 @@ impl ProxyUnderTest {
             }
         }
         collected
+    }
+
+    /// Wait for a notification with the given method, collecting any other
+    /// messages observed in the meantime instead of discarding them (unlike
+    /// `wait_for_notification`) — for asserting on what did NOT arrive
+    /// before the awaited notification, not just what did. Panics on
+    /// timeout.
+    #[allow(dead_code)] // Used by some but not all integration test binaries.
+    pub async fn wait_for_notification_collecting(
+        &mut self,
+        method: &str,
+        timeout_ms: u64,
+    ) -> (RpcMessage, Vec<RpcMessage>) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let mut collected = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "wait_for_notification_collecting: timed out after {timeout_ms}ms waiting for {method:?}, collected: {collected:?}"
+            );
+            match tokio::time::timeout(remaining, self.reader.read_message()).await {
+                Ok(Ok(msg)) if msg.method.as_deref() == Some(method) => return (msg, collected),
+                Ok(Ok(msg)) => collected.push(msg),
+                Ok(Err(e)) => {
+                    let stderr = self.dump_stderr().await;
+                    panic!("wait_for_notification_collecting: read error: {e}\n--- stderr ---\n{stderr}");
+                }
+                Err(_) => {
+                    let stderr = self.dump_stderr().await;
+                    panic!(
+                        "wait_for_notification_collecting: timed out after {timeout_ms}ms waiting for {method:?}\n--- stderr ---\n{stderr}"
+                    );
+                }
+            }
+        }
     }
 
     /// Wait for a notification with the given method, discarding any other
