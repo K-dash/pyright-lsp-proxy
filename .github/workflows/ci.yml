@@ -128,7 +128,7 @@ jobs:
       - name: Setup Rust 1.88
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
         with:
-          toolchain: "1.88"
+          toolchain: "1.97"
 
       # Guards the declared `rust-version` in Cargo.toml: without this, only
       # the latest stable toolchain (via the `ci` job) is ever exercised, so
