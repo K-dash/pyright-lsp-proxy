@@ -7,5 +7,13 @@
   "timezone": "Asia/Tokyo",
   "schedule": [
     "every weekend"
+  ],
+  "packageRules": [
+    {
+      "description": "MSRV is a compatibility policy declared in Cargo.toml's rust-version, read dynamically by the msrv job in ci.yml. Raising it is a deliberate, human decision, not a routine dependency bump.",
+      "matchManagers": ["github-actions"],
+      "matchDepNames": ["rust"],
+      "enabled": false
+    }
   ]
 }
