@@ -1,4 +1,4 @@
-.PHONY: all check fmt lint doc test build clean
+.PHONY: all check check-versions fmt lint doc test build clean
 
 # Default target: run all
 all: fmt lint doc test
@@ -35,9 +35,14 @@ release:
 check:
 	cargo check
 
+# Check that Cargo.toml, Cargo.lock, plugin.json, and marketplace.json all
+# agree on the same version (read-only, no files are modified)
+check-versions:
+	./scripts/check-versions.sh
+
 # Clean
 clean:
 	cargo clean
 
-# For CI: fmt-check + lint + doc + test
-ci: fmt-check lint doc test
+# For CI: check-versions + fmt-check + lint + doc + test
+ci: check-versions fmt-check lint doc test

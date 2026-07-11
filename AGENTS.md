@@ -105,6 +105,9 @@ For small, well-scoped changes (single-file fixes, typo corrections, simple bug 
 - Run single test: `cargo test test_name`
 - Run all tests: `cargo test` or `make test`
 - Tests located alongside source in same module or in tests/ directory
+- `tests/version_consistency_test.rs` requires `jq` on `PATH` (used by
+  `scripts/check-versions.sh`); `make ci` runs `check-versions` first and
+  fails fast with a clear error if `jq` is missing, before `cargo test` runs
 
 ## Project Structure
 
