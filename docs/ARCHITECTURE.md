@@ -108,6 +108,45 @@ pub struct PendingRequest {
 }
 ```
 
+### Creating State
+
+Backend creation (process spawn → `initialize` handshake → document restoration) never runs inline on the event loop. Each creation runs in its own `tokio::spawn`ed task, reported back via a dedicated `creation_rx` channel — the same "reader/writer/handler as independent tasks" shape session tracking already uses for a running backend, applied to the window before one exists.
+
+```rust
+pub struct CreatingEntry {
+    pub session: u64,            // allocated up front, carried into the Ready BackendInstance
+    pub queued: Vec<RpcMessage>, // messages that arrived while this venv was Creating
+}
+```
+
+`BackendPool` tracks `creating: HashMap<PathBuf, CreatingEntry>` as a map **separate** from `backends`: LRU/TTL/staleness/warmup logic applies only to `Ready` backends, so folding both states into one map would force every one of those call sites to branch on state.
+
+**Why restoration has to live inside the spawned task, not just after a `into_split()` done inline.** Splitting the backend and starting its reader task before writing restored documents fixes the narrow case (a reader now exists to drain diagnostics). It does not fix the general case: while a `select!` arm's handler is `.await`ing inline, the other arms — including the one draining `backend_msg_rx` (capacity 1024) — are not polled. A restoration burst past that capacity parks the reader task on its channel send, the backend's own stdout pipe backs up behind it, the backend blocks writing and stops reading its stdin, and if that same arm still has more to write, the whole proxy deadlocks. True deadlock-freedom requires the reader task, the creation task, and the main loop to be three independent tokio tasks, so the main loop keeps draining `backend_msg_rx` no matter what the creation task's writer is doing. Spawning the whole creation (including restoration) as its own task is what buys that independence.
+
+**Queueing and replay.** A message that targets a `Creating` venv is appended to that entry's `queued` (capped at `MAX_CREATING_QUEUE_LEN = 64`, its own constant independent of the warmup queue's). `ensure_backend_in_pool` returns a `PoolLookup`:
+
+```rust
+enum PoolLookup {
+    Ready(PathBuf),          // forward directly
+    CreatingStarted(PathBuf),   // this call's own snapshot already covers a same-tick didOpen
+    CreatingInFlight(PathBuf),  // a creation was already running; queue this message
+    NotFound,
+}
+```
+
+The `Started`/`InFlight` distinction only matters for `didOpen`: the restoration snapshot is a clone of `open_documents` taken synchronously when the creation task is spawned, so a `didOpen` that triggered the creation itself is already in that snapshot (no further action), while one that lands mid-handshake is not and must be queued. `didChange` and requests are always queued in both `Creating` variants.
+
+**Deferred cache mutations.** A replayed message is ordinary redispatch through the exact same dispatch arm a live message would take (see Event Loop below), which makes `didClose`'s cache removal and `didChange`'s edit application unsafe to apply eagerly for a `Creating` venv: applying now *and* again on replay would double-apply a non-idempotent edit, or (for `didClose`) remove the document before the replay pass's own venv lookup can resolve it, silently losing the close a second time. Both defer their mutation instead, to whichever pass turns out to be the one that actually delivers the message — immediately, if the venv is `Ready`; otherwise on replay. `forward_or_queue_for_venv` reports which of four things happened (`NotificationDelivery`: `Forwarded`, `Queued`, `Dropped`, `NoBackend`), and the deferral is only safe for `Queued` — the one outcome guaranteed a future replay. `Dropped` (the `MAX_CREATING_QUEUE_LEN = 64` cap rejected it) or `NoBackend` both mean nothing will ever redeliver the message, so the caller applies the deferred mutation immediately instead: delivery to the in-flight backend is lost (the client already got the dedup'd overflow `window/showMessage`), but the cache stays coherent, so the next respawn's restoration snapshot reflects the truth instead of resurrecting a closed document or restoring stale text.
+
+When the creation task finishes, the `creation_rx` select! arm (the only code path allowed to remove a `Creating` entry) handles the outcome:
+
+- **Success**: insert the new `BackendInstance` into `backends`, then move `queued` into a global `ProxyState::replay_queue: VecDeque<RpcMessage>` — a plain `VecDeque::extend`, no backend I/O. A dedicated select! arm re-dispatches exactly **one** replayed message per loop iteration (never a batch loop — a burst of replayed `didOpen`s could itself exceed `backend_msg_rx`'s capacity), through the same dispatch path as an ordinary client message. The main `select!` is *not* `biased;` (see Event Loop below), so "real backend traffic drains before a replay" can no longer come from arm order; the replay arm enforces it itself with a non-blocking `backend_msg_rx.try_recv()` immediately before dispatching: if a backend message is already there, dispatch that instead and push the replay back to the front of the queue for the next iteration.
+- **Failure**: every queued *request* gets an immediate JSON-RPC error response. Queued *notifications* go into `replay_queue` too, exactly like the success arm — even though there's no backend left for them to reach, redispatching them is what runs their deferred cache mutation (see above); without it, a queued `didClose`/`didChange` behind a failed creation would leave the cache permanently stale. A replayed `didOpen` finding the venv absent starts one fresh creation attempt — bounded, not a retry loop, since a repeat failure has nothing left queued to replay and the failure notification is already deduplicated.
+
+**Pool capacity.** `is_full()` counts `backends.len() + creating.len()`: a creation task holds a real process even before it's `Ready`. If the pool is full and no `Ready` backend is evictable (every slot is `Creating`), backend creation is rejected outright with `ProxyError::PoolBusy` — surfaced as an immediate JSON-RPC error, no implicit waiting.
+
+**Known v1 gaps** (accepted, not fixed): a `$/progress end` for an instance not yet in `backends` is a no-op — the warmup state update is missed but converges via the warmup fail-open timeout; fan-out (`workspace/symbol`) only targets `pool.backends_keys()`, so a `Creating` venv is silently excluded — unchanged, existing best-effort semantics. (`didClose` for a `Creating` venv used to be a similar no-op; it's now queued and replayed like any other message — see Event Loop below.)
+
 ## Backend-to-Client Request Proxying
 
 LSP backends can send requests to the client (e.g., `window/workDoneProgress/create`). With multiple backends, their request IDs can collide.
@@ -245,8 +284,8 @@ disabled).
 | Observation | Behavior |
 |-------------|----------|
 | Token unchanged | Serve as usual |
-| Token mismatch (venv replaced) | Evict old backend (cancel pending, clear diagnostics, shutdown), notify client via `window/showMessage`, respawn with the new environment — exactly once per change |
-| Token mismatch, respawn fails (e.g. broken interpreter mid-`uv sync`) | Contained, never fatal: notify the client via `window/showMessage`, keep serving other venvs; the next request for this venv retries backend creation via the pool-miss path |
+| Token mismatch (venv replaced) | Evict old backend (cancel pending, clear diagnostics, shutdown), notify client via `window/showMessage`, start creating a new one (`Creating`, off the event loop — see Creating State) — exactly once per change |
+| Token mismatch, creation fails to even start (e.g. pool busy) | Contained, never fatal: notify the client via `window/showMessage`, keep serving other venvs; the next request for this venv retries backend creation via the pool-miss path |
 | `pyvenv.cfg` missing < grace (2 × interval) | Keep serving the old backend (transient `uv sync` window) |
 | `pyvenv.cfg` missing ≥ grace | Evict without respawn; reset affected documents' cached venv so the next request re-resolves it — usually the strict-mode ".venv not found" error |
 
@@ -574,7 +613,7 @@ make ci
 | `text_edit.rs` | Incremental text edit application for didChange |
 | `venv.rs` | `.venv` search logic (parent traversal, git toplevel boundary) |
 | `error.rs` | Error type definitions (ProxyError, BackendError, etc.) |
-| `proxy/mod.rs` | Main event loop (`tokio::select!` with 5 arms) |
+| `proxy/mod.rs` | Main event loop (`tokio::select!` with 7 arms) |
 | `proxy/client_dispatch.rs` | Client message routing, warmup queueing, cancel handling |
 | `proxy/backend_dispatch.rs` | Backend message routing, proxy ID rewriting, progress detection |
 | `proxy/fanout.rs` | Fan-out dispatch, response merging, deduplication, timeout handling |
@@ -585,16 +624,22 @@ make ci
 
 ### Event Loop
 
-The main event loop in `proxy/mod.rs` uses `tokio::select!` with 5 arms:
+The main event loop in `proxy/mod.rs` uses `tokio::select!` with 7 arms, unbiased (default randomized-order polling):
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                  tokio::select!                     │
-├─────────────────────────────────────────────────────┤
-│ 1. Client reader     │ stdin JSON-RPC messages      │
-│ 2. Backend reader    │ mpsc channel (all backends)  │
-│ 3. TTL timer         │ 60s interval sweep           │
-│ 4. Warmup timer      │ nearest warmup deadline      │
-│ 5. Fan-out timer     │ nearest fan-out deadline     │
-└─────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────┐
+│                 tokio::select! (unbiased)                  │
+├───────────────────────────────────────────────────────────┤
+│ Client reader     │ mpsc channel (dedicated reader task)   │
+│ Backend reader    │ mpsc channel (all backends)            │
+│ Creation outcome  │ mpsc channel (backend-creation tasks)  │
+│ TTL timer         │ 60s interval sweep                     │
+│ Warmup timer      │ nearest warmup deadline                │
+│ Fan-out timer     │ nearest fan-out deadline                │
+│ Replay queue      │ one Creating-queued message/iteration  │
+└───────────────────────────────────────────────────────────┘
 ```
+
+**Not `biased;`.** An earlier version put `biased;` on this `select!` with the client reader listed first, to guarantee two orderings: backend traffic must drain before a replay (see Creating State), and — implicitly, by omission — nothing was thought to need priority *over* the client. Under sustained client input that second assumption breaks down: a `biased;` client-first `select!` can starve backend responses, creation outcomes, every timer, and replay indefinitely, and can reintroduce the #93 deadlock by a different path — a client flood plus a diagnostics burst fills `backend_msg_rx`, parking its reader task; the wedged backend stops reading its own stdin; a client-arm forward (e.g. `didChange`) then blocks writing to that backend's stdin; and the main loop is stuck with no other arm ever getting polled to drain the channel and unwedge it. The one real ordering requirement — backend traffic before a replay — doesn't need arm order to hold: it's enforced locally inside the replay arm instead, via a non-blocking `backend_msg_rx.try_recv()` immediately before dispatching a replay (see Creating State above).
+
+**Client reads are a channel, not an inline read, for a second, independent reason.** `LspFrameReader::read_message()` spans multiple `.await` points (a `read_line` loop for headers, then `read_exact` for the body), and tokio documents `read_line` as not cancellation-safe: used directly as a `select!` branch, a read that's mid-frame when some other arm resolves first gets dropped, silently losing whatever header/body bytes it had already consumed from the stream and desyncing framing for every read after it — observed as spurious "Missing Content-Length header" errors that crash the whole proxy. This risk exists independently of `biased;`, but an unbiased `select!` visits the other arms more often, making it far easier to trigger. The client reader now runs on its own dedicated task, looping `read_message()` to completion with no `select!` in between, and forwards each parsed message over a channel — the same dedicated-task-plus-channel shape the backend reader already used for the identical reason (`mpsc::Receiver::recv()` **is** cancel-safe, so consuming from a channel inside `select!` is fine even though the read that fills it isn't).

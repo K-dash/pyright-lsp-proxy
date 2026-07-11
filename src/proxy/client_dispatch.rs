@@ -1,5 +1,9 @@
+use super::pool_management::PoolLookup;
 use crate::backend::LspBackend;
-use crate::backend_pool::{shutdown_backend_instance, BackendInstance, MAX_WARMUP_QUEUE_LEN};
+use crate::backend_pool::{
+    shutdown_backend_instance, spawn_reader_task, BackendInstance, MAX_CREATING_QUEUE_LEN,
+    MAX_WARMUP_QUEUE_LEN,
+};
 use crate::error::ProxyError;
 use crate::framing::LspFrameWriter;
 use crate::message::{RpcId, RpcMessage};
@@ -17,6 +21,23 @@ const INDEX_DEPENDENT_METHODS: &[&str] = &[
 
 /// LSP methods that support fan-out to all backends when multiple are active.
 const FANOUT_METHODS: &[&str] = &["workspace/symbol"];
+
+/// Outcome of routing a notification via `forward_or_queue_for_venv`.
+pub(crate) enum NotificationDelivery {
+    /// Written directly to a `Ready` backend.
+    Forwarded,
+    /// The venv is `Creating`; queued in its entry for replay once the
+    /// creation resolves (success or failure — see
+    /// `handle_creation_outcome`, both arms replay queued notifications).
+    Queued,
+    /// The venv is `Creating`, but its queue is already at
+    /// `MAX_CREATING_QUEUE_LEN`; dropped (an overflow `window/showMessage`
+    /// was already sent). Nothing will ever redeliver this message.
+    Dropped,
+    /// The venv isn't tracked anywhere (neither `Ready` nor `Creating`) —
+    /// nothing to forward to or queue behind.
+    NoBackend,
+}
 
 impl super::LspProxy {
     /// Handle client "initialize" request.
@@ -43,13 +64,25 @@ impl super::LspProxy {
                 .await
             {
                 Ok(init_response) => {
-                    // Split and insert into pool
+                    // Split and insert into pool. No restoration needed here:
+                    // this is the very first backend, spawned before the
+                    // event loop starts, so no `didOpen` could have arrived
+                    // yet — the reader task is started before insertion
+                    // regardless, for consistency with `run_backend_creation`.
                     let session = self.state.pool.next_session_id();
                     let venv_token = crate::venv::venv_token(&venv).await;
                     let parts = backend.into_split();
                     let tx = self.state.pool.msg_sender();
-                    let instance =
-                        BackendInstance::from_parts(parts, venv.clone(), session, tx, venv_token);
+                    let reader_task = spawn_reader_task(parts.reader, tx, venv.clone(), session);
+                    let instance = BackendInstance::from_parts(
+                        parts.writer,
+                        parts.child,
+                        parts.next_id,
+                        reader_task,
+                        venv.clone(),
+                        session,
+                        venv_token,
+                    );
                     self.state.pool.insert(venv.clone(), instance);
 
                     // Send initialize response to client
@@ -198,10 +231,18 @@ impl super::LspProxy {
                             .ensure_backend_in_pool(&url, &file_path, client_writer)
                             .await
                         {
-                            Ok(Some(venv)) => {
+                            Ok(PoolLookup::Ready(venv)) => {
                                 target_venv = Some(venv);
                             }
-                            Ok(None) => {
+                            Ok(
+                                PoolLookup::CreatingStarted(venv)
+                                | PoolLookup::CreatingInFlight(venv),
+                            ) => {
+                                self.queue_or_reject_creating_request(&venv, msg, client_writer)
+                                    .await?;
+                                return Ok(());
+                            }
+                            Ok(PoolLookup::NotFound) => {
                                 // No venv found — return error
                                 let error_message = "lsp-proxy: .venv not found (strict mode). Create .venv or run hooks.";
                                 tracing::warn!(
@@ -256,10 +297,17 @@ impl super::LspProxy {
                         .ensure_backend_in_pool(&url, &file_path, client_writer)
                         .await
                     {
-                        Ok(Some(venv)) => {
+                        Ok(PoolLookup::Ready(venv)) => {
                             target_venv = Some(venv);
                         }
-                        Ok(None) => {
+                        Ok(
+                            PoolLookup::CreatingStarted(venv) | PoolLookup::CreatingInFlight(venv),
+                        ) => {
+                            self.queue_or_reject_creating_request(&venv, msg, client_writer)
+                                .await?;
+                            return Ok(());
+                        }
+                        Ok(PoolLookup::NotFound) => {
                             tracing::warn!(
                                 method = ?msg.method_name(),
                                 uri = %url,
@@ -391,6 +439,103 @@ impl super::LspProxy {
         Ok(())
     }
 
+    /// Queue a request into a Creating venv's bounded queue, or reject it
+    /// immediately with a JSON-RPC error if the queue is full or the venv is
+    /// no longer tracked as Creating (a race with the completion handler —
+    /// shouldn't happen in the single-threaded event loop, handled
+    /// defensively). Registers the queued request in `pending_requests`
+    /// under the Creating entry's pre-allocated session, so `$/cancelRequest`
+    /// can find it via the same lookup used for the warmup queue.
+    async fn queue_or_reject_creating_request(
+        &mut self,
+        venv_path: &Path,
+        msg: &RpcMessage,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+    ) -> Result<(), ProxyError> {
+        let key = venv_path.to_path_buf();
+        let Some(entry) = self.state.pool.creating_get_mut(&key) else {
+            let error_response =
+                RpcMessage::error_response(msg, "lsp-proxy: backend not available");
+            client_writer.write_message(&error_response).await?;
+            return Ok(());
+        };
+
+        if entry.try_queue(msg.clone()) {
+            let session = entry.session;
+            self.register_pending_request(msg, session, venv_path);
+            tracing::info!(
+                method = ?msg.method_name(),
+                id = ?msg.id,
+                venv = %venv_path.display(),
+                "Queueing request while backend is being created"
+            );
+        } else {
+            tracing::warn!(
+                method = ?msg.method_name(),
+                id = ?msg.id,
+                venv = %venv_path.display(),
+                "Rejecting request: creating queue full"
+            );
+            let error_response = RpcMessage::error_response(
+                msg,
+                &format!(
+                    "lsp-proxy: creating queue full ({MAX_CREATING_QUEUE_LEN} requests) for {}",
+                    venv_path.display()
+                ),
+            );
+            client_writer.write_message(&error_response).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Forward a message to `venv_path`'s backend if it's `Ready`, queue it
+    /// (bounded, dedup'd overflow warning) if the backend is `Creating`, or
+    /// drop it silently if no backend is tracked for the venv at all (matches
+    /// the pre-existing "forward to nothing" no-op for an absent backend).
+    ///
+    /// Used for notifications (no response to send an error for), so
+    /// overflow can only be reported via a `window/showMessage`, never a
+    /// JSON-RPC error response.
+    ///
+    /// Returns which `NotificationDelivery` outcome happened — the "drop"
+    /// case above splits into `Dropped` (overflow) and `NoBackend` (nothing
+    /// tracked for this venv at all). Some callers (didChange, didClose)
+    /// defer a cache mutation on the assumption that a `Queued` message is
+    /// guaranteed to be replayed later — `Dropped` and `NoBackend` both
+    /// break that assumption (nothing will ever redeliver this message), so
+    /// those callers need to know which outcome they got, not just whether
+    /// this returned an error.
+    pub(crate) async fn forward_or_queue_for_venv(
+        &mut self,
+        venv_path: &Path,
+        msg: &RpcMessage,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+    ) -> Result<NotificationDelivery, ProxyError> {
+        let key = venv_path.to_path_buf();
+        if self.state.pool.contains(&key) {
+            self.forward_to_backend(venv_path, msg).await?;
+            return Ok(NotificationDelivery::Forwarded);
+        }
+
+        let Some(entry) = self.state.pool.creating_get_mut(&key) else {
+            return Ok(NotificationDelivery::NoBackend);
+        };
+
+        if entry.try_queue(msg.clone()) {
+            return Ok(NotificationDelivery::Queued);
+        }
+
+        tracing::warn!(
+            method = ?msg.method_name(),
+            venv = %venv_path.display(),
+            "Dropping notification: creating queue full"
+        );
+        self.notify_creating_queue_overflow(venv_path, client_writer)
+            .await;
+        Ok(NotificationDelivery::Dropped)
+    }
+
     /// Register a pending request so that the response can be routed back
     /// to the correct backend session.
     fn register_pending_request(&mut self, msg: &RpcMessage, session: u64, venv_path: &Path) {
@@ -455,6 +600,7 @@ impl super::LspProxy {
     pub(crate) async fn dispatch_client_notification(
         &mut self,
         msg: &RpcMessage,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
     ) -> Result<(), ProxyError> {
         if let Some(url) = Self::extract_text_document_uri(msg) {
             let Some(venv_path) = self.venv_for_uri(&url) else {
@@ -465,7 +611,13 @@ impl super::LspProxy {
                 );
                 return Ok(());
             };
-            return self.forward_to_backend(&venv_path, msg).await;
+            // No deferred cache mutation depends on the outcome here (that's
+            // only relevant to didChange/didClose's own dispatch arms) — the
+            // delivery result doesn't change what this generic path does
+            // next, so it's discarded once errors are handled.
+            self.forward_or_queue_for_venv(&venv_path, msg, client_writer)
+                .await?;
+            return Ok(());
         }
 
         let venvs: Vec<PathBuf> = self.state.pool.backends_keys();
@@ -510,12 +662,24 @@ impl super::LspProxy {
                         self.state.pending_requests.remove(&cancelled_id);
                         return Ok(());
                     }
+                } else if let Some(entry) = self.state.pool.creating_get_mut(&pending.venv_path) {
+                    if entry.session == pending.backend_session
+                        && entry.cancel_queued_request(&cancelled_id).is_some()
+                    {
+                        tracing::info!(
+                            id = ?cancelled_id,
+                            venv = %pending.venv_path.display(),
+                            "Cancelled creating-queued request"
+                        );
+                        self.state.pending_requests.remove(&cancelled_id);
+                        return Ok(());
+                    }
                 }
             }
         }
 
-        // Not in warmup queue or fan-out — forward $/cancelRequest to all backends
-        self.dispatch_client_notification(msg).await
+        // Not in a warmup/creating queue or fan-out — forward $/cancelRequest to all backends
+        self.dispatch_client_notification(msg, client_writer).await
     }
 
     /// Forward queued warmup requests to the backend now that it is ready.

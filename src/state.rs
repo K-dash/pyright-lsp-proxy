@@ -1,7 +1,7 @@
 use crate::backend::BackendKind;
 use crate::backend_pool::BackendPool;
 use crate::message::{RpcId, RpcMessage};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -104,6 +104,13 @@ pub struct ProxyState {
     /// a venv, keyed by venv path. Used to dedupe `window/showMessage`
     /// spam when the same venv keeps failing to spawn (issue #26).
     pub venv_error_notified_at: HashMap<PathBuf, Instant>,
+
+    /// Messages that arrived for a venv while its backend was `Creating`,
+    /// moved here in FIFO order by the `creation_rx` completion handler once
+    /// the backend is `Ready`. Drained one message per event-loop iteration
+    /// (never a batch loop) so a burst of replayed `didOpen`s can't starve
+    /// `backend_msg_rx` — see ARCHITECTURE.md's Creating-state section.
+    pub replay_queue: VecDeque<RpcMessage>,
 }
 
 impl ProxyState {
@@ -124,6 +131,7 @@ impl ProxyState {
             pending_fanouts: HashMap::new(),
             ignore_checked_venvs: HashSet::new(),
             venv_error_notified_at: HashMap::new(),
+            replay_queue: VecDeque::new(),
         }
     }
 

@@ -16,6 +16,15 @@ use support::{PackageConfig, ProxyUnderTest, WorkspaceConfig};
 /// the cancelled hover, or the scripted step order breaks and the mock
 /// exits) and non-corruption (a fresh request on the same backend still
 /// succeeds normally afterwards). See the report for the full reasoning.
+///
+/// The synchronizing hover after `didOpen` forces the backend all the way to
+/// `Ready` (its response can only arrive once creation has completed) before
+/// the cancellation scenario starts. Without it, the "cancelled" hover below
+/// races backend creation: if it lands while the backend is still
+/// `Creating`, it takes the queue-and-replay path instead of being forwarded
+/// directly, and `$/cancelRequest` cancels it locally without the backend
+/// ever seeing either message — a different (and separately covered) code
+/// path from the one this test targets.
 #[tokio::test]
 async fn cancel_request_forwarded_and_backend_still_usable() {
     let scenario = serde_json::json!({
@@ -27,11 +36,15 @@ async fn cancel_request_forwarded_and_backend_still_usable() {
             },
             { "expect": { "method": "initialized" }, "actions": [] },
             { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
-            // First hover is deliberately left unanswered: it's the one
+            {
+                "expect": { "method": "textDocument/hover" },
+                "actions": [{ "type": "respond", "body": { "contents": { "kind": "plaintext", "value": "sync hover" } } }]
+            },
+            // Second hover is deliberately left unanswered: it's the one
             // that gets cancelled.
             { "expect": { "method": "textDocument/hover" }, "actions": [] },
             // If $/cancelRequest were not forwarded, the next message the
-            // backend actually sees is the second hover below instead of
+            // backend actually sees is the third hover below instead of
             // this notification, which mismatches this step and crashes
             // the mock — a loud, detectable failure.
             { "expect": { "method": "$/cancelRequest" }, "actions": [] },
@@ -77,7 +90,18 @@ async fn cancel_request_forwarded_and_backend_still_usable() {
         })
     };
 
-    // First hover: forwarded to the backend and left pending on purpose.
+    // Synchronizing round-trip: its response can only arrive once backend
+    // creation (spawn + handshake + restoration) has fully completed, so it
+    // guarantees the backend is `Ready` before the cancellation scenario
+    // below, deterministically (not by racing creation's timing).
+    let sync_resp = proxy.request("textDocument/hover", hover_params()).await;
+    assert!(
+        sync_resp.error.is_none(),
+        "synchronizing hover should not return an error, got: {:?}",
+        sync_resp.error
+    );
+
+    // Second hover: forwarded to the (now Ready) backend and left pending on purpose.
     let cancelled_id = proxy
         .send_request("textDocument/hover", hover_params())
         .await;

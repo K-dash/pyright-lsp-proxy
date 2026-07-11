@@ -1,10 +1,13 @@
-use crate::backend::LspBackend;
-use crate::backend_pool::BackendInstance;
+use crate::backend::{BackendKind, LspBackend};
+use crate::backend_pool::{spawn_reader_task, BackendInstance, BackendMessage, CreationOutcome};
 use crate::error::ProxyError;
 use crate::framing::LspFrameWriter;
 use crate::message::{RpcId, RpcMessage};
+use crate::state::OpenDocument;
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use tokio::process::ChildStdin;
+use tokio::sync::mpsc;
 use url::Url;
 
 /// Rewrite rootUri, rootPath, and workspaceFolders in initialize params
@@ -56,7 +59,11 @@ fn rewrite_root_uri(init_params: &mut Value, venv: &Path) {
 /// this venv's project root. A document already owned by a *different* venv
 /// is never restored here, even if its path is nested under this venv's
 /// project root (e.g. a child project's own `.venv`).
-fn should_restore_document(
+///
+/// `pub(crate)`: also called from `pool_management::start_backend_creation`
+/// to build the restoration snapshot on the main-loop side, before the
+/// creation task is spawned.
+pub(crate) fn should_restore_document(
     doc_venv: Option<&Path>,
     venv: &Path,
     file_path: Option<&Path>,
@@ -72,7 +79,7 @@ fn should_restore_document(
 
 /// Perform the LSP initialize handshake with a backend:
 /// 1. Send `initialize` request with the given params
-/// 2. Wait for the initialize response (10s timeout, skip notifications)
+/// 2. Wait for the initialize response (`init_handshake_timeout()`, skip notifications)
 /// 3. Send `initialized` notification
 ///
 /// Returns the initialize response from the backend.
@@ -94,12 +101,14 @@ async fn perform_initialize_handshake(
 
     // Receive initialize response
     let init_id = 1i64;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let timeout_duration = crate::backend_pool::init_handshake_timeout();
+    let timeout_secs = timeout_duration.as_secs();
+    let deadline = tokio::time::Instant::now() + timeout_duration;
     let init_response = loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Err(ProxyError::Backend(
-                crate::error::BackendError::InitializeTimeout(10),
+                crate::error::BackendError::InitializeTimeout(timeout_secs),
             ));
         }
 
@@ -142,7 +151,7 @@ async fn perform_initialize_handshake(
             }
             Err(_) => {
                 return Err(ProxyError::Backend(
-                    crate::error::BackendError::InitializeTimeout(10),
+                    crate::error::BackendError::InitializeTimeout(timeout_secs),
                 ));
             }
         }
@@ -159,7 +168,10 @@ async fn perform_initialize_handshake(
 
 impl super::LspProxy {
     /// Extract cached initialize params, returning an error if not available.
-    fn cached_init_params(&self) -> Result<Value, ProxyError> {
+    ///
+    /// `pub(crate)`: also called from `pool_management::start_backend_creation`
+    /// to snapshot the params before spawning the creation task.
+    pub(crate) fn cached_init_params(&self) -> Result<Value, ProxyError> {
         self.state
             .client_initialize
             .as_ref()
@@ -169,6 +181,11 @@ impl super::LspProxy {
 
     /// Complete backend initialization: forward initialize, receive response, send initialized.
     /// Returns the initialize response to forward to the client.
+    ///
+    /// Used only by the very first (pre-spawned fallback) backend at startup,
+    /// before the event loop is even running — no other venv can be waiting
+    /// on the loop yet, so this stays inline rather than moving into a
+    /// spawned task like `start_backend_creation`.
     pub(crate) async fn complete_backend_initialization(
         &self,
         backend: &mut LspBackend,
@@ -178,135 +195,158 @@ impl super::LspProxy {
         let init_params = self.cached_init_params()?;
         perform_initialize_handshake(backend, init_params, venv).await
     }
+}
 
-    /// Create a new backend, initialize it, split it, and return a `BackendInstance`.
-    /// Does NOT insert into the pool — caller is responsible for that.
-    pub(crate) async fn create_backend_instance(
-        &mut self,
-        venv: &Path,
-        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
-    ) -> Result<BackendInstance, ProxyError> {
-        let session = self.state.pool.next_session_id();
+/// Write restored documents (already filtered to this venv by the caller) to
+/// a split backend's writer.
+///
+/// Called only from `run_backend_creation`, AFTER the reader task has
+/// started draining the backend's stdout (see `BackendInstance::from_parts`'s
+/// doc comment) — the #93 fix: a restoration-triggered diagnostics burst is
+/// drained concurrently instead of filling the pipe and deadlocking this
+/// write loop.
+///
+/// Fails fast on the first write error instead of logging and continuing: a
+/// write failure here means the pipe is broken (the backend died), so later
+/// writes in the loop would fail identically, and returning `Err` fails the
+/// whole creation through `CreationOutcome::Err`'s existing containment
+/// (queued requests get a JSON-RPC error, one dedup'd notify, lazy retry) —
+/// instead of silently pooling an instance with some documents missing.
+async fn write_restored_documents(
+    writer: &mut LspFrameWriter<ChildStdin>,
+    docs: &[(Url, OpenDocument)],
+    session: u64,
+) -> Result<(), ProxyError> {
+    tracing::info!(
+        session = session,
+        total_docs = docs.len(),
+        "Starting document restoration"
+    );
+
+    for (url, doc) in docs {
+        let uri_str = url.to_string();
+        let text_len = doc.text.len();
+
+        let didopen_msg = RpcMessage::notification(
+            "textDocument/didOpen",
+            Some(serde_json::json!({
+                "textDocument": {
+                    "uri": uri_str,
+                    "languageId": doc.language_id,
+                    "version": doc.version,
+                    "text": doc.text,
+                }
+            })),
+        );
+
+        writer.write_message(&didopen_msg).await.map_err(|e| {
+            tracing::error!(
+                session = session,
+                uri = %uri_str,
+                error = ?e,
+                "Failed to restore document"
+            );
+            e
+        })?;
 
         tracing::info!(
             session = session,
-            venv = %venv.display(),
-            "Creating new backend instance"
+            uri = %uri_str,
+            text_len = text_len,
+            "Restored document"
         );
+    }
 
-        // 1. Spawn
-        let mut backend = LspBackend::spawn(self.state.backend_kind, Some(venv))?;
+    tracing::info!(
+        session = session,
+        restored = docs.len(),
+        "Document restoration completed"
+    );
+    Ok(())
+}
 
-        // 2. Initialize handshake
-        let init_params = self.cached_init_params()?;
-        perform_initialize_handshake(&mut backend, init_params, venv).await?;
-        tracing::info!(session = session, venv = %venv.display(), "Backend initialized");
+/// Spawn a backend, complete the handshake, split it, start its reader task,
+/// replay restored documents, and capture its venv identity token.
+///
+/// Runs entirely off the event loop (see `spawn_backend_creation_task`), so
+/// a slow handshake or a restoration diagnostics burst never blocks the main
+/// loop or other venvs' traffic (#93, #96).
+pub(crate) async fn run_backend_creation(
+    backend_kind: BackendKind,
+    venv: &Path,
+    session: u64,
+    init_params: Value,
+    restore_snapshot: Vec<(Url, OpenDocument)>,
+    msg_sender: mpsc::Sender<BackendMessage>,
+) -> Result<BackendInstance, ProxyError> {
+    tracing::info!(session = session, venv = %venv.display(), "Creating new backend instance");
 
-        // 3. Document restoration for this venv
-        self.restore_documents_to_backend(&mut backend, venv, session, client_writer)
-            .await?;
+    let mut backend = LspBackend::spawn(backend_kind, Some(venv))?;
 
-        // 4. Capture venv identity token (None if capture raced a rebuild)
-        let venv_token = crate::venv::venv_token(venv).await;
+    perform_initialize_handshake(&mut backend, init_params, venv).await?;
+    tracing::info!(session = session, venv = %venv.display(), "Backend initialized");
 
-        // 5. Split and create instance
-        let parts = backend.into_split();
-        let tx = self.state.pool.msg_sender();
-        Ok(BackendInstance::from_parts(
-            parts,
-            venv.to_path_buf(),
+    // Split and start the reader task BEFORE restoring: the backend's
+    // stdout is drained from this point on, so restoration writes below
+    // can't deadlock even under a large diagnostics burst (#93).
+    let parts = backend.into_split();
+    let reader_task = spawn_reader_task(parts.reader, msg_sender, venv.to_path_buf(), session);
+
+    let mut writer = parts.writer;
+    if let Err(e) = write_restored_documents(&mut writer, &restore_snapshot, session).await {
+        // The child is dropped (and killed via `kill_on_drop`) when `parts`
+        // goes out of scope on this early return; the reader task is
+        // aborted explicitly rather than left to notice EOF on its own.
+        reader_task.abort();
+        return Err(e);
+    }
+
+    // Capture venv identity token (None if capture raced a rebuild)
+    let venv_token = crate::venv::venv_token(venv).await;
+
+    Ok(BackendInstance::from_parts(
+        writer,
+        parts.child,
+        parts.next_id,
+        reader_task,
+        venv.to_path_buf(),
+        session,
+        venv_token,
+    ))
+}
+
+/// Spawn the backend-creation task and report its outcome back to the main
+/// loop via `creation_tx`. Fire-and-forget from the caller's perspective
+/// (`pool_management::start_backend_creation` does not await this) — the
+/// main loop picks up the result later via the `creation_rx` select! arm.
+pub(crate) fn spawn_backend_creation_task(
+    backend_kind: BackendKind,
+    venv: PathBuf,
+    session: u64,
+    init_params: Value,
+    restore_snapshot: Vec<(Url, OpenDocument)>,
+    msg_sender: mpsc::Sender<BackendMessage>,
+    creation_tx: mpsc::Sender<CreationOutcome>,
+) {
+    tokio::spawn(async move {
+        let result = run_backend_creation(
+            backend_kind,
+            &venv,
             session,
-            tx,
-            venv_token,
-        ))
-    }
+            init_params,
+            restore_snapshot,
+            msg_sender,
+        )
+        .await;
 
-    /// Restore documents belonging to a venv to a backend
-    pub(crate) async fn restore_documents_to_backend(
-        &self,
-        backend: &mut LspBackend,
-        venv: &Path,
-        session: u64,
-        _client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
-    ) -> Result<(), ProxyError> {
-        let venv_parent = venv.parent().map(std::path::Path::to_path_buf);
-        let total_docs = self.state.open_documents.len();
-        let mut restored = 0;
-        let mut skipped = 0;
-        let mut failed = 0;
-
-        tracing::info!(
-            session = session,
-            total_docs = total_docs,
-            venv_parent = ?venv_parent.as_ref().map(|p| p.display().to_string()),
-            "Starting document restoration"
-        );
-
-        for (url, doc) in &self.state.open_documents {
-            let file_path = url.to_file_path().ok();
-            let should_restore = should_restore_document(
-                doc.venv.as_deref(),
-                venv,
-                file_path.as_deref(),
-                venv_parent.as_deref(),
-            );
-
-            if !should_restore {
-                skipped += 1;
-                continue;
-            }
-
-            let uri_str = url.to_string();
-            let language_id = doc.language_id.clone();
-            let version = doc.version;
-            let text = doc.text.clone();
-            let text_len = text.len();
-
-            let didopen_msg = RpcMessage::notification(
-                "textDocument/didOpen",
-                Some(serde_json::json!({
-                    "textDocument": {
-                        "uri": uri_str,
-                        "languageId": language_id,
-                        "version": version,
-                        "text": text,
-                    }
-                })),
-            );
-
-            match backend.send_message(&didopen_msg).await {
-                Ok(()) => {
-                    restored += 1;
-                    tracing::info!(
-                        session = session,
-                        uri = %uri_str,
-                        text_len = text_len,
-                        "Restored document"
-                    );
-                }
-                Err(e) => {
-                    failed += 1;
-                    tracing::error!(
-                        session = session,
-                        uri = %uri_str,
-                        error = ?e,
-                        "Failed to restore document"
-                    );
-                }
-            }
-        }
-
-        tracing::info!(
-            session = session,
-            restored = restored,
-            skipped = skipped,
-            failed = failed,
-            total = total_docs,
-            "Document restoration completed"
-        );
-
-        Ok(())
-    }
+        let outcome = CreationOutcome {
+            venv_path: venv,
+            result,
+        };
+        // Receiver only drops on proxy shutdown; a send failure there is
+        // moot (nothing left to report the outcome to).
+        let _ = creation_tx.send(outcome).await;
+    });
 }
 
 #[cfg(test)]
@@ -369,5 +409,54 @@ mod tests {
             Some(Path::new("/repo/a.py")),
             None,
         ));
+    }
+
+    /// Deterministic coverage for the write-failure layer of the zombie-
+    /// backend fix (a restoration write failure must fail creation instead
+    /// of being logged and swallowed — see `run_backend_creation`'s doc
+    /// comment). Spawns a trivial process and waits for it to exit before
+    /// writing, so the pipe is genuinely, unambiguously closed — unlike the
+    /// E2E `dead_backend_during_creation_does_not_pool_as_zombie_e2e`, which
+    /// races a mock's own crash timing and can't reliably isolate this path
+    /// from the pre-existing Ready-backend crash-cleanup path that also
+    /// catches most timings of that race.
+    #[tokio::test]
+    async fn write_restored_documents_fails_on_broken_pipe() {
+        use super::write_restored_documents;
+        use crate::framing::LspFrameWriter;
+        use crate::state::OpenDocument;
+        use url::Url;
+
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn helper process");
+        let stdin = child.stdin.take().expect("child stdin should be piped");
+        // Wait for exit before writing: guarantees the pipe's read end is
+        // closed, so the write below fails deterministically (EPIPE) rather
+        // than racing the child's own exit.
+        child
+            .wait()
+            .await
+            .expect("helper process should exit cleanly");
+
+        let mut writer = LspFrameWriter::new(stdin);
+        let docs = vec![(
+            Url::parse("file:///a.py").unwrap(),
+            OpenDocument {
+                language_id: "python".to_string(),
+                version: 1,
+                text: "a = 1\n".to_string(),
+                venv: None,
+            },
+        )];
+
+        let result = write_restored_documents(&mut writer, &docs, 1).await;
+        assert!(
+            result.is_err(),
+            "expected a restoration write to an already-closed pipe to fail, not be silently swallowed"
+        );
     }
 }

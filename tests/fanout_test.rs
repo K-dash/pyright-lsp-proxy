@@ -4,7 +4,18 @@ use support::{PackageConfig, ProxyUnderTest, WorkspaceConfig};
 
 /// E2E: `workspace/symbol` with two pooled backends fans out to both and
 /// merges their result sets into a single response.
+///
+/// Each scenario's synchronizing `documentSymbol` step (answered before
+/// `workspace/symbol`) forces its backend to `Ready` deterministically:
+/// `workspace/symbol` fan-out only targets `pool.backends_keys()` (Ready
+/// backends), by design (see ARCHITECTURE.md's Creating-state section) — a
+/// backend still `Creating` when the fan-out fires is silently excluded, so
+/// without this synchronization the test would race backend creation.
 #[tokio::test]
+// `file_a`/`file_b` (and their `_uri`/`sync_a`/`sync_b` variants) are
+// deliberately parallel names for the two test fixtures this scenario
+// exercises.
+#[allow(clippy::similar_names)]
 async fn fanout_merges_results_from_two_backends() {
     let scenario_a = serde_json::json!({
         "on_startup": [],
@@ -15,6 +26,10 @@ async fn fanout_merges_results_from_two_backends() {
             },
             { "expect": { "method": "initialized" }, "actions": [] },
             { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
+            {
+                "expect": { "method": "textDocument/documentSymbol" },
+                "actions": [{ "type": "respond", "body": [] }]
+            },
             {
                 "expect": { "method": "workspace/symbol" },
                 "actions": [{ "type": "respond", "body": [
@@ -44,6 +59,10 @@ async fn fanout_merges_results_from_two_backends() {
             },
             { "expect": { "method": "initialized" }, "actions": [] },
             { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
+            {
+                "expect": { "method": "textDocument/documentSymbol" },
+                "actions": [{ "type": "respond", "body": [] }]
+            },
             {
                 "expect": { "method": "workspace/symbol" },
                 "actions": [{ "type": "respond", "body": [
@@ -92,18 +111,41 @@ async fn fanout_merges_results_from_two_backends() {
     );
     proxy.send_initialized().await;
 
-    // didOpen on each package spawns its backend.
+    // didOpen on each package starts its backend's creation.
     let file_a = root.join("proj-a/main.py");
     std::fs::write(&file_a, "a = 1\n").unwrap();
-    proxy
-        .did_open(&support::path_to_uri(&file_a), "a = 1\n")
-        .await;
+    let file_a_uri = support::path_to_uri(&file_a);
+    proxy.did_open(&file_a_uri, "a = 1\n").await;
 
     let file_b = root.join("proj-b/main.py");
     std::fs::write(&file_b, "b = 2\n").unwrap();
-    proxy
-        .did_open(&support::path_to_uri(&file_b), "b = 2\n")
+    let file_b_uri = support::path_to_uri(&file_b);
+    proxy.did_open(&file_b_uri, "b = 2\n").await;
+
+    // Synchronizing round-trips: force both backends to `Ready` before the
+    // fan-out below (see the test's doc comment).
+    let sync_a = proxy
+        .request(
+            "textDocument/documentSymbol",
+            serde_json::json!({ "textDocument": { "uri": &file_a_uri } }),
+        )
         .await;
+    assert!(
+        sync_a.error.is_none(),
+        "sync documentSymbol(a) failed: {:?}",
+        sync_a.error
+    );
+    let sync_b = proxy
+        .request(
+            "textDocument/documentSymbol",
+            serde_json::json!({ "textDocument": { "uri": &file_b_uri } }),
+        )
+        .await;
+    assert!(
+        sync_b.error.is_none(),
+        "sync documentSymbol(b) failed: {:?}",
+        sync_b.error
+    );
 
     // workspace/symbol has no document URI: with 2 pooled backends this
     // fans out to both and merges their results.
@@ -143,7 +185,15 @@ async fn fanout_merges_results_from_two_backends() {
 /// E2E: `workspace/symbol` fanned out to two backends, one of which never
 /// responds, returns the other backend's results (not an error, not a
 /// hang) once the fan-out timeout elapses.
+///
+/// Each scenario's synchronizing `documentSymbol` step forces its backend to
+/// `Ready` before the fan-out fires — see
+/// `fanout_merges_results_from_two_backends`'s doc comment for why.
 #[tokio::test]
+// `file_a`/`file_b` (and their `_uri`/`sync_a`/`sync_b` variants) are
+// deliberately parallel names for the two test fixtures this scenario
+// exercises.
+#[allow(clippy::similar_names)]
 async fn fanout_returns_partial_results_on_backend_timeout() {
     let scenario_a = serde_json::json!({
         "on_startup": [],
@@ -154,6 +204,10 @@ async fn fanout_returns_partial_results_on_backend_timeout() {
             },
             { "expect": { "method": "initialized" }, "actions": [] },
             { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
+            {
+                "expect": { "method": "textDocument/documentSymbol" },
+                "actions": [{ "type": "respond", "body": [] }]
+            },
             {
                 "expect": { "method": "workspace/symbol" },
                 "actions": [{ "type": "respond", "body": [
@@ -186,6 +240,10 @@ async fn fanout_returns_partial_results_on_backend_timeout() {
             },
             { "expect": { "method": "initialized" }, "actions": [] },
             { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
+            {
+                "expect": { "method": "textDocument/documentSymbol" },
+                "actions": [{ "type": "respond", "body": [] }]
+            },
             { "expect": { "method": "workspace/symbol" }, "actions": [] },
             { "expect": { "method": "$/cancelRequest" }, "actions": [] },
             {
@@ -229,15 +287,38 @@ async fn fanout_returns_partial_results_on_backend_timeout() {
 
     let file_a = root.join("proj-a/main.py");
     std::fs::write(&file_a, "a = 1\n").unwrap();
-    proxy
-        .did_open(&support::path_to_uri(&file_a), "a = 1\n")
-        .await;
+    let file_a_uri = support::path_to_uri(&file_a);
+    proxy.did_open(&file_a_uri, "a = 1\n").await;
 
     let file_b = root.join("proj-b/main.py");
     std::fs::write(&file_b, "b = 2\n").unwrap();
-    proxy
-        .did_open(&support::path_to_uri(&file_b), "b = 2\n")
+    let file_b_uri = support::path_to_uri(&file_b);
+    proxy.did_open(&file_b_uri, "b = 2\n").await;
+
+    // Synchronizing round-trips: force both backends to `Ready` before the
+    // fan-out below (see the test's doc comment).
+    let sync_a = proxy
+        .request(
+            "textDocument/documentSymbol",
+            serde_json::json!({ "textDocument": { "uri": &file_a_uri } }),
+        )
         .await;
+    assert!(
+        sync_a.error.is_none(),
+        "sync documentSymbol(a) failed: {:?}",
+        sync_a.error
+    );
+    let sync_b = proxy
+        .request(
+            "textDocument/documentSymbol",
+            serde_json::json!({ "textDocument": { "uri": &file_b_uri } }),
+        )
+        .await;
+    assert!(
+        sync_b.error.is_none(),
+        "sync documentSymbol(b) failed: {:?}",
+        sync_b.error
+    );
 
     // Backend B never answers, so the response only arrives once the 1s
     // fan-out timeout fires and the proxy returns backend A's partial

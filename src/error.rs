@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -19,6 +20,9 @@ pub enum ProxyError {
 
     #[error("Venv error: {0}")]
     Venv(#[from] VenvError),
+
+    #[error("Backend pool is full and no backend is evictable for {0}")]
+    PoolBusy(PathBuf),
 }
 
 #[derive(Error, Debug)]
