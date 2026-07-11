@@ -1325,3 +1325,105 @@ async fn dead_backend_during_creation_does_not_pool_as_zombie_e2e() {
         "shutdown should not return an error"
     );
 }
+
+/// E2E (blocking review finding): a `didClose` landing while its venv is
+/// still `Creating` must still reach the backend, in order, after the
+/// restoration snapshot's replay — not be silently dropped.
+///
+/// The restoration snapshot is taken when the didOpen starts creation,
+/// before this didClose can possibly land, so the creation task always
+/// replays the didOpen regardless. If the didClose were dropped instead of
+/// queued, the backend would permanently hold a document the proxy already
+/// considers closed. The mock's strictly-ordered scenario (didOpen, THEN
+/// didClose, THEN a verifying hover) makes this observable: if didClose
+/// isn't delivered, the mock receives the verifying hover while still
+/// expecting didClose, mismatches, and crashes — so the verifying hover
+/// fails instead of returning its scripted value.
+#[tokio::test]
+async fn didclose_during_creating_reaches_backend_e2e() {
+    let scenario = serde_json::json!({
+        "on_startup": [],
+        "steps": [
+            {
+                "expect": { "method": "initialize" },
+                "actions": [
+                    { "type": "sleep_ms", "ms": 300 },
+                    { "type": "respond", "body": { "capabilities": { "hoverProvider": true } } }
+                ]
+            },
+            { "expect": { "method": "initialized" }, "actions": [] },
+            { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
+            { "expect": { "method": "textDocument/didClose" }, "actions": [] },
+            {
+                "expect": { "method": "textDocument/hover" },
+                "actions": [{ "type": "respond", "body": { "contents": { "kind": "plaintext", "value": "verify hover" } } }]
+            },
+            {
+                "expect": { "method": "shutdown" },
+                "actions": [{ "type": "respond", "body": null }]
+            }
+        ]
+    });
+
+    let config = WorkspaceConfig {
+        packages: vec![PackageConfig {
+            name: "pkg".to_string(),
+            scenario,
+            has_venv: true,
+        }],
+    };
+
+    let (temp_dir, root) = support::setup_test_workspace(&config);
+    let mut proxy = ProxyUnderTest::spawn(temp_dir, root.clone(), &root);
+
+    let root_uri = support::path_to_uri(&root);
+    let init_resp = proxy.initialize(&root_uri).await;
+    assert!(
+        init_resp.error.is_none(),
+        "initialize should not return an error"
+    );
+    proxy.send_initialized().await;
+
+    let file_a = root.join("pkg/a.py");
+    std::fs::write(&file_a, "a = 1\n").unwrap();
+    let file_a_uri = support::path_to_uri(&file_a);
+    // Starts creation (300ms handshake delay); a.py is captured in the
+    // restoration snapshot this call takes.
+    proxy.did_open(&file_a_uri, "a = 1\n").await;
+
+    // Lands well within the 300ms handshake window: creation is already in
+    // flight, so this must queue instead of being silently dropped.
+    proxy
+        .notify(
+            "textDocument/didClose",
+            serde_json::json!({ "textDocument": { "uri": &file_a_uri } }),
+        )
+        .await;
+
+    // Only succeeds if the mock progressed past its didClose step, proving
+    // the didClose was actually delivered (queued and replayed) in order.
+    let verify = proxy
+        .request(
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": &file_a_uri },
+                "position": { "line": 0, "character": 0 }
+            }),
+        )
+        .await;
+    assert!(
+        verify.error.is_none(),
+        "verifying hover failed: {:?}",
+        verify.error
+    );
+    assert_eq!(
+        verify.result.as_ref().unwrap()["contents"]["value"],
+        "verify hover"
+    );
+
+    let shutdown_resp = proxy.shutdown_and_exit().await;
+    assert!(
+        shutdown_resp.error.is_none(),
+        "shutdown should not return an error"
+    );
+}

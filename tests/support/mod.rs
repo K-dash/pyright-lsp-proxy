@@ -150,7 +150,11 @@ pub fn write_broken_venv_fixture(pkg_dir: &Path) {
 pub struct ProxyUnderTest {
     child: Child,
     reader: LspFrameReader<tokio::process::ChildStdout>,
-    writer: LspFrameWriter<tokio::process::ChildStdin>,
+    // `Option` so the writer half can be taken and handed to a separately
+    // spawned task (see `spawn_notification_flood`) while `self` keeps the
+    // reader half for observing responses. `None` after that happens; any
+    // subsequent call routing through `write()` panics.
+    writer: Option<LspFrameWriter<tokio::process::ChildStdin>>,
     #[allow(dead_code)]
     temp_dir: TempDir,
     // Kept alive for the proxy's lifetime: its path backs the spawned
@@ -207,12 +211,72 @@ impl ProxyUnderTest {
         Self {
             child,
             reader: LspFrameReader::new(stdout),
-            writer: LspFrameWriter::new(stdin),
+            writer: Some(LspFrameWriter::new(stdin)),
             temp_dir,
             harness_home,
             root,
             next_id: 1,
         }
+    }
+
+    /// Take the writer half and hand it to a spawned task that floods the
+    /// proxy with fire-and-forget `method`/`params` notifications, as fast
+    /// as it can, until the returned handle is aborted.
+    ///
+    /// Used to keep client input continuously pending so a finite
+    /// pre-written batch (which an unfair, client-first select! could still
+    /// fully drain before any starvation became observable, since stdin
+    /// eventually empties) can't mask a fairness regression.
+    ///
+    /// After this call, `self` can no longer send — anything routing
+    /// through `write()` (`request`/`notify`/`send_request`/etc.) panics.
+    /// Only reading (`read_next`/`wait_for_response`/...) remains valid.
+    /// Intended for tests that only need to observe responses during the
+    /// flood and don't need a graceful `shutdown`/`exit` afterward — the
+    /// child process is cleaned up by `Drop` regardless.
+    #[allow(dead_code)] // Used by some but not all integration test binaries.
+    pub fn spawn_notification_flood(
+        &mut self,
+        method: &'static str,
+        params: Value,
+    ) -> tokio::task::JoinHandle<()> {
+        use tokio::io::AsyncWriteExt;
+
+        // Pre-frame ONE message's bytes once, then repeat them into a
+        // single large buffer written via one `write_all` call per batch,
+        // instead of looping `write_message` (header/body/flush — three
+        // separate `.await` points per message). A per-message loop yields
+        // to the scheduler often enough that the proxy's reader can drain
+        // the pipe faster than the flood refills it, leaving windows where
+        // client_reader.read_message() isn't immediately ready — exactly
+        // the gap a starvation regression would otherwise hide in. A large
+        // batch keeps the pipe genuinely saturated.
+        const BATCH_SIZE: usize = 256;
+
+        let mut writer = self
+            .writer
+            .take()
+            .expect("writer already taken by an earlier flood");
+
+        let msg = RpcMessage::notification(method, Some(params));
+        let content = serde_json::to_vec(&msg).expect("flood message must serialize");
+        let header = format!("Content-Length: {}\r\n\r\n", content.len());
+        let mut one_frame = Vec::with_capacity(header.len() + content.len());
+        one_frame.extend_from_slice(header.as_bytes());
+        one_frame.extend_from_slice(&content);
+
+        let mut batch = Vec::with_capacity(one_frame.len() * BATCH_SIZE);
+        for _ in 0..BATCH_SIZE {
+            batch.extend_from_slice(&one_frame);
+        }
+
+        tokio::spawn(async move {
+            loop {
+                if writer.get_mut().write_all(&batch).await.is_err() {
+                    return;
+                }
+            }
+        })
     }
 
     /// Return the canonical workspace root path.
@@ -338,6 +402,7 @@ impl ProxyUnderTest {
     }
 
     /// Perform shutdown + exit sequence. Returns the shutdown response.
+    #[allow(dead_code)] // Used by some but not all integration test binaries.
     pub async fn shutdown_and_exit(&mut self) -> RpcMessage {
         let resp = self.request("shutdown", Value::Null).await;
         let exit_msg = RpcMessage::notification("exit", None);
@@ -487,6 +552,21 @@ impl ProxyUnderTest {
         }
     }
 
+    /// Read the next LSP message, with no built-in timeout — the caller
+    /// wraps this in its own `tokio::time::timeout` (e.g. against an
+    /// overall deadline shared across many reads, rather than `read_next`'s
+    /// fixed per-call timeout).
+    #[allow(dead_code)] // Used by some but not all integration test binaries.
+    pub async fn read_message_raw(&mut self) -> RpcMessage {
+        match self.reader.read_message().await {
+            Ok(msg) => msg,
+            Err(e) => {
+                let stderr = self.dump_stderr().await;
+                panic!("read_message_raw: framing error: {e}\n--- proxy stderr ---\n{stderr}");
+            }
+        }
+    }
+
     /// Read the next LSP message (with timeout).
     pub async fn read_next(&mut self) -> RpcMessage {
         match tokio::time::timeout(READ_TIMEOUT, self.reader.read_message()).await {
@@ -507,9 +587,16 @@ impl ProxyUnderTest {
 
     /// Write an LSP message to the proxy's stdin.
     async fn write(&mut self, msg: &RpcMessage) {
-        self.writer.write_message(msg).await.unwrap_or_else(|e| {
-            panic!("write: failed to write message: {e}");
-        });
+        self.writer
+            .as_mut()
+            .expect(
+                "writer taken by spawn_notification_flood — this ProxyUnderTest can no longer send",
+            )
+            .write_message(msg)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("write: failed to write message: {e}");
+            });
     }
 
     /// Dump whatever is currently available on the proxy's stderr.
@@ -526,6 +613,36 @@ impl ProxyUnderTest {
         } else {
             "(no stderr handle)".to_string()
         }
+    }
+
+    /// Continuously drain and discard the proxy's stderr in the background.
+    ///
+    /// `child.stderr` is a `Stdio::piped()` handle with a small kernel
+    /// buffer (~64KB); nothing else reads it during a test unless a test
+    /// calls `dump_stderr` on a failure path. A test that generates high
+    /// log volume while the child runs (e.g. one `WARN` per dropped
+    /// message under a continuous flood) can fill that buffer within
+    /// seconds — `tracing`'s stderr writer is synchronous, so once the
+    /// pipe is full the proxy blocks on its own logging and every task on
+    /// its runtime stalls with it, indistinguishable from a genuine
+    /// starvation/deadlock bug from the outside. Tests that generate
+    /// sustained traffic should call this right after spawning. Takes
+    /// `child.stderr`, so `dump_stderr` becomes a no-op for the rest of
+    /// this instance's life — draining and inspecting are mutually
+    /// exclusive.
+    #[allow(dead_code)] // Used by tests with sustained/high-volume traffic.
+    pub fn spawn_stderr_drain(&mut self) -> tokio::task::JoinHandle<()> {
+        use tokio::io::AsyncReadExt;
+        let mut stderr = self.child.stderr.take().expect("stderr already taken");
+        tokio::spawn(async move {
+            let mut buf = [0u8; 8192];
+            loop {
+                match stderr.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        })
     }
 }
 

@@ -77,6 +77,16 @@ impl<W: AsyncWrite + Unpin> LspFrameWriter<W> {
         Self { writer }
     }
 
+    /// Escape hatch to the underlying writer, e.g. for batching multiple
+    /// pre-framed messages into a single `write_all` call (the E2E harness
+    /// uses this to saturate the proxy's client input for fairness testing;
+    /// `write_message` alone, with its own `write_all`/`write_all`/`flush`
+    /// per call, can't sustain that under per-call `.await` scheduling
+    /// gaps).
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.writer
+    }
+
     /// Write LSP message
     pub async fn write_message(&mut self, message: &RpcMessage) -> Result<(), FramingError> {
         let content = serde_json::to_vec(message)?;

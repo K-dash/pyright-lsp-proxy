@@ -138,12 +138,12 @@ The `Started`/`InFlight` distinction only matters for `didOpen`: the restoration
 
 When the creation task finishes, the `creation_rx` select! arm (the only code path allowed to remove a `Creating` entry) handles the outcome:
 
-- **Success**: insert the new `BackendInstance` into `backends`, then move `queued` into a global `ProxyState::replay_queue: VecDeque<RpcMessage>` — a plain `VecDeque::extend`, no backend I/O. A dedicated select! arm re-dispatches exactly **one** replayed message per loop iteration (never a batch loop — a burst of replayed `didOpen`s could itself exceed `backend_msg_rx`'s capacity), through the same dispatch path as an ordinary client message. `biased;` on the main `select!` places the `backend_msg_rx` arm ahead of the replay arm, so real backend traffic always drains first.
+- **Success**: insert the new `BackendInstance` into `backends`, then move `queued` into a global `ProxyState::replay_queue: VecDeque<RpcMessage>` — a plain `VecDeque::extend`, no backend I/O. A dedicated select! arm re-dispatches exactly **one** replayed message per loop iteration (never a batch loop — a burst of replayed `didOpen`s could itself exceed `backend_msg_rx`'s capacity), through the same dispatch path as an ordinary client message. The main `select!` is *not* `biased;` (see Event Loop below), so "real backend traffic drains before a replay" can no longer come from arm order; the replay arm enforces it itself with a non-blocking `backend_msg_rx.try_recv()` immediately before dispatching: if a backend message is already there, dispatch that instead and push the replay back to the front of the queue for the next iteration.
 - **Failure**: every queued *request* gets an immediate JSON-RPC error response; queued notifications are dropped with one dedup'd `window/showMessage` (issue #26's pattern) — contained per #92, never a process exit.
 
 **Pool capacity.** `is_full()` counts `backends.len() + creating.len()`: a creation task holds a real process even before it's `Ready`. If the pool is full and no `Ready` backend is evictable (every slot is `Creating`), backend creation is rejected outright with `ProxyError::PoolBusy` — surfaced as an immediate JSON-RPC error, no implicit waiting.
 
-**Known v1 gaps** (accepted, not fixed): a `$/progress end` for an instance not yet in `backends` is a no-op — the warmup state update is missed but converges via the warmup fail-open timeout; `didClose` for a `Creating` venv stays a no-op (not queued), narrowing an existing open-then-close race rather than closing it; fan-out (`workspace/symbol`) only targets `pool.backends_keys()`, so a `Creating` venv is silently excluded — unchanged, existing best-effort semantics.
+**Known v1 gaps** (accepted, not fixed): a `$/progress end` for an instance not yet in `backends` is a no-op — the warmup state update is missed but converges via the warmup fail-open timeout; fan-out (`workspace/symbol`) only targets `pool.backends_keys()`, so a `Creating` venv is silently excluded — unchanged, existing best-effort semantics. (`didClose` for a `Creating` venv used to be a similar no-op; it's now queued and replayed like any other message — see Event Loop below.)
 
 ## Backend-to-Client Request Proxying
 
@@ -611,7 +611,7 @@ make ci
 | `text_edit.rs` | Incremental text edit application for didChange |
 | `venv.rs` | `.venv` search logic (parent traversal, git toplevel boundary) |
 | `error.rs` | Error type definitions (ProxyError, BackendError, etc.) |
-| `proxy/mod.rs` | Main event loop (`tokio::select!` with 5 arms) |
+| `proxy/mod.rs` | Main event loop (`tokio::select!` with 7 arms) |
 | `proxy/client_dispatch.rs` | Client message routing, warmup queueing, cancel handling |
 | `proxy/backend_dispatch.rs` | Backend message routing, proxy ID rewriting, progress detection |
 | `proxy/fanout.rs` | Fan-out dispatch, response merging, deduplication, timeout handling |
@@ -622,20 +622,22 @@ make ci
 
 ### Event Loop
 
-The main event loop in `proxy/mod.rs` uses `tokio::select!`, `biased;`, with 7 arms:
+The main event loop in `proxy/mod.rs` uses `tokio::select!` with 7 arms, unbiased (default randomized-order polling):
 
 ```
 ┌───────────────────────────────────────────────────────────┐
-│                  tokio::select! (biased)                  │
+│                 tokio::select! (unbiased)                  │
 ├───────────────────────────────────────────────────────────┤
-│ 1. Client reader     │ stdin JSON-RPC messages             │
-│ 2. Backend reader    │ mpsc channel (all backends)         │
-│ 3. Creation outcome  │ mpsc channel (backend-creation tasks)│
-│ 4. TTL timer         │ 60s interval sweep                  │
-│ 5. Warmup timer      │ nearest warmup deadline             │
-│ 6. Fan-out timer     │ nearest fan-out deadline             │
-│ 7. Replay queue      │ one Creating-queued message/iteration│
+│ Client reader     │ mpsc channel (dedicated reader task)   │
+│ Backend reader    │ mpsc channel (all backends)            │
+│ Creation outcome  │ mpsc channel (backend-creation tasks)  │
+│ TTL timer         │ 60s interval sweep                     │
+│ Warmup timer      │ nearest warmup deadline                │
+│ Fan-out timer     │ nearest fan-out deadline                │
+│ Replay queue      │ one Creating-queued message/iteration  │
 └───────────────────────────────────────────────────────────┘
 ```
 
-`biased;` polls arms top-to-bottom instead of in random order, stopping at the first ready one. This is load-bearing for arm 7 (see the Creating State section): arm 2 (backend reader) must always be checked — and, if ready, win — ahead of arm 7, so a replayed message can never be dispatched while there's real backend traffic waiting to be drained. All other arms keep their pre-existing relative order.
+**Not `biased;`.** An earlier version put `biased;` on this `select!` with the client reader listed first, to guarantee two orderings: backend traffic must drain before a replay (see Creating State), and — implicitly, by omission — nothing was thought to need priority *over* the client. Under sustained client input that second assumption breaks down: a `biased;` client-first `select!` can starve backend responses, creation outcomes, every timer, and replay indefinitely, and can reintroduce the #93 deadlock by a different path — a client flood plus a diagnostics burst fills `backend_msg_rx`, parking its reader task; the wedged backend stops reading its own stdin; a client-arm forward (e.g. `didChange`) then blocks writing to that backend's stdin; and the main loop is stuck with no other arm ever getting polled to drain the channel and unwedge it. The one real ordering requirement — backend traffic before a replay — doesn't need arm order to hold: it's enforced locally inside the replay arm instead, via a non-blocking `backend_msg_rx.try_recv()` immediately before dispatching a replay (see Creating State above).
+
+**Client reads are a channel, not an inline read, for a second, independent reason.** `LspFrameReader::read_message()` spans multiple `.await` points (a `read_line` loop for headers, then `read_exact` for the body), and tokio documents `read_line` as not cancellation-safe: used directly as a `select!` branch, a read that's mid-frame when some other arm resolves first gets dropped, silently losing whatever header/body bytes it had already consumed from the stream and desyncing framing for every read after it — observed as spurious "Missing Content-Length header" errors that crash the whole proxy. This risk exists independently of `biased;`, but an unbiased `select!` visits the other arms more often, making it far easier to trigger. The client reader now runs on its own dedicated task, looping `read_message()` to completion with no `select!` in between, and forwards each parsed message over a channel — the same dedicated-task-plus-channel shape the backend reader already used for the identical reason (`mpsc::Receiver::recv()` **is** cancel-safe, so consuming from a channel inside `select!` is fine even though the read that fills it isn't).
