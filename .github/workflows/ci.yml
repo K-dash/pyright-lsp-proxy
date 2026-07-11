@@ -10,13 +10,15 @@ on:
     paths-ignore:
       - "*.md"
 
-# Dedupe superseded runs. For pull_request events, github.head_ref is the PR's
-# source branch, so repeated pushes to the same PR share a group and the
-# newer run cancels the older one. For push events to main, head_ref is empty,
-# so the group falls back to the unique run_id — every main commit gets its
-# own group and never cancels another main run.
+# Dedupe superseded runs. Group by PR number (not head_ref: branch names are
+# not unique across forks, so two PRs from different forks with the same
+# branch name would otherwise share a group and cancel each other). Repeated
+# pushes to the same PR share a group, so the newer run cancels the older one.
+# For push events to main, there is no pull_request number, so the group
+# falls back to the unique run_id — every main commit gets its own group and
+# never cancels another main run.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 permissions:
