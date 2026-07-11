@@ -72,7 +72,30 @@ pub(crate) fn should_restore_document(
     doc_venv == Some(venv)
         || (doc_venv.is_none()
             && match (file_path, venv_parent) {
-                (Some(fp), Some(vp)) => fp.starts_with(vp),
+                (Some(fp), Some(vp)) => {
+                    // `fp` is the raw client URI's path (logical form); `vp`
+                    // is always canonical, derived from `venv`, which has
+                    // been canonical since #116. Canonicalize `fp`'s PARENT
+                    // directory, not `fp` itself, and compare that against
+                    // `vp` — mirroring `find_venv`'s entry-point idiom
+                    // (which also canonicalizes only the parent). `didOpen`
+                    // genuinely delivers unsaved buffers: canonicalizing the
+                    // full path would fail for a file that doesn't exist on
+                    // disk yet even though its parent directory does, and
+                    // silently fall back to the uncanonicalized path, so a
+                    // symlinked project would still never match for that
+                    // case (#119). Only containment matters here, so the
+                    // parent-only comparison is sufficient.
+                    fp.parent().map_or_else(
+                        || fp.starts_with(vp),
+                        |parent| {
+                            let canonical_parent = parent
+                                .canonicalize()
+                                .unwrap_or_else(|_| parent.to_path_buf());
+                            canonical_parent.starts_with(vp)
+                        },
+                    )
+                }
                 _ => false,
             })
 }
@@ -408,6 +431,66 @@ mod tests {
             Path::new(VENV),
             Some(Path::new("/repo/a.py")),
             None,
+        ));
+    }
+
+    /// Regression test for #119: the file path arrives in logical
+    /// (symlinked) form from the client URI, while `venv`/`venv_parent` are
+    /// always canonical (physical) form since #116 — mirroring the #95
+    /// scenario `find_venv` already handles (e.g. macOS's `/tmp` ->
+    /// `/private/tmp`). Without canonicalizing `file_path` in the fallback
+    /// comparison, `starts_with` can never match here.
+    #[test]
+    fn restores_unresolved_document_reached_through_a_symlinked_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+
+        let real_project = root.join("real_project");
+        std::fs::create_dir(&real_project).unwrap();
+        let file = real_project.join("a.py");
+        std::fs::write(&file, "a = 1\n").unwrap();
+
+        let symlink_project = root.join("symlinked_project");
+        std::os::unix::fs::symlink(&real_project, &symlink_project).unwrap();
+        let file_via_symlink = symlink_project.join("a.py");
+
+        let venv = real_project.join(".venv");
+
+        assert!(should_restore_document(
+            None,
+            &venv,
+            Some(&file_via_symlink),
+            Some(&real_project),
+        ));
+    }
+
+    /// Regression test for #119 (parent-canonicalize follow-up): `didOpen`
+    /// genuinely delivers unsaved buffers — the target file itself may not
+    /// exist on disk yet even though its parent directory does. Only the
+    /// project directory is created here; `new_file.py` is deliberately
+    /// never written. A whole-path `canonicalize()` fails for a
+    /// not-yet-existing file and falls back to the raw (symlinked) path, so
+    /// this case still missed restoration even after the first #119 fix —
+    /// canonicalizing the parent directory instead closes it.
+    #[test]
+    fn restores_unresolved_document_for_an_unsaved_file_under_a_symlinked_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+
+        let real_project = root.join("real_project");
+        std::fs::create_dir(&real_project).unwrap();
+
+        let symlink_project = root.join("symlinked_project");
+        std::os::unix::fs::symlink(&real_project, &symlink_project).unwrap();
+        let unsaved_file_via_symlink = symlink_project.join("new_file.py");
+
+        let venv = real_project.join(".venv");
+
+        assert!(should_restore_document(
+            None,
+            &venv,
+            Some(&unsaved_file_via_symlink),
+            Some(&real_project),
         ));
     }
 
