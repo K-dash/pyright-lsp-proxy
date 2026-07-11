@@ -13,6 +13,31 @@ use typemux_cc::message::{RpcId, RpcMessage};
 
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+// ── Hermeticity defaults ────────────────────────────────────────────
+//
+// Every spawned proxy is isolated from the developer's real environment
+// (see #120): `HOME` is redirected to a per-spawn temp dir so
+// `~/.config/typemux-cc/config` (src/config.rs:21-23) can't leak developer
+// settings into a test run, `PATH` is sanitized so a missing mock shim in
+// `.venv/bin` fails loudly instead of silently falling through to a real
+// `pyright-langserver`/`ty`/`pyrefly` install, and `RUST_LOG` gets a quiet
+// default instead of the crate's own `typemux_cc=debug` fallback. Applied
+// before `envs`, so an explicit entry in a test's `spawn_with_env` call
+// always overrides the default for that key.
+
+/// Minimal `PATH` for spawned proxies: enough to resolve `git` (venv
+/// boundary detection) and to exec the mock shim's `#!/bin/sh` shebang
+/// (resolved directly by the kernel, not via `PATH`). Excludes any
+/// developer-installed backend so a missing shim in `.venv/bin` is a loud,
+/// deterministic failure rather than a silent fallback to a real install.
+const HERMETIC_PATH: &str = "/usr/bin:/bin";
+
+/// Default `RUST_LOG` for spawned proxies. Quiets the crate's own
+/// `typemux_cc=debug` fallback (src/main.rs) and a developer's
+/// `~/.config/typemux-cc/config` possibly setting `RUST_LOG=trace`, either
+/// of which can push timing-sensitive E2E tests toward their read timeout.
+const HERMETIC_RUST_LOG: &str = "typemux_cc=warn";
+
 // ── Workspace configuration ────────────────────────────────────────
 
 /// Describes one package (sub-directory) inside the test workspace.
@@ -128,6 +153,10 @@ pub struct ProxyUnderTest {
     writer: LspFrameWriter<tokio::process::ChildStdin>,
     #[allow(dead_code)]
     temp_dir: TempDir,
+    // Kept alive for the proxy's lifetime: its path backs the spawned
+    // proxy's `HOME`, which `src/config.rs` reads at startup.
+    #[allow(dead_code)]
+    harness_home: TempDir,
     #[allow(dead_code)] // Read via `root()`, used by some but not all integration test binaries.
     root: PathBuf,
     next_id: i64,
@@ -149,6 +178,8 @@ impl ProxyUnderTest {
         envs: &[(&str, &str)],
     ) -> Self {
         let proxy_bin = env!("CARGO_BIN_EXE_typemux-cc");
+        let harness_home = TempDir::new().expect("failed to create harness HOME dir");
+
         let mut child = Command::new(proxy_bin)
             .current_dir(cwd)
             // Clear git env vars so the proxy's `git rev-parse` uses the test
@@ -157,6 +188,11 @@ impl ProxyUnderTest {
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")
+            // Hermeticity defaults (see the module-level comment above);
+            // `envs` is applied last so an explicit entry always wins.
+            .env("HOME", harness_home.path())
+            .env("PATH", HERMETIC_PATH)
+            .env("RUST_LOG", HERMETIC_RUST_LOG)
             .envs(envs.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -173,6 +209,7 @@ impl ProxyUnderTest {
             reader: LspFrameReader::new(stdout),
             writer: LspFrameWriter::new(stdin),
             temp_dir,
+            harness_home,
             root,
             next_id: 1,
         }
