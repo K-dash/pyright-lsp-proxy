@@ -273,6 +273,32 @@ impl super::LspProxy {
                     error = ?e,
                     "Backend creation failed"
                 );
+                // Requests get an immediate error response (no backend
+                // will ever exist for them). Notifications are different:
+                // round 2's Creating-state design defers their cache
+                // mutation (didClose's removal, didChange's edit) to
+                // whichever pass finds the venv no longer Creating, on the
+                // assumption that pass is always a replay. Dropping them
+                // here instead of replaying them would mean that mutation
+                // never runs at all — a didClose's document stays open
+                // forever (the ghost-document bug round 2 fixed, back via
+                // the failure path instead of the success path), and a
+                // didChange's edit is lost, so the next restoration replays
+                // stale text. So notifications go to `replay_queue` here
+                // too, exactly like the success arm above, even though
+                // there's no backend for them to reach: on re-dispatch the
+                // venv is no longer Creating, so didClose/didChange apply
+                // their deferred mutation and then no-op on the forward
+                // (venv absent from the pool). A replayed didOpen is the
+                // one case that does more than that: `ensure_backend_in_pool`
+                // sees the venv absent and starts a fresh creation attempt.
+                // That's bounded, not a retry loop — a second failure finds
+                // no replay queued for it (only a newly-arrived client
+                // message could requeue), and the error notification is
+                // already deduplicated — so this just turns "lazy retry on
+                // the next unrelated request" into "one immediate retry for
+                // documents the client opened during the failed window".
+                let mut requeued_notifications = Vec::new();
                 for queued in entry.queued {
                     if let Some(id) = &queued.id {
                         self.state.pending_requests.remove(id);
@@ -281,8 +307,11 @@ impl super::LspProxy {
                             &format!("lsp-proxy: backend error: {e}"),
                         );
                         client_writer.write_message(&error_response).await?;
+                    } else {
+                        requeued_notifications.push(queued);
                     }
                 }
+                self.state.replay_queue.extend(requeued_notifications);
                 self.notify_backend_error(&venv_path, &e, client_writer)
                     .await;
             }

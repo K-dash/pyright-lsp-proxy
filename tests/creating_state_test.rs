@@ -1427,3 +1427,165 @@ async fn didclose_during_creating_reaches_backend_e2e() {
         "shutdown should not return an error"
     );
 }
+
+/// E2E (blocking review finding, round 3): a `didClose` queued behind a
+/// creation that then FAILS must still update the document cache before
+/// the venv's next (lazy-retry) creation attempt — not be dropped along
+/// with the queued requests.
+///
+/// Round 2 deferred a queued didClose's cache removal to whichever pass
+/// resolves it, on the assumption that pass is always a replay. Creation
+/// failure has no replay for notifications by default (only queued
+/// *requests* get an explicit error response), so without also replaying
+/// queued notifications on failure, the deferred removal never runs: the
+/// closed document stays cached, and the next creation's restoration
+/// snapshot resurrects it as a ghost `didOpen` the new mock never expects.
+///
+/// This mock's second scenario is strictly ordered with exactly one
+/// `textDocument/didOpen` step (the still-open document). A ghost replay
+/// of the closed document's `didOpen` desyncs the scenario against the
+/// next step (`textDocument/hover`) and crashes the mock — so the
+/// verifying hover times out instead of returning its scripted value.
+#[tokio::test]
+async fn didclose_queued_behind_failing_creation_prevents_ghost_replay_e2e() {
+    // Creation 1: dies mid-handshake (after reading `initialize`, before
+    // responding), giving a real — if brief — Creating window to queue the
+    // didClose against, then failing deterministically.
+    let scenario_crash = serde_json::json!({
+        "on_startup": [],
+        "steps": [
+            {
+                "expect": { "method": "initialize" },
+                "actions": [
+                    { "type": "sleep_ms", "ms": 300 },
+                    { "type": "crash" }
+                ]
+            }
+        ]
+    });
+
+    let config = WorkspaceConfig {
+        packages: vec![PackageConfig {
+            name: "pkg".to_string(),
+            scenario: scenario_crash,
+            has_venv: true,
+        }],
+    };
+
+    let (temp_dir, root) = support::setup_test_workspace(&config);
+    let pkg_dir = root.join("pkg");
+    let mut proxy = ProxyUnderTest::spawn(temp_dir, root.clone(), &root);
+
+    let root_uri = support::path_to_uri(&root);
+    let init_resp = proxy.initialize(&root_uri).await;
+    assert!(
+        init_resp.error.is_none(),
+        "initialize should not return an error"
+    );
+    proxy.send_initialized().await;
+
+    let closed_doc = pkg_dir.join("a.py");
+    std::fs::write(&closed_doc, "a = 1\n").unwrap();
+    let closed_doc_uri = support::path_to_uri(&closed_doc);
+    // Starts creation 1 (300ms handshake delay before it crashes).
+    proxy.did_open(&closed_doc_uri, "a = 1\n").await;
+
+    // Lands well within the 300ms window: creation 1 is in flight, so this
+    // queues behind it instead of forwarding anywhere.
+    proxy
+        .notify(
+            "textDocument/didClose",
+            serde_json::json!({ "textDocument": { "uri": &closed_doc_uri } }),
+        )
+        .await;
+
+    // Synchronizing round-trip: creation 1's failure notification is only
+    // sent after `creating_remove` and the (fixed) requeue of the queued
+    // didClose into `replay_queue` have already happened — and, just as
+    // importantly for this test, only after creation 1's own process has
+    // already spawned and read whatever scenario file was on disk at that
+    // time. Repairing the fixture any earlier than this (e.g. right after
+    // sending the didOpen above) races creation 1's own process startup:
+    // if the repair wins, creation 1 reads the GOOD scenario instead of
+    // the crash one, never fails at all, and this test is exercising
+    // nothing.
+    let failure = proxy
+        .wait_for_notification("window/showMessage", 5000)
+        .await;
+    let failure_msg = failure.params.as_ref().unwrap()["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        failure_msg.contains("Failed to start LSP backend"),
+        "expected a backend-start failure message, got: {failure_msg}"
+    );
+
+    // Heal the venv for creation 2: exactly one restoration didOpen, for
+    // the still-open document only.
+    let scenario_retry = serde_json::json!({
+        "on_startup": [],
+        "steps": [
+            {
+                "expect": { "method": "initialize" },
+                "actions": [{ "type": "respond", "body": { "capabilities": { "hoverProvider": true } } }]
+            },
+            { "expect": { "method": "initialized" }, "actions": [] },
+            { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
+            {
+                "expect": { "method": "textDocument/hover" },
+                "actions": [{ "type": "respond", "body": { "contents": { "kind": "plaintext", "value": "verify hover b" } } }]
+            },
+            {
+                "expect": { "method": "shutdown" },
+                "actions": [{ "type": "respond", "body": null }]
+            }
+        ]
+    });
+    support::write_venv_fixture(&pkg_dir, &scenario_retry);
+
+    // Generous margin for the queued didClose to actually get replayed
+    // (dispatched) — it requires no further I/O (the venv is absent, so
+    // the forward after cache removal is a no-op), so this is far more
+    // than it needs, but documents the ordering this test depends on: the
+    // didClose's cache removal must complete before the didOpen below
+    // starts creation 2's restoration snapshot.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Trigger a retry via a normal request: a plain didOpen for a second,
+    // still-open document. The venv is absent (creation 1 failed, nothing
+    // pooled), so this starts creation 2 and its own restoration snapshot
+    // is taken synchronously from this same call — it must contain only
+    // this document, not the closed one.
+    let open_doc = pkg_dir.join("b.py");
+    std::fs::write(&open_doc, "b = 1\n").unwrap();
+    let open_doc_uri = support::path_to_uri(&open_doc);
+    proxy.did_open(&open_doc_uri, "b = 1\n").await;
+
+    // Only succeeds if creation 2's mock progressed past its single
+    // restoration didOpen without a ghost desyncing the scenario.
+    let verify = proxy
+        .request(
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": &open_doc_uri },
+                "position": { "line": 0, "character": 0 }
+            }),
+        )
+        .await;
+    assert!(
+        verify.error.is_none(),
+        "verifying hover failed: {:?}",
+        verify.error
+    );
+    assert_eq!(
+        verify.result.as_ref().unwrap()["contents"]["value"],
+        "verify hover b"
+    );
+
+    let shutdown_resp = proxy.shutdown_and_exit().await;
+    assert!(
+        shutdown_resp.error.is_none(),
+        "shutdown should not return an error"
+    );
+}
