@@ -109,8 +109,28 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
+/// `scripts/check-versions.sh` requires `jq`. Tests print a skip notice and
+/// return early rather than fail when it's absent, so a missing optional
+/// dev tool is never mistaken for a real assertion failure.
+fn jq_available() -> bool {
+    let available = Command::new("jq")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !available {
+        println!(
+            "skipping: jq not found in PATH (required by scripts/check-versions.sh); \
+             install with `brew install jq` or `apt-get install -y jq`"
+        );
+    }
+    available
+}
+
 #[test]
 fn matching_versions_pass() {
+    if !jq_available() {
+        return;
+    }
     let temp = TempDir::new().unwrap();
     write_fixture(temp.path(), &Versions::matching("1.2.3"));
 
@@ -122,6 +142,9 @@ fn matching_versions_pass() {
 
 #[test]
 fn cargo_toml_mismatch_fails_and_reports_value() {
+    if !jq_available() {
+        return;
+    }
     let temp = TempDir::new().unwrap();
     let mut v = Versions::matching("1.2.3");
     v.cargo_toml = "9.9.9";
@@ -138,6 +161,9 @@ fn cargo_toml_mismatch_fails_and_reports_value() {
 
 #[test]
 fn cargo_lock_mismatch_is_scoped_to_the_root_package() {
+    if !jq_available() {
+        return;
+    }
     let temp = TempDir::new().unwrap();
     let mut v = Versions::matching("1.2.3");
     v.cargo_lock = "9.9.9";
@@ -155,6 +181,9 @@ fn cargo_lock_mismatch_is_scoped_to_the_root_package() {
 
 #[test]
 fn plugin_json_mismatch_fails_and_reports_value() {
+    if !jq_available() {
+        return;
+    }
     let temp = TempDir::new().unwrap();
     let mut v = Versions::matching("1.2.3");
     v.plugin_json = "9.9.9";
@@ -170,6 +199,9 @@ fn plugin_json_mismatch_fails_and_reports_value() {
 
 #[test]
 fn marketplace_json_mismatch_fails_and_reports_value() {
+    if !jq_available() {
+        return;
+    }
     let temp = TempDir::new().unwrap();
     let mut v = Versions::matching("1.2.3");
     v.marketplace_json = "9.9.9";
@@ -185,6 +217,9 @@ fn marketplace_json_mismatch_fails_and_reports_value() {
 
 #[test]
 fn malformed_json_fails_and_names_the_file() {
+    if !jq_available() {
+        return;
+    }
     let temp = TempDir::new().unwrap();
     write_fixture(temp.path(), &Versions::matching("1.2.3"));
     std::fs::write(
@@ -202,6 +237,9 @@ fn malformed_json_fails_and_names_the_file() {
 
 #[test]
 fn release_tag_matching_version_passes() {
+    if !jq_available() {
+        return;
+    }
     let temp = TempDir::new().unwrap();
     write_fixture(temp.path(), &Versions::matching("1.2.3"));
 
@@ -212,6 +250,9 @@ fn release_tag_matching_version_passes() {
 
 #[test]
 fn release_tag_mismatch_fails_and_reports_both_values() {
+    if !jq_available() {
+        return;
+    }
     let temp = TempDir::new().unwrap();
     write_fixture(temp.path(), &Versions::matching("1.2.3"));
 
@@ -227,6 +268,9 @@ fn release_tag_mismatch_fails_and_reports_both_values() {
 /// above: fails if a real version bump ever forgets one of the four files.
 #[test]
 fn real_repo_versions_agree() {
+    if !jq_available() {
+        return;
+    }
     let output = run_check(Path::new(env!("CARGO_MANIFEST_DIR")), &[]);
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));

@@ -166,7 +166,13 @@ On any failure it keeps the previously working binary and prints an explicit war
 
 ### Method B: Local Build (For Developers)
 
-> Requires Rust 1.75 or later.
+> Requires Rust 1.75 or later. Running the full test suite (`cargo test` /
+> `make ci`) additionally requires [`jq`](https://jqlang.org/) — it's used by
+> `scripts/check-versions.sh` to validate the release version across
+> `Cargo.toml`, `Cargo.lock`, and the plugin manifests. Install it with
+> `brew install jq` (macOS) or `apt-get install -y jq` (Debian/Ubuntu). If
+> it's missing, the version-consistency tests print a skip notice instead of
+> failing.
 
 ```bash
 git clone https://github.com/K-dash/typemux-cc.git
