@@ -11,8 +11,8 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: read
+# Deny by default; each job below opts into the minimum it needs.
+permissions: {}
 
 jobs:
   validate:
@@ -23,16 +23,15 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
       - name: Check version consistency & release tag
         run: ./scripts/check-versions.sh --release "$GITHUB_REF_NAME"
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
       - name: Run quality gate
         run: make ci
@@ -59,10 +58,12 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           targets: ${{ matrix.target }}
 
@@ -89,7 +90,7 @@ jobs:
       # the release itself is only ever created once, by `publish`, after
       # every matrix leg here has succeeded.
       - name: Upload build artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ matrix.binary_name }}
           path: |
@@ -107,19 +108,35 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
           merge-multiple: true
 
-      # Create the release exactly once, with every asset attached and
-      # generated notes. Doing this in a single job also avoids the
-      # duplicated "What's Changed" section that appeared when notes were
-      # generated repeatedly across matrix legs.
+      # Fail loudly if a platform's binary or checksum is missing, instead of
+      # letting the glob below silently publish a partial release.
+      - name: Verify release assets
+        run: |
+          test "$(find artifacts -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 6
+          test -f artifacts/typemux-cc-macos-arm64
+          test -f artifacts/typemux-cc-macos-arm64.sha256
+          test -f artifacts/typemux-cc-linux-x86_64
+          test -f artifacts/typemux-cc-linux-x86_64.sha256
+          test -f artifacts/typemux-cc-linux-arm64
+          test -f artifacts/typemux-cc-linux-arm64.sha256
+
+      # `gh release create` is atomic by design: it creates a draft release,
+      # uploads every asset, and only publishes once every upload succeeds —
+      # so a failed upload never leaves a partial release public. This
+      # replaces the third-party softprops/action-gh-release action with the
+      # `gh` CLI already preinstalled on GitHub-hosted runners.
+      # `--verify-tag` stops `gh` from auto-creating a tag on the default
+      # branch if the pushed tag is somehow not found on the remote.
       - name: Create GitHub release with all assets
-        uses: softprops/action-gh-release@v3
-        with:
-          generate_release_notes: true
-          files: artifacts/*
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" artifacts/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes
