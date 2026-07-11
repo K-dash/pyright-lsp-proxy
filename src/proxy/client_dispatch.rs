@@ -1,5 +1,5 @@
 use crate::backend::LspBackend;
-use crate::backend_pool::{shutdown_backend_instance, BackendInstance};
+use crate::backend_pool::{shutdown_backend_instance, BackendInstance, MAX_WARMUP_QUEUE_LEN};
 use crate::error::ProxyError;
 use crate::framing::LspFrameWriter;
 use crate::message::{RpcId, RpcMessage};
@@ -300,6 +300,36 @@ impl super::LspProxy {
 
             if let Some((session, should_queue)) = backend_info {
                 if should_queue {
+                    let queued = self
+                        .state
+                        .pool
+                        .get_mut(venv_path)
+                        .is_some_and(|inst| inst.try_queue_warmup_request(msg.clone()));
+
+                    if !queued {
+                        let queue_len = self
+                            .state
+                            .pool
+                            .get(venv_path)
+                            .map_or(0, |inst| inst.warmup_queue.len());
+                        tracing::warn!(
+                            method = ?method,
+                            id = ?msg.id,
+                            venv = %venv_path.display(),
+                            queue_len,
+                            "Rejecting index-dependent request: warmup queue full"
+                        );
+                        let error_response = RpcMessage::error_response(
+                            msg,
+                            &format!(
+                                "lsp-proxy: warmup queue full ({MAX_WARMUP_QUEUE_LEN} requests) for {}",
+                                venv_path.display()
+                            ),
+                        );
+                        client_writer.write_message(&error_response).await?;
+                        return Ok(());
+                    }
+
                     // Register in pending requests (so cancel/crash handling works)
                     self.register_pending_request(msg, session, venv_path);
                     tracing::info!(
@@ -308,9 +338,6 @@ impl super::LspProxy {
                         venv = %venv_path.display(),
                         "Queueing index-dependent request during warmup"
                     );
-                    if let Some(inst) = self.state.pool.get_mut(venv_path) {
-                        inst.warmup_queue.push(msg.clone());
-                    }
                     return Ok(());
                 }
 
