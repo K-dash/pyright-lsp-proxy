@@ -202,16 +202,25 @@ impl super::LspProxy {
     /// `BackendPool::creating`.
     ///
     /// Success (and actually alive): insert the new `BackendInstance` into
-    /// `backends`, then move the entry's queued messages into
+    /// `backends`, then move the entry's queued client messages into
     /// `ProxyState::replay_queue` — a plain `VecDeque::extend`, no I/O, no
     /// backend writes here (see ARCHITECTURE.md on why replay must not be a
-    /// batch loop).
+    /// batch loop). Separately, any server-initiated requests queued during
+    /// Creating (`CreatingEntry.server_requests`, see #134) are forwarded to
+    /// the CLIENT here, bounded to `MAX_CREATING_SERVER_REQUEST_QUEUE_LEN` —
+    /// client-directed writes, not backend I/O, so this stays in the same
+    /// "small, finite loop" class as the failure arm's error responses
+    /// below, not the batch-loop restriction replay is under.
     ///
     /// Success but already dead, or failure: every queued *request* gets an
     /// immediate JSON-RPC error response (bounded to `MAX_CREATING_QUEUE_LEN`,
     /// so this is a small, finite loop, unlike replay); queued notifications
     /// are dropped, and a single dedup'd `window/showMessage` reports the
     /// failure (#92 containment: notify + lazy retry, never process exit).
+    /// Queued server-initiated requests are dropped too — no backend
+    /// survives to answer them, and nothing was ever registered in
+    /// `pending_backend_requests` for them (registration only happens at
+    /// forward time, above), so there is nothing to leak.
     pub(crate) async fn handle_creation_outcome(
         &mut self,
         outcome: CreationOutcome,
@@ -261,6 +270,7 @@ impl super::LspProxy {
                     venv = %venv_path.display(),
                     session = entry.session,
                     queued = entry.queued.len(),
+                    server_requests = entry.server_requests.len(),
                     indexing_progress_token = ?instance.indexing_progress_token,
                     "Backend creation completed"
                 );
@@ -269,6 +279,28 @@ impl super::LspProxy {
                 self.warn_if_project_root_ignored(&venv_path, client_writer)
                     .await;
                 self.state.replay_queue.extend(entry.queued);
+
+                // #134: server-initiated requests queued during Creating
+                // (see `dispatch_creating_backend_message`) are forwarded to
+                // the client now, through the same rewriting a `Ready`
+                // backend's request gets — the instance is already inserted
+                // into the pool above, so `pending_backend_requests`
+                // registration below routes the client's eventual response
+                // back to it via `dispatch_client_response`, exactly like a
+                // request that arrived after Ready. Bookkeeping-only, like
+                // the rest of this handler: forwarding at most
+                // `MAX_CREATING_SERVER_REQUEST_QUEUE_LEN` small requests to
+                // the client is no heavier than the failure arm's bounded
+                // error-response loop below — no backend I/O here.
+                for request in entry.server_requests {
+                    self.forward_backend_request_to_client(
+                        &venv_path,
+                        entry.session,
+                        request,
+                        client_writer,
+                    )
+                    .await?;
+                }
             }
             Err(e) => {
                 tracing::error!(
@@ -316,6 +348,22 @@ impl super::LspProxy {
                     }
                 }
                 self.state.replay_queue.extend(requeued_notifications);
+
+                // #134: server-initiated requests queued during Creating
+                // have no backend left to answer — drop them. Nothing was
+                // ever registered in `pending_backend_requests` for them
+                // (registration only happens at forward time, in the
+                // success arm above), so there is nothing to clean up here
+                // and no leak.
+                if !entry.server_requests.is_empty() {
+                    tracing::debug!(
+                        venv = %venv_path.display(),
+                        session = entry.session,
+                        count = entry.server_requests.len(),
+                        "Dropping server-initiated requests queued during a failed creation; no backend to answer them"
+                    );
+                }
+
                 self.notify_backend_error(&venv_path, &e, client_writer)
                     .await;
             }

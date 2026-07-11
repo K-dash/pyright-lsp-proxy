@@ -271,6 +271,21 @@ impl BackendInstance {
 /// different mechanisms.
 pub const MAX_CREATING_QUEUE_LEN: usize = 64;
 
+/// Maximum number of server-initiated (backend→client) requests queued per
+/// venv while its backend is `Creating`. A separate queue and constant from
+/// `MAX_CREATING_QUEUE_LEN` even though they share the same bound: that one
+/// bounds client→backend messages, the opposite direction, with a different
+/// overflow response (a JSON-RPC error or a dedup'd `showMessage` — there's
+/// a client-facing surface to answer with) and a different drain mechanism
+/// (`replay_queue`, one message per event-loop iteration, vs. this queue's
+/// direct forward inside `handle_creation_outcome`). An overflowing server
+/// request has no such surface — it's just dropped (see
+/// `dispatch_creating_backend_message`) — so conflating the two queues would
+/// blur two genuinely different failure modes. Same bound as its sibling
+/// (64): no evidence yet that a real backend needs more requests answered
+/// during this window than a client has messages queued behind it.
+pub const MAX_CREATING_SERVER_REQUEST_QUEUE_LEN: usize = 64;
+
 /// A backend currently being created (spawn + handshake + restoration
 /// running in a `tokio::spawn`ed task — see ARCHITECTURE.md's Creating-state
 /// section). Tracked in `BackendPool::creating`, a map separate from
@@ -296,6 +311,17 @@ pub struct CreatingEntry {
     /// this carry-over, that race would permanently lose the indexing token
     /// and strand warmup on the timeout alone. See #104's capture notes.
     pub indexing_progress_token: Option<RpcId>,
+    /// Server-initiated (backend→client) requests that arrived for this venv
+    /// while it was Creating, in arrival order — see #134 (pyright 1.1.407
+    /// sends `workspace/configuration` moments after `initialized`, squarely
+    /// in this window). A separate queue from `queued`: opposite direction,
+    /// different overflow handling, and drained differently — forwarded
+    /// through the same client-facing rewriting a `Ready` backend's request
+    /// gets (`backend_dispatch::forward_backend_request_to_client`) once
+    /// creation succeeds (`pool_management::handle_creation_outcome`), or
+    /// dropped with a debug log on failure (no backend survives to answer
+    /// them).
+    pub server_requests: Vec<RpcMessage>,
 }
 
 impl CreatingEntry {
@@ -304,6 +330,7 @@ impl CreatingEntry {
             session,
             queued: Vec::new(),
             indexing_progress_token: None,
+            server_requests: Vec::new(),
         }
     }
 
@@ -331,6 +358,20 @@ impl CreatingEntry {
         } else {
             None
         }
+    }
+
+    /// Queue a server-initiated request, unless the queue is already at
+    /// `MAX_CREATING_SERVER_REQUEST_QUEUE_LEN`. Returns `false` if rejected
+    /// for capacity, in which case the caller must log and drop it — unlike
+    /// `try_queue`'s client-originated requests, there is no client-facing
+    /// surface to answer a backend→client request with an error; the
+    /// backend's own timeout handling (if any) owns the unanswered request.
+    pub fn try_queue_server_request(&mut self, msg: RpcMessage) -> bool {
+        if self.server_requests.len() >= MAX_CREATING_SERVER_REQUEST_QUEUE_LEN {
+            return false;
+        }
+        self.server_requests.push(msg);
+        true
     }
 }
 
