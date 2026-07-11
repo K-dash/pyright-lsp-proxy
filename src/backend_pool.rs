@@ -151,6 +151,14 @@ pub struct BackendInstance {
     /// reappears. Used to bound how long a backend serves without a venv
     /// before being treated as removed.
     pub venv_missing_since: Option<Instant>,
+    /// Token of this backend's indexing `$/progress`, recorded (while
+    /// `Warming`) from the first `window/workDoneProgress/create` request it
+    /// sends — see `proxy::backend_dispatch`. Always the ORIGINAL
+    /// backend-side token, never the client-visible namespaced one. `None`
+    /// until observed, or permanently for a backend that never sends one
+    /// (confirmed for `ty` 0.0.58 and `pyrefly` 1.1.1 — see #104's capture
+    /// notes), in which case warmup relies solely on the timeout fail-open.
+    pub indexing_progress_token: Option<RpcId>,
 }
 
 impl BackendInstance {
@@ -192,6 +200,7 @@ impl BackendInstance {
             venv_token,
             last_venv_check: Instant::now(),
             venv_missing_since: None,
+            indexing_progress_token: None,
         }
     }
 
@@ -279,6 +288,14 @@ pub struct CreatingEntry {
     /// `creation_rx` completion handler on success, or answered/dropped on
     /// failure — never delivered by a batch loop (see ARCHITECTURE.md).
     pub queued: Vec<RpcMessage>,
+    /// Carried into the `BackendInstance` on success (see
+    /// `pool_management::handle_creation_outcome`). A backend can start
+    /// indexing — and send `window/workDoneProgress/create` for it — before
+    /// its own creation task completes (the reader task drains from the
+    /// moment it's split, well before insertion into `backends`); without
+    /// this carry-over, that race would permanently lose the indexing token
+    /// and strand warmup on the timeout alone. See #104's capture notes.
+    pub indexing_progress_token: Option<RpcId>,
 }
 
 impl CreatingEntry {
@@ -286,6 +303,7 @@ impl CreatingEntry {
         Self {
             session,
             queued: Vec::new(),
+            indexing_progress_token: None,
         }
     }
 
@@ -360,6 +378,16 @@ impl BackendPool {
     /// Get immutable reference to a backend instance
     pub fn get(&self, venv_path: &PathBuf) -> Option<&BackendInstance> {
         self.backends.get(venv_path)
+    }
+
+    /// Find the backend instance owning a given session id, if any. Used to
+    /// route `window/workDoneProgress/cancel` to the right backend once its
+    /// proxy-namespaced token has been decoded to a session id — the token
+    /// alone doesn't carry a venv path, unlike `pending_requests` lookups.
+    pub fn get_mut_by_session(&mut self, session: u64) -> Option<&mut BackendInstance> {
+        self.backends
+            .values_mut()
+            .find(|inst| inst.session == session)
     }
 
     /// Get mutable reference to a backend instance

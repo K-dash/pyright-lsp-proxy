@@ -682,6 +682,76 @@ impl super::LspProxy {
         self.dispatch_client_notification(msg, client_writer).await
     }
 
+    /// Handle `window/workDoneProgress/cancel`.
+    ///
+    /// Unlike `$/cancelRequest`, this must never broadcast: the token the
+    /// client sends back is the proxy-namespaced string minted by
+    /// `progress_token::namespace` when a backend's
+    /// `window/workDoneProgress/create` or `$/progress` was forwarded (see
+    /// `backend_dispatch`), so only the one backend that owns the decoded
+    /// session would recognize it — every other backend would see a
+    /// completely foreign token. Decode it, restore the ORIGINAL token, and
+    /// forward to that backend alone. If the token isn't proxy-namespaced,
+    /// or its session no longer resolves to a backend (evicted/crashed/TTL'd
+    /// since the token was minted), drop the notification with a debug log —
+    /// there's nothing to cancel and no client-visible response to send
+    /// either way (`window/workDoneProgress/cancel` is fire-and-forget).
+    pub(crate) async fn dispatch_workdone_progress_cancel(
+        &mut self,
+        msg: &RpcMessage,
+    ) -> Result<(), ProxyError> {
+        let Some(raw_token) = msg
+            .params
+            .as_ref()
+            .and_then(|p| p.get("token"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            tracing::debug!(
+                "window/workDoneProgress/cancel: missing or non-string token, dropping"
+            );
+            return Ok(());
+        };
+
+        let Some((session, original_token)) = super::progress_token::decode(raw_token) else {
+            tracing::debug!(
+                token = raw_token,
+                "window/workDoneProgress/cancel: token is not proxy-namespaced, dropping"
+            );
+            return Ok(());
+        };
+
+        let Some(inst) = self.state.pool.get_mut_by_session(session) else {
+            tracing::debug!(
+                session,
+                "window/workDoneProgress/cancel: session no longer resolves to a backend, dropping"
+            );
+            return Ok(());
+        };
+
+        let mut forwarded = msg.clone();
+        if let Some(params) = forwarded
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            params.insert(
+                "token".to_string(),
+                serde_json::to_value(&original_token).unwrap_or(serde_json::Value::Null),
+            );
+        }
+
+        inst.last_used = Instant::now();
+        if let Err(e) = inst.writer.write_message(&forwarded).await {
+            tracing::warn!(
+                session,
+                error = ?e,
+                "Failed to forward workDoneProgress/cancel to backend"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Forward queued warmup requests to the backend now that it is ready.
     /// `expected_session` is checked to avoid forwarding to a replaced backend.
     pub(crate) async fn drain_warmup_queue(
