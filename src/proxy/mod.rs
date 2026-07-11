@@ -12,6 +12,7 @@ use crate::framing::{LspFrameReader, LspFrameWriter};
 use crate::message::RpcMessage;
 use crate::state::ProxyState;
 use crate::venv;
+use client_dispatch::NotificationDelivery;
 use pool_management::StaleOutcome;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -118,8 +119,43 @@ impl LspProxy {
                             // silent-drop bug `forward_to_backend` alone
                             // would hit here, since a Creating venv
                             // isn't in `backends` yet); absent → no-op.
-                            self.forward_or_queue_for_venv(&venv_path, &msg, client_writer)
+                            let delivery = self
+                                .forward_or_queue_for_venv(&venv_path, &msg, client_writer)
                                 .await?;
+                            // The deferred-edit assumption above only holds
+                            // for `Queued` — a queue overflow, or (defensively
+                            // — structurally unreachable, since nothing
+                            // between the `already_creating` check and here
+                            // can move the venv out of `creating`) the entry
+                            // vanishing outright, both mean nothing will ever
+                            // replay this message. Apply the edit now instead:
+                            // delivery to the in-flight backend is lost (the
+                            // overflow showMessage already told the client
+                            // that), but the cache stays coherent for the
+                            // next respawn's restoration snapshot. A replayed
+                            // didChange re-enters this exact arm, so a queue
+                            // that's *still* full on replay takes this same
+                            // path automatically.
+                            if already_creating {
+                                // `Queued` and `Forwarded` are both no-ops
+                                // here, but for unrelated reasons (a
+                                // guaranteed future replay vs. a structurally
+                                // unreachable state), so keep them as
+                                // separate documented arms.
+                                #[allow(clippy::match_same_arms)]
+                                match delivery {
+                                    NotificationDelivery::Queued => {}
+                                    NotificationDelivery::Dropped
+                                    | NotificationDelivery::NoBackend => {
+                                        self.handle_did_change(&msg)?;
+                                    }
+                                    // Structurally unreachable alongside
+                                    // `already_creating`: `Forwarded` requires
+                                    // `pool.contains`, which was false at the
+                                    // check above and can't change mid-arm.
+                                    NotificationDelivery::Forwarded => {}
+                                }
+                            }
                         }
                         // Respawned: creation just started for this venv
                         // (it was Ready a moment ago, hence `already_creating`
@@ -171,8 +207,35 @@ impl LspProxy {
                 // reopened later). `forward_to_backend` alone (writes only
                 // to a Ready instance) would silently drop this case.
                 if let Some(venv_path) = venv_for_close {
-                    self.forward_or_queue_for_venv(&venv_path, &msg, client_writer)
+                    let delivery = self
+                        .forward_or_queue_for_venv(&venv_path, &msg, client_writer)
                         .await?;
+                    // Same reasoning as the didChange arm above: `Queued` is
+                    // the only outcome guaranteed a future replay. A queue
+                    // overflow (`Dropped`), or defensively `NoBackend`, means
+                    // nothing will ever redeliver this didClose, so the
+                    // deferred cache removal must happen now instead — the
+                    // ghost document would otherwise poison every future
+                    // restoration snapshot for this venv. A replayed
+                    // didClose re-enters this exact arm, so a queue that's
+                    // still full on replay takes this same path
+                    // automatically.
+                    if is_creating {
+                        // `Queued` and `Forwarded` are both no-ops here, but
+                        // for unrelated reasons — see the didChange arm's
+                        // identical comment above.
+                        #[allow(clippy::match_same_arms)]
+                        match delivery {
+                            NotificationDelivery::Queued => {}
+                            NotificationDelivery::Dropped | NotificationDelivery::NoBackend => {
+                                self.handle_did_close(&msg);
+                            }
+                            // Structurally unreachable alongside
+                            // `is_creating`: see the didChange arm's
+                            // identical comment above.
+                            NotificationDelivery::Forwarded => {}
+                        }
+                    }
                 }
             }
             Some("$/cancelRequest") => {

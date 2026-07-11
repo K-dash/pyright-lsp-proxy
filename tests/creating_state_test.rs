@@ -1589,3 +1589,207 @@ async fn didclose_queued_behind_failing_creation_prevents_ghost_replay_e2e() {
         "shutdown should not return an error"
     );
 }
+
+/// E2E (blocking review finding, round 4): a `didClose` that overflows the
+/// Creating queue's `MAX_CREATING_QUEUE_LEN` cap must still update the
+/// document cache — not just the failure path (round 3) but the capacity
+/// path too. `forward_or_queue_for_venv` reports `Dropped` on overflow, and
+/// the caller must apply the deferred cache mutation immediately in that
+/// case, since a dropped message is never replayed.
+///
+/// The queue is filled with a second document's own didOpen plus
+/// `MAX_CREATING_QUEUE_LEN - 1` `didChange` notifications for it — not the
+/// first document's, since that one gets closed by the overflow itself:
+/// once its deferred cache removal runs immediately (this round's fix), it
+/// stops resolving to any venv at all, and a same-document filler queued
+/// behind it would silently no-op on replay (`didChange` for an unopened
+/// document) instead of proving anything. Backend 1's scenario absorbs
+/// those `MAX_CREATING_QUEUE_LEN` replayed messages (queued while `pkg` was
+/// `Creating`, then forwarded live once it's `Ready`) generated
+/// programmatically, the same shape as the diagnostics-burst tests above. A
+/// `window/logMessage` action on the last one is this test's synchronizing
+/// round-trip: it can only arrive after every queued notification has
+/// actually been replayed. Backend 2's scenario (after a forced respawn) is
+/// strictly ordered with exactly one restoration `didOpen` — for the
+/// still-open second document, not the overflow-closed first one. A ghost
+/// replay of the closed document desyncs it and crashes the mock, so the
+/// verifying hover never returns its scripted value.
+#[tokio::test]
+async fn didclose_overflow_prevents_ghost_replay_on_respawn_e2e() {
+    let mut steps_1 = vec![
+        serde_json::json!({
+            "expect": { "method": "initialize" },
+            "actions": [
+                { "type": "sleep_ms", "ms": 300 },
+                { "type": "respond", "body": { "capabilities": { "hoverProvider": true } } }
+            ]
+        }),
+        serde_json::json!({ "expect": { "method": "initialized" }, "actions": [] }),
+        // Restoration of the closed-to-be document (its creation-time
+        // snapshot predates the overflow, so this is expected regardless).
+        serde_json::json!({ "expect": { "method": "textDocument/didOpen" }, "actions": [] }),
+        // The still-open document's own didOpen, queued (CreatingInFlight)
+        // behind the same creation, replayed here.
+        serde_json::json!({ "expect": { "method": "textDocument/didOpen" }, "actions": [] }),
+    ];
+    for i in 0..MAX_CREATING_QUEUE_LEN - 1 {
+        let actions = if i == MAX_CREATING_QUEUE_LEN - 2 {
+            serde_json::json!([{
+                "type": "notify",
+                "method": "window/logMessage",
+                "params": { "type": 3, "message": "replay drained" }
+            }])
+        } else {
+            serde_json::json!([])
+        };
+        steps_1.push(serde_json::json!({
+            "expect": { "method": "textDocument/didChange" },
+            "actions": actions
+        }));
+    }
+    let scenario_1 = serde_json::json!({ "on_startup": [], "steps": steps_1 });
+
+    let config = WorkspaceConfig {
+        packages: vec![PackageConfig {
+            name: "pkg".to_string(),
+            scenario: scenario_1,
+            has_venv: true,
+        }],
+    };
+
+    let (temp_dir, root) = support::setup_test_workspace(&config);
+    let pkg_dir = root.join("pkg");
+    let mut proxy = ProxyUnderTest::spawn_with_env(
+        temp_dir,
+        root.clone(),
+        &root,
+        &[("TYPEMUX_CC_VENV_CHECK_INTERVAL", "1")],
+    );
+
+    let root_uri = support::path_to_uri(&root);
+    let init_resp = proxy.initialize(&root_uri).await;
+    assert!(
+        init_resp.error.is_none(),
+        "initialize should not return an error"
+    );
+    proxy.send_initialized().await;
+
+    let closed_doc = pkg_dir.join("a.py");
+    std::fs::write(&closed_doc, "a = 1\n").unwrap();
+    let closed_doc_uri = support::path_to_uri(&closed_doc);
+    // Starts creation 1 (300ms handshake delay before it resolves); this
+    // didOpen's own snapshot covers it, so it's not queued.
+    proxy.did_open(&closed_doc_uri, "a = 1\n").await;
+
+    let open_doc = pkg_dir.join("b.py");
+    std::fs::write(&open_doc, "b = 1\n").unwrap();
+    let open_doc_uri = support::path_to_uri(&open_doc);
+    // Creation is already in flight: queues (item 1 of the cap).
+    proxy.did_open(&open_doc_uri, "b = 1\n").await;
+
+    // Fill the rest of the Creating queue with didChange for the still-open
+    // document, all well within the 300ms window.
+    for i in 0..MAX_CREATING_QUEUE_LEN - 1 {
+        proxy
+            .did_change(
+                &open_doc_uri,
+                i64::try_from(i).unwrap() + 2,
+                &format!("b = {}\n", i + 2),
+            )
+            .await;
+    }
+
+    // The queue is now at its cap (1 didOpen + 63 didChange = 64): this
+    // didClose for the OTHER document overflows and is dropped (a dedup'd
+    // window/showMessage is sent instead of queueing).
+    proxy
+        .notify(
+            "textDocument/didClose",
+            serde_json::json!({ "textDocument": { "uri": &closed_doc_uri } }),
+        )
+        .await;
+
+    // Synchronizing round-trip: this can only arrive once the mock has
+    // received (and the proxy has therefore already fully replayed) every
+    // one of the queued messages.
+    let marker = proxy.wait_for_notification("window/logMessage", 5000).await;
+    assert_eq!(marker.params.as_ref().unwrap()["message"], "replay drained");
+
+    // Force a respawn (staleness pattern): replace `.venv`'s identity and
+    // push past the 1s debounce.
+    std::fs::remove_dir_all(pkg_dir.join(".venv")).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+    // Creation 2: exactly one restoration didOpen, for the still-open
+    // document only.
+    let scenario_2 = serde_json::json!({
+        "on_startup": [],
+        "steps": [
+            {
+                "expect": { "method": "initialize" },
+                "actions": [{ "type": "respond", "body": { "capabilities": { "hoverProvider": true } } }]
+            },
+            { "expect": { "method": "initialized" }, "actions": [] },
+            { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
+            {
+                "expect": { "method": "textDocument/hover" },
+                "actions": [{ "type": "respond", "body": { "contents": { "kind": "plaintext", "value": "verify hover b" } } }]
+            },
+            {
+                "expect": { "method": "shutdown" },
+                "actions": [{ "type": "respond", "body": null }]
+            }
+        ]
+    });
+    support::write_venv_fixture(&pkg_dir, &scenario_2);
+    // Different-length pyvenv.cfg content: belt-and-braces against an
+    // inode/mtime collision defeating identity-change detection.
+    std::fs::write(
+        pkg_dir.join(".venv/pyvenv.cfg"),
+        "home = /usr/bin\nversion = 3.12\n",
+    )
+    .unwrap();
+
+    // Trigger the staleness check via a didChange for the still-open
+    // document (the closed one is expected to no longer resolve to any
+    // venv at all once this round's fix has run its deferred cache
+    // removal synchronously on overflow).
+    proxy.did_change(&open_doc_uri, 100, "b = 100\n").await;
+
+    let (verify, notifications) = proxy
+        .request_collecting(
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": &open_doc_uri },
+                "position": { "line": 0, "character": 0 }
+            }),
+        )
+        .await;
+    assert!(
+        verify.error.is_none(),
+        "verifying hover failed: {:?}",
+        verify.error
+    );
+    assert_eq!(
+        verify.result.as_ref().unwrap()["contents"]["value"],
+        "verify hover b"
+    );
+
+    let replaced_notice = notifications.iter().any(|n| {
+        n.method.as_deref() == Some("window/showMessage")
+            && n.params
+                .as_ref()
+                .and_then(|p| p["message"].as_str())
+                .is_some_and(|m| m.contains("replaced"))
+    });
+    assert!(
+        replaced_notice,
+        "expected a window/showMessage about the replaced venv, got: {notifications:?}"
+    );
+
+    let shutdown_resp = proxy.shutdown_and_exit().await;
+    assert!(
+        shutdown_resp.error.is_none(),
+        "shutdown should not return an error"
+    );
+}

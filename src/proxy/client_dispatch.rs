@@ -22,6 +22,23 @@ const INDEX_DEPENDENT_METHODS: &[&str] = &[
 /// LSP methods that support fan-out to all backends when multiple are active.
 const FANOUT_METHODS: &[&str] = &["workspace/symbol"];
 
+/// Outcome of routing a notification via `forward_or_queue_for_venv`.
+pub(crate) enum NotificationDelivery {
+    /// Written directly to a `Ready` backend.
+    Forwarded,
+    /// The venv is `Creating`; queued in its entry for replay once the
+    /// creation resolves (success or failure — see
+    /// `handle_creation_outcome`, both arms replay queued notifications).
+    Queued,
+    /// The venv is `Creating`, but its queue is already at
+    /// `MAX_CREATING_QUEUE_LEN`; dropped (an overflow `window/showMessage`
+    /// was already sent). Nothing will ever redeliver this message.
+    Dropped,
+    /// The venv isn't tracked anywhere (neither `Ready` nor `Creating`) —
+    /// nothing to forward to or queue behind.
+    NoBackend,
+}
+
 impl super::LspProxy {
     /// Handle client "initialize" request.
     ///
@@ -480,32 +497,43 @@ impl super::LspProxy {
     /// Used for notifications (no response to send an error for), so
     /// overflow can only be reported via a `window/showMessage`, never a
     /// JSON-RPC error response.
+    ///
+    /// Returns which `NotificationDelivery` outcome happened — the "drop"
+    /// case above splits into `Dropped` (overflow) and `NoBackend` (nothing
+    /// tracked for this venv at all). Some callers (didChange, didClose)
+    /// defer a cache mutation on the assumption that a `Queued` message is
+    /// guaranteed to be replayed later — `Dropped` and `NoBackend` both
+    /// break that assumption (nothing will ever redeliver this message), so
+    /// those callers need to know which outcome they got, not just whether
+    /// this returned an error.
     pub(crate) async fn forward_or_queue_for_venv(
         &mut self,
         venv_path: &Path,
         msg: &RpcMessage,
         client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
-    ) -> Result<(), ProxyError> {
+    ) -> Result<NotificationDelivery, ProxyError> {
         let key = venv_path.to_path_buf();
         if self.state.pool.contains(&key) {
-            return self.forward_to_backend(venv_path, msg).await;
+            self.forward_to_backend(venv_path, msg).await?;
+            return Ok(NotificationDelivery::Forwarded);
         }
 
         let Some(entry) = self.state.pool.creating_get_mut(&key) else {
-            return Ok(());
+            return Ok(NotificationDelivery::NoBackend);
         };
 
-        if !entry.try_queue(msg.clone()) {
-            tracing::warn!(
-                method = ?msg.method_name(),
-                venv = %venv_path.display(),
-                "Dropping notification: creating queue full"
-            );
-            self.notify_creating_queue_overflow(venv_path, client_writer)
-                .await;
+        if entry.try_queue(msg.clone()) {
+            return Ok(NotificationDelivery::Queued);
         }
 
-        Ok(())
+        tracing::warn!(
+            method = ?msg.method_name(),
+            venv = %venv_path.display(),
+            "Dropping notification: creating queue full"
+        );
+        self.notify_creating_queue_overflow(venv_path, client_writer)
+            .await;
+        Ok(NotificationDelivery::Dropped)
     }
 
     /// Register a pending request so that the response can be routed back
@@ -583,9 +611,13 @@ impl super::LspProxy {
                 );
                 return Ok(());
             };
-            return self
-                .forward_or_queue_for_venv(&venv_path, msg, client_writer)
-                .await;
+            // No deferred cache mutation depends on the outcome here (that's
+            // only relevant to didChange/didClose's own dispatch arms) — the
+            // delivery result doesn't change what this generic path does
+            // next, so it's discarded once errors are handled.
+            self.forward_or_queue_for_venv(&venv_path, msg, client_writer)
+                .await?;
+            return Ok(());
         }
 
         let venvs: Vec<PathBuf> = self.state.pool.backends_keys();

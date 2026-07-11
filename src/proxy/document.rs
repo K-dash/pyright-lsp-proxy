@@ -112,6 +112,11 @@ impl super::LspProxy {
                 // an earlier didOpen/request) and its snapshot did NOT
                 // capture this document — queue it for replay.
                 Ok(PoolLookup::CreatingInFlight(_)) => {
+                    // Unlike didChange/didClose, didOpen has no deferred
+                    // cache mutation to reconcile against the delivery
+                    // outcome: `open_documents.insert` above already ran
+                    // unconditionally, so it's already correct whether this
+                    // ends up queued, dropped, or (unreachably here) sent.
                     self.forward_or_queue_for_venv(venv_path, msg, client_writer)
                         .await?;
                     return Ok(());
