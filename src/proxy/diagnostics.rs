@@ -3,6 +3,7 @@ use crate::framing::LspFrameWriter;
 use crate::message::RpcMessage;
 use crate::venv;
 use std::path::Path;
+use tokio::time::Instant;
 
 impl super::LspProxy {
     /// Warn the client if a venv's project root is gitignored from the proxy's cwd.
@@ -64,13 +65,32 @@ impl super::LspProxy {
         }
     }
 
-    /// Send window/showMessage error to client when backend creation fails
+    /// Send window/showMessage error to client when backend creation fails.
+    ///
+    /// Logs every failure server-side. The client-visible notification is
+    /// deduplicated per venv within a TTL (see
+    /// `ProxyState::should_notify_backend_failure`) so that repeated
+    /// failures (e.g. `didOpen` for several files under the same broken
+    /// venv) don't spam `window/showMessage` (issue #26).
     pub(crate) async fn notify_backend_error(
-        &self,
+        &mut self,
         venv_path: &Path,
         error: &ProxyError,
         client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
     ) {
+        tracing::error!(
+            venv = %venv_path.display(),
+            error = ?error,
+            "Backend creation failed"
+        );
+
+        if !self
+            .state
+            .should_notify_backend_failure(venv_path, Instant::now())
+        {
+            return;
+        }
+
         let msg = RpcMessage::notification(
             "window/showMessage",
             Some(serde_json::json!({

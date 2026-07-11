@@ -115,6 +115,7 @@ impl super::LspProxy {
 
         let instance = self.create_backend_instance(venv, client_writer).await?;
         self.state.pool.insert(venv.to_path_buf(), instance);
+        self.state.venv_error_notified_at.remove(venv);
         self.warn_if_project_root_ignored(venv, client_writer).await;
 
         Ok(())
