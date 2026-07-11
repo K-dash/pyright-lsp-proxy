@@ -72,7 +72,15 @@ pub(crate) fn should_restore_document(
     doc_venv == Some(venv)
         || (doc_venv.is_none()
             && match (file_path, venv_parent) {
-                (Some(fp), Some(vp)) => fp.starts_with(vp),
+                (Some(fp), Some(vp)) => {
+                    // `fp` is the raw client URI's path (logical form); `vp`
+                    // is always canonical, derived from `venv`, which has
+                    // been canonical since #116. Canonicalize `fp` too,
+                    // mirroring `find_venv`'s entry-point idiom, or a
+                    // symlinked project path never matches here (#119).
+                    let fp = fp.canonicalize().unwrap_or_else(|_| fp.to_path_buf());
+                    fp.starts_with(vp)
+                }
                 _ => false,
             })
 }
@@ -408,6 +416,36 @@ mod tests {
             Path::new(VENV),
             Some(Path::new("/repo/a.py")),
             None,
+        ));
+    }
+
+    /// Regression test for #119: the file path arrives in logical
+    /// (symlinked) form from the client URI, while `venv`/`venv_parent` are
+    /// always canonical (physical) form since #116 — mirroring the #95
+    /// scenario `find_venv` already handles (e.g. macOS's `/tmp` ->
+    /// `/private/tmp`). Without canonicalizing `file_path` in the fallback
+    /// comparison, `starts_with` can never match here.
+    #[test]
+    fn restores_unresolved_document_reached_through_a_symlinked_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+
+        let real_project = root.join("real_project");
+        std::fs::create_dir(&real_project).unwrap();
+        let file = real_project.join("a.py");
+        std::fs::write(&file, "a = 1\n").unwrap();
+
+        let symlink_project = root.join("symlinked_project");
+        std::os::unix::fs::symlink(&real_project, &symlink_project).unwrap();
+        let file_via_symlink = symlink_project.join("a.py");
+
+        let venv = real_project.join(".venv");
+
+        assert!(should_restore_document(
+            None,
+            &venv,
+            Some(&file_via_symlink),
+            Some(&real_project),
         ));
     }
 
