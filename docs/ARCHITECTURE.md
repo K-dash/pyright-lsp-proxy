@@ -181,6 +181,7 @@ pub enum WarmupState {
 |---------|---------|-------------|
 | `TYPEMUX_CC_WARMUP_TIMEOUT` | `2` (seconds) | Warmup timeout duration |
 | `TYPEMUX_CC_WARMUP_TIMEOUT=0` | — | Disable warmup entirely (immediate Ready) |
+| `TYPEMUX_CC_WARMUP_TIMEOUT=<non-integer>` | — | Startup fails with an explicit error |
 
 ## Strict Venv Mode
 
@@ -235,7 +236,8 @@ mtime/size.
 ### Check Triggers and Outcomes
 
 Checks are debounced to once per `TYPEMUX_CC_VENV_CHECK_INTERVAL` seconds
-(default 5; `0` disables tracking). Triggers: `ensure_backend_in_pool`
+(default 5; `0` disables tracking; a non-integer value fails startup with an
+explicit error). Triggers: `ensure_backend_in_pool`
 (all venv-checked request methods), `didOpen`/`didChange` forwarding, and a
 60s background sweep (shared with the TTL timer, armed even when TTL is
 disabled).
@@ -292,7 +294,7 @@ Results are deduplicated using the key: `(uri, range.start.line, range.start.cha
 
 ### Timeout and Partial Results
 
-If a backend does not respond within the fan-out timeout (default 5s, configurable via `TYPEMUX_CC_FANOUT_TIMEOUT`):
+If a backend does not respond within the fan-out timeout (default 5s, configurable via `TYPEMUX_CC_FANOUT_TIMEOUT`; a non-integer value fails startup with an explicit error):
 
 1. A `window/showMessage` warning is sent to the client listing timed-out backends
 2. `$/cancelRequest` is sent to remaining backends (best effort)

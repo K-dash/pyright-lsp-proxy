@@ -26,6 +26,12 @@ const DEFAULT_WARMUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Returns the warmup timeout duration.
 /// `TYPEMUX_CC_WARMUP_TIMEOUT=0` means warmup is disabled (immediate Ready).
+///
+/// The `.ok()` below only ever swallows an "unset" case: `validate_env_config`
+/// runs at startup and aborts on an unparseable value, so by the time this is
+/// called on the normal startup path, a set value is guaranteed to parse.
+/// (`--doctor` skips that validation and calls this directly; it reports raw
+/// invalid values itself instead of relying on this fallback.)
 pub fn warmup_timeout() -> Duration {
     std::env::var("TYPEMUX_CC_WARMUP_TIMEOUT")
         .ok()
@@ -38,6 +44,9 @@ const DEFAULT_FANOUT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Returns the fan-out timeout duration for workspace/symbol and similar multi-backend requests.
 /// `TYPEMUX_CC_FANOUT_TIMEOUT=0` means no timeout (wait forever).
+///
+/// See `warmup_timeout`'s doc comment: reachable only with an unset or
+/// already-validated value on the normal startup path.
 pub fn fanout_timeout() -> Duration {
     std::env::var("TYPEMUX_CC_FANOUT_TIMEOUT")
         .ok()
@@ -51,11 +60,40 @@ const DEFAULT_VENV_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Returns the debounce interval for pooled-backend venv identity checks.
 /// `TYPEMUX_CC_VENV_CHECK_INTERVAL=0` disables venv identity tracking entirely.
+///
+/// See `warmup_timeout`'s doc comment: reachable only with an unset or
+/// already-validated value on the normal startup path.
 pub fn venv_check_interval() -> Duration {
     std::env::var("TYPEMUX_CC_VENV_CHECK_INTERVAL")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map_or(DEFAULT_VENV_CHECK_INTERVAL, Duration::from_secs)
+}
+
+/// Env vars validated by `validate_env_config`, backing the three accessors above.
+const TIMEOUT_ENV_VARS: [&str; 3] = [
+    "TYPEMUX_CC_WARMUP_TIMEOUT",
+    "TYPEMUX_CC_FANOUT_TIMEOUT",
+    "TYPEMUX_CC_VENV_CHECK_INTERVAL",
+];
+
+/// Validates the timeout/interval env vars above at startup, before the event
+/// loop runs. A set-but-unparseable value (e.g. `TYPEMUX_CC_FANOUT_TIMEOUT=5s`)
+/// is a configuration error, not something to silently default around, so this
+/// returns an error naming the variable and its raw value instead of letting
+/// the accessors swallow it via `.ok()`. Not called for `--doctor`, which
+/// reports invalid values instead of aborting.
+pub fn validate_env_config() -> Result<(), String> {
+    for env_var in TIMEOUT_ENV_VARS {
+        if let Ok(raw) = std::env::var(env_var) {
+            if raw.parse::<u64>().is_err() {
+                return Err(format!(
+                    "invalid {env_var}={raw:?}: expected a non-negative integer number of seconds"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Message from a backend reader task

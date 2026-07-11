@@ -100,6 +100,38 @@ fn env_only_source(env_var: &str, config_report: &ConfigLoadReport) -> String {
     }
 }
 
+/// Build the config item for one of the timeout/interval settings validated by
+/// `backend_pool::validate_env_config`. `--doctor` bypasses that validation
+/// (see `main.rs`), so an invalid value never aborts here; instead this shows
+/// the raw value and marks it invalid rather than reporting the accessor's
+/// silent default fallback as if it were in effect.
+fn timeout_env_item(
+    name: &str,
+    env_var: &str,
+    effective: std::time::Duration,
+    config_report: &ConfigLoadReport,
+) -> ConfigItem {
+    let raw = std::env::var(env_var);
+    let source = env_only_source(env_var, config_report);
+    match raw {
+        Err(_) => ConfigItem {
+            name: name.to_string(),
+            value: effective.as_secs().to_string(),
+            source,
+        },
+        Ok(raw) if raw.parse::<u64>().is_ok() => ConfigItem {
+            name: name.to_string(),
+            value: effective.as_secs().to_string(),
+            source,
+        },
+        Ok(raw) => ConfigItem {
+            name: name.to_string(),
+            value: format!("{raw:?} (invalid)"),
+            source: format!("{source} (invalid, would fail to start)"),
+        },
+    }
+}
+
 /// Search for a binary in PATH directories using `std::env::split_paths` + metadata.
 /// Returns the first match that is a file with execute permission.
 pub fn find_binary_in_path(binary_name: &str) -> Option<PathBuf> {
@@ -209,26 +241,26 @@ pub async fn collect_doctor_report(
         source: arg_source(matches, "backend_ttl", config_report),
     };
 
-    let warmup_timeout = backend_pool::warmup_timeout();
-    let warmup_timeout_item = ConfigItem {
-        name: "warmup_timeout".to_string(),
-        value: warmup_timeout.as_secs().to_string(),
-        source: env_only_source("TYPEMUX_CC_WARMUP_TIMEOUT", config_report),
-    };
+    let warmup_timeout_item = timeout_env_item(
+        "warmup_timeout",
+        "TYPEMUX_CC_WARMUP_TIMEOUT",
+        backend_pool::warmup_timeout(),
+        config_report,
+    );
 
-    let fanout_timeout = backend_pool::fanout_timeout();
-    let fanout_timeout_item = ConfigItem {
-        name: "fanout_timeout".to_string(),
-        value: fanout_timeout.as_secs().to_string(),
-        source: env_only_source("TYPEMUX_CC_FANOUT_TIMEOUT", config_report),
-    };
+    let fanout_timeout_item = timeout_env_item(
+        "fanout_timeout",
+        "TYPEMUX_CC_FANOUT_TIMEOUT",
+        backend_pool::fanout_timeout(),
+        config_report,
+    );
 
-    let venv_check_interval = backend_pool::venv_check_interval();
-    let venv_check_interval_item = ConfigItem {
-        name: "venv_check_interval".to_string(),
-        value: venv_check_interval.as_secs().to_string(),
-        source: env_only_source("TYPEMUX_CC_VENV_CHECK_INTERVAL", config_report),
-    };
+    let venv_check_interval_item = timeout_env_item(
+        "venv_check_interval",
+        "TYPEMUX_CC_VENV_CHECK_INTERVAL",
+        backend_pool::venv_check_interval(),
+        config_report,
+    );
 
     let log_file_value: String = matches
         .get_one::<PathBuf>("log_file")

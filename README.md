@@ -211,6 +211,8 @@ Settings priority: **CLI flag > environment variable > config file > default**
 | `TYPEMUX_CC_VENV_CHECK_INTERVAL` | Interval in seconds between venv identity checks (0 = disable venv identity tracking) | `5` |
 | `RUST_LOG` | Log level | `typemux_cc=debug` |
 
+An invalid value for a numeric variable above (e.g. `TYPEMUX_CC_FANOUT_TIMEOUT=5s`) fails startup with an explicit error instead of silently falling back to the default.
+
 ## Typical Use Case
 
 ### Git Worktree (AI-Assisted Development)
