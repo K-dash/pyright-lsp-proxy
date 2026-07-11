@@ -66,6 +66,12 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Fail loudly on unparseable timeout/interval env vars before starting
+    // anything else (see `validate_env_config` doc comment).
+    if let Err(msg) = backend_pool::validate_env_config() {
+        anyhow::bail!(msg);
+    }
+
     // Initialize logging (default: stderr, --log-file adds file output)
     if let Some(log_path) = &args.log_file {
         // File output specified: stderr + file
