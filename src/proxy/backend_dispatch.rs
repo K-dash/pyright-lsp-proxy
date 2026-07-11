@@ -76,7 +76,7 @@ impl super::LspProxy {
     /// converges once the backend is `Ready`). So "the normal notification
     /// path" for this window is simply: forward it.
     async fn dispatch_creating_backend_message(
-        &self,
+        &mut self,
         venv_path: PathBuf,
         session: u64,
         result: Result<RpcMessage, BackendError>,
@@ -104,18 +104,24 @@ impl super::LspProxy {
                 // The backend's reader task died mid-creation. `pool.creating`'s
                 // entry is owned by the `creation_rx` completion handler, not
                 // this crash-cleanup path (which only operates on `backends`)
-                // — the completion handler's own liveness check catches this
-                // and reports it as a contained creation failure, whether the
-                // process itself died (`try_wait`) or only the reader task did
-                // while the process stayed alive (`reader_task.is_finished()`,
-                // #106 — a framing error, or any other read failure, leaves a
-                // live process with nothing left to drain its stdout).
+                // — the completion handler's own liveness checks catch this:
+                // the process itself dying (`try_wait`), the reader task's own
+                // `JoinHandle` finishing (`is_finished()`) with the process
+                // still alive, or — this arm's own contribution — this exact
+                // error, recorded onto `CreatingEntry::reader_error` below so
+                // it isn't lost by being consumed (and, before this fix,
+                // merely logged) here instead of reaching that check. #106.
                 tracing::debug!(
                     venv = %venv_path.display(),
                     session = session,
                     error = ?e,
-                    "Backend read error during creation; completion handler will report the outcome"
+                    "Backend read error during creation; recording onto the entry for the completion handler"
                 );
+                if let Some(entry) = self.state.pool.creating_get_mut(&venv_path) {
+                    if entry.reader_error.is_none() {
+                        entry.reader_error = Some(e);
+                    }
+                }
             }
         }
         Ok(())

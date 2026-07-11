@@ -279,6 +279,20 @@ pub struct CreatingEntry {
     /// `creation_rx` completion handler on success, or answered/dropped on
     /// failure — never delivered by a batch loop (see ARCHITECTURE.md).
     pub queued: Vec<RpcMessage>,
+    /// Set by `dispatch_creating_backend_message`'s `Err` arm when the
+    /// reader task reports a read failure (e.g. a framing error, #106)
+    /// while this venv is still Creating. First error wins.
+    ///
+    /// The reader task's `BackendMessage` is a one-shot signal: it's sent
+    /// once, then the task exits. If that message is consumed HERE (while
+    /// Creating) rather than later via the Ready-state crash-cleanup path,
+    /// nothing else will ever report the death — `handle_creation_outcome`'s
+    /// own liveness checks (`try_wait`, `reader_task.is_finished()`) can't
+    /// retroactively see a message that was already drained from the
+    /// channel. Recording it here instead of just logging closes that gap:
+    /// `handle_creation_outcome` consults this field before trusting an
+    /// `Ok` creation result.
+    pub reader_error: Option<BackendError>,
 }
 
 impl CreatingEntry {
@@ -286,6 +300,7 @@ impl CreatingEntry {
         Self {
             session,
             queued: Vec::new(),
+            reader_error: None,
         }
     }
 

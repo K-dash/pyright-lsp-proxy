@@ -219,60 +219,14 @@ impl super::LspProxy {
     ) -> Result<(), ProxyError> {
         let CreationOutcome { venv_path, result } = outcome;
 
-        let Some(entry) = self.state.pool.creating_remove(&venv_path) else {
+        let Some(mut entry) = self.state.pool.creating_remove(&venv_path) else {
             // Defensive: no other code path removes `creating` entries.
             tracing::warn!(venv = %venv_path.display(), "Creation outcome for an untracked venv, ignoring");
             return Ok(());
         };
 
         let result = match result {
-            // A restoration write failure already fails creation before this
-            // point (see `write_restored_documents`), but a backend can also
-            // die *without* any write failing — e.g. every write lands in
-            // the OS pipe buffer moments before the process exits. Check
-            // liveness before trusting `Ok`. This narrows but doesn't close
-            // the race: the process could still die in the instant after
-            // `try_wait`, same residual window a `Ready` backend already
-            // lives with (caught on its next read/write instead).
-            //
-            // `try_wait` only detects the PROCESS dying. A backend can also
-            // emit a malformed/oversized frame (#106) — or, pre-dating that
-            // fix, a bare `MissingContentLength` from a backend that dies
-            // mid-write — while staying alive: the reader task
-            // (`spawn_reader_task`) hits the framing error and exits, but
-            // `try_wait` still reports the process as running. Without this
-            // second check, such an instance would be pooled `Ready` with no
-            // task left to ever drain its stdout, and every subsequent
-            // request against it would write into the pipe and hang forever
-            // waiting for a response nobody reads. `is_finished()` catches
-            // that: the reader task is gone, so this is a dead backend
-            // regardless of what the OS process is doing.
-            Ok(mut instance) => match instance.child.try_wait() {
-                Ok(None) => {
-                    if instance.reader_task.is_finished() {
-                        instance.reader_task.abort();
-                        Err(ProxyError::Backend(BackendError::InitializeFailed(
-                            "backend reader task exited during creation (framing error) \
-                             while the process is still alive"
-                                .to_string(),
-                        )))
-                    } else {
-                        Ok(instance)
-                    }
-                }
-                Ok(Some(status)) => {
-                    instance.reader_task.abort();
-                    Err(ProxyError::Backend(BackendError::InitializeFailed(
-                        format!("backend process exited during creation ({status})"),
-                    )))
-                }
-                Err(io_err) => {
-                    instance.reader_task.abort();
-                    Err(ProxyError::Backend(BackendError::InitializeFailed(
-                        format!("failed to check backend liveness after creation: {io_err}"),
-                    )))
-                }
-            },
+            Ok(instance) => check_creation_liveness(instance, entry.reader_error.take()),
             Err(e) => Err(e),
         };
 
@@ -784,5 +738,160 @@ impl super::LspProxy {
         }
 
         Ok(())
+    }
+}
+
+/// Decide whether a freshly created backend instance is actually healthy
+/// enough to pool, given every liveness signal available at this point.
+/// Pure and synchronous (no `.await`) so it's deterministically unit
+/// testable — extracted for exactly that reason, mirroring
+/// `backend_dispatch::classify_session`.
+///
+/// Three ways a reader can be dead by the time this runs, all converging on
+/// the same containment failure:
+///
+/// 1. `reader_error` is `Some`: `dispatch_creating_backend_message`'s `Err`
+///    arm already consumed the reader task's one-shot `BackendMessage` from
+///    `backend_msg_rx` while this venv was still `Creating`, and recorded it
+///    onto `CreatingEntry::reader_error` instead of just logging it. This is
+///    the ordering `try_wait`/`is_finished()` alone cannot see: if the main
+///    loop drains that channel message and THEN processes this creation
+///    outcome — all within one scheduler tick, before the reader task's own
+///    `JoinHandle` has been polled again to actually transition to
+///    "finished" — `is_finished()` would still read `false` even though the
+///    backend is unambiguously dead. Checked first, and unconditionally
+///    decisive: no live-process signal can override an error that was
+///    already observed.
+/// 2. `try_wait` reports the process exited: the reader task's message may
+///    or may not have been consumed yet, but the process itself is
+///    unarguably gone.
+/// 3. `try_wait` reports the process alive, but `reader_task.is_finished()`
+///    is `true`: the reader died (e.g. panicked, or its `send` raced ahead
+///    of the main loop ever polling `backend_msg_rx` before this check ran)
+///    without its message having been consumed via path 1.
+///
+/// If none of the three fire, the instance is genuinely healthy: `Ok`.
+///
+/// The one case this still doesn't close (documented, not fixed here,
+/// same as before #106): the reader task's error hasn't been sent, consumed,
+/// nor has its `JoinHandle` finished, by the time this check runs — i.e. the
+/// backend dies in the instant right after this check passes. That's the
+/// same residual window a `Ready` backend already lives with every day
+/// (caught on its next read/write instead, via the ordinary crash-cleanup
+/// path in `backend_dispatch::dispatch_ready_backend_message`).
+fn check_creation_liveness(
+    mut instance: BackendInstance,
+    reader_error: Option<BackendError>,
+) -> Result<BackendInstance, ProxyError> {
+    if let Some(reader_err) = reader_error {
+        instance.reader_task.abort();
+        return Err(ProxyError::Backend(BackendError::InitializeFailed(
+            format!("backend reader task exited during creation: {reader_err}"),
+        )));
+    }
+
+    match instance.child.try_wait() {
+        Ok(None) => {
+            if !instance.reader_task.is_finished() {
+                return Ok(instance);
+            }
+            instance.reader_task.abort();
+            Err(ProxyError::Backend(BackendError::InitializeFailed(
+                "backend reader task exited during creation (framing error) \
+                 while the process is still alive"
+                    .to_string(),
+            )))
+        }
+        Ok(Some(status)) => {
+            instance.reader_task.abort();
+            Err(ProxyError::Backend(BackendError::InitializeFailed(
+                format!("backend process exited during creation ({status})"),
+            )))
+        }
+        Err(io_err) => {
+            instance.reader_task.abort();
+            Err(ProxyError::Backend(BackendError::InitializeFailed(
+                format!("failed to check backend liveness after creation: {io_err}"),
+            )))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_creation_liveness;
+    use crate::backend_pool::BackendInstance;
+    use crate::error::BackendError;
+    use crate::framing::LspFrameWriter;
+    use std::path::PathBuf;
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    /// Spawn a genuinely live helper process and a genuinely unfinished
+    /// reader task, so `try_wait`/`is_finished()` alone would both say
+    /// "healthy" — isolates the `reader_error` branch specifically. Not
+    /// `async` itself (no `.await` at this level — `Command::spawn` is
+    /// synchronous and `tokio::spawn` just needs an active runtime, which
+    /// the `#[tokio::test]` callers already provide).
+    fn live_instance() -> BackendInstance {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 5")
+            .stdin(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("failed to spawn helper process");
+        let stdin = child.stdin.take().expect("child stdin should be piped");
+        let writer = LspFrameWriter::new(stdin);
+        let reader_task = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+
+        BackendInstance::from_parts(
+            writer,
+            child,
+            1,
+            reader_task,
+            PathBuf::from("/fake/venv"),
+            1,
+            None,
+        )
+    }
+
+    /// A recorded `reader_error` fails creation even when both other
+    /// liveness signals (`try_wait`, `is_finished()`) say the backend is
+    /// healthy — proves the ordering `is_finished()` alone can't close (see
+    /// `check_creation_liveness`'s doc comment, case 1) is actually closed.
+    ///
+    /// Detection power: reverting the `reader_error` consultation (making
+    /// this function ignore its second argument) makes this test fail,
+    /// since `try_wait` and `is_finished()` alone both report healthy here.
+    #[tokio::test]
+    async fn check_creation_liveness_reader_error_fails_even_when_process_and_reader_are_alive() {
+        let instance = live_instance();
+        let reader_error = Some(BackendError::InitializeFailed(
+            "simulated framing error".to_string(),
+        ));
+
+        let result = check_creation_liveness(instance, reader_error);
+
+        assert!(
+            result.is_err(),
+            "a recorded reader_error must fail creation regardless of try_wait/is_finished"
+        );
+    }
+
+    /// No recorded error, process alive, reader task not finished: the
+    /// ordinary healthy path.
+    #[tokio::test]
+    async fn check_creation_liveness_healthy_when_no_error_recorded() {
+        let instance = live_instance();
+
+        let result = check_creation_liveness(instance, None);
+
+        assert!(
+            result.is_ok(),
+            "a live process with no recorded error and an unfinished reader should be pooled"
+        );
     }
 }
