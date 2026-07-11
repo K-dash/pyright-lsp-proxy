@@ -80,6 +80,16 @@ rm ~/.claude/plugins/marketplaces/typemux-cc-marketplace/bin/typemux-cc
 
 Since v0.2.14 the installer verifies the installed binary's version against the plugin manifest and re-downloads on mismatch, so this cleanup is only needed once for installations created with older versions.
 
+## Empty `bin/` Right After Updating
+
+Symptom: `/plugin update` reports the new version, but `~/.claude/plugins/cache/typemux-cc-marketplace/typemux-cc/<version>/bin/` is empty and the LSP doesn't start.
+
+This is the opposite of "Plugin Update Not Taking Effect" above (old version persisting): here the new version's cache directory exists, but with nothing in `bin/`.
+
+The plugin manifest (`.claude-plugin/plugin.json`) lives in this repo, so `/plugin update` starts advertising a new version the moment a version-bump PR merges to `main` — before the matching GitHub Release exists. The [`Release` workflow](../.github/workflows/release.yml) now tags and builds that merge commit automatically, so the gap between "manifest says vX.Y.Z" and "release vX.Y.Z has assets" is roughly one CI build (a few minutes), not however long a human takes to notice and tag it. If you update and restart inside that window, `install.sh` (run by the SessionStart hook) creates `bin/` before downloading, then 404s against a release that doesn't exist yet and exits 1 — leaving `bin/` present but empty.
+
+Remedy: start a new Claude Code session once the release is live (check the [Releases page](https://github.com/K-dash/typemux-cc/releases)). The SessionStart hook re-runs `install.sh` on every session start, so the next one downloads normally. No cache removal needed — this is not the stale-cache issue above.
+
 ## `.venv` Not Switching
 
 - Verify `.venv/pyvenv.cfg` exists
