@@ -21,13 +21,15 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
+# Deny by default; each job below opts into the minimum it needs.
+permissions: {}
 
 jobs:
   ci:
     name: Makefile CI (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     timeout-minutes: 30
     strategy:
       # Let every platform leg finish even if another one fails, so a
@@ -40,13 +42,15 @@ jobs:
           - ubuntu-24.04-arm
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       # Step timeout (25) is lower than the job timeout (30) on purpose: a
       # step timeout marks the step as failed, so the `if: failure()` upload
@@ -62,9 +66,29 @@ jobs:
       # step actually failed.
       - name: Upload CI diagnostics
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ci-diagnostics-${{ matrix.os }}
           path: ci-output.log
           if-no-files-found: warn
           retention-days: 3
+
+  zizmor:
+    name: zizmor (Actions security)
+    runs-on: ubuntu-latest # zizmor-action runs in a container; needs Docker
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@192e21d79ab29983730a13d1382995c2307fbcaa # v0.5.7
+        with:
+          persona: regular
+          # Public repo, no Advanced Security tier needed: print findings to
+          # the log and fail the job on any finding instead of uploading SARIF.
+          advanced-security: false
