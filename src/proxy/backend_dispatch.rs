@@ -101,11 +101,15 @@ impl super::LspProxy {
                 );
             }
             Err(e) => {
-                // The backend died mid-creation. `pool.creating`'s entry is
-                // owned by the `creation_rx` completion handler, not this
-                // crash-cleanup path (which only operates on `backends`) —
-                // the completion handler's own liveness check catches this
-                // and reports it as a contained creation failure.
+                // The backend's reader task died mid-creation. `pool.creating`'s
+                // entry is owned by the `creation_rx` completion handler, not
+                // this crash-cleanup path (which only operates on `backends`)
+                // — the completion handler's own liveness check catches this
+                // and reports it as a contained creation failure, whether the
+                // process itself died (`try_wait`) or only the reader task did
+                // while the process stayed alive (`reader_task.is_finished()`,
+                // #106 — a framing error, or any other read failure, leaves a
+                // live process with nothing left to drain its stdout).
                 tracing::debug!(
                     venv = %venv_path.display(),
                     session = session,

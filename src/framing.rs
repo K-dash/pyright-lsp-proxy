@@ -18,10 +18,10 @@ const MAX_CONTENT_LENGTH: usize = 64 * 1024 * 1024; // 64 MiB
 /// growing the line buffer without limit.
 const MAX_HEADER_LINE_LEN: usize = 8 * 1024; // 8 KiB
 
-/// Maximum total size of the header block (sum of all header line lengths
-/// before the terminating blank line). LSP frames carry at most two headers;
-/// this bounds a peer that never sends the terminating blank line from
-/// making `read_headers` accumulate lines forever.
+/// Maximum total size of the header block (sum of all header line lengths,
+/// including the terminating blank line itself). LSP frames carry at most
+/// two headers; this bounds a peer that never sends the terminating blank
+/// line from making `read_headers` accumulate lines forever.
 const MAX_HEADER_BLOCK_LEN: usize = 64 * 1024; // 64 KiB
 
 /// LSP frame reader
@@ -218,21 +218,15 @@ mod tests {
     }
 
     /// A frame declaring exactly `MAX_CONTENT_LENGTH` — the boundary the
-    /// oversized check must NOT reject — still parses successfully.
+    /// oversized check must NOT reject — is accepted by `read_headers`.
+    /// Calls `read_headers` directly rather than `read_message`, so the
+    /// boundary check is exercised without materializing a 64 MiB body.
     #[tokio::test]
     async fn test_content_length_at_limit_still_parses() {
-        let prefix = r#"{"jsonrpc":"2.0","params":{"pad":""#;
-        let suffix = r#""}}"#;
-        let pad_len = MAX_CONTENT_LENGTH - prefix.len() - suffix.len();
-        let content = format!("{prefix}{}{suffix}", "a".repeat(pad_len));
-        assert_eq!(content.len(), MAX_CONTENT_LENGTH);
-
-        let mut input = format!("Content-Length: {MAX_CONTENT_LENGTH}\r\n\r\n").into_bytes();
-        input.extend_from_slice(content.as_bytes());
-
-        let mut reader = LspFrameReader::new(&input[..]);
-        let msg = reader.read_message().await.unwrap();
-        assert_eq!(msg.jsonrpc, "2.0");
+        let input = format!("Content-Length: {MAX_CONTENT_LENGTH}\r\n\r\n");
+        let mut reader = LspFrameReader::new(input.as_bytes());
+        let content_length = reader.read_headers().await.unwrap();
+        assert_eq!(content_length, MAX_CONTENT_LENGTH);
     }
 
     /// A single header line far beyond `MAX_HEADER_LINE_LEN` is rejected —

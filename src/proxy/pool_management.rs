@@ -234,8 +234,32 @@ impl super::LspProxy {
             // the race: the process could still die in the instant after
             // `try_wait`, same residual window a `Ready` backend already
             // lives with (caught on its next read/write instead).
+            //
+            // `try_wait` only detects the PROCESS dying. A backend can also
+            // emit a malformed/oversized frame (#106) — or, pre-dating that
+            // fix, a bare `MissingContentLength` from a backend that dies
+            // mid-write — while staying alive: the reader task
+            // (`spawn_reader_task`) hits the framing error and exits, but
+            // `try_wait` still reports the process as running. Without this
+            // second check, such an instance would be pooled `Ready` with no
+            // task left to ever drain its stdout, and every subsequent
+            // request against it would write into the pipe and hang forever
+            // waiting for a response nobody reads. `is_finished()` catches
+            // that: the reader task is gone, so this is a dead backend
+            // regardless of what the OS process is doing.
             Ok(mut instance) => match instance.child.try_wait() {
-                Ok(None) => Ok(instance),
+                Ok(None) => {
+                    if instance.reader_task.is_finished() {
+                        instance.reader_task.abort();
+                        Err(ProxyError::Backend(BackendError::InitializeFailed(
+                            "backend reader task exited during creation (framing error) \
+                             while the process is still alive"
+                                .to_string(),
+                        )))
+                    } else {
+                        Ok(instance)
+                    }
+                }
                 Ok(Some(status)) => {
                     instance.reader_task.abort();
                     Err(ProxyError::Backend(BackendError::InitializeFailed(

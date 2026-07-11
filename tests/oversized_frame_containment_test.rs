@@ -168,3 +168,177 @@ async fn oversized_frame_from_backend_is_contained_e2e() {
         "shutdown should not return an error"
     );
 }
+
+/// E2E (#106 review fix, #96 AC3 containment): a malformed/oversized frame
+/// from a backend during the Creating window — with the backend PROCESS
+/// staying alive — must not pool a zombie `Ready` instance whose reader task
+/// is already dead.
+///
+/// Before this fix, `handle_creation_outcome`'s liveness check was
+/// `child.try_wait()` only: a dead reader task on a live process (a framing
+/// error, or any other read failure — this zombie class predates #106, e.g.
+/// a bare `MissingContentLength` from a backend that dies mid-write, but
+/// #106's new size limits make it far more reachable) slipped through as
+/// `Ok(None)` and the instance was pooled `Ready` with nothing left to ever
+/// drain its stdout — every subsequent request against it would write into
+/// the pipe and hang forever waiting for a response nobody reads.
+///
+/// The restoration `didOpen` (queued by opening `zombie/main.py`, which also
+/// starts creation and is captured in the snapshot the creation task
+/// restores) gets a malformed frame in response instead of silence. The
+/// mock process is deliberately NOT scripted to exit afterward — it must
+/// stay alive so `try_wait` alone would report the backend as healthy;
+/// `reader_task.is_finished()` is what has to catch this.
+#[tokio::test]
+async fn zombie_reader_during_creating_is_not_pooled_e2e() {
+    let scenario_good = serde_json::json!({
+        "on_startup": [],
+        "steps": [
+            {
+                "expect": { "method": "initialize" },
+                "actions": [{ "type": "respond", "body": { "capabilities": { "hoverProvider": true } } }]
+            },
+            { "expect": { "method": "initialized" }, "actions": [] },
+            { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
+            {
+                "expect": { "method": "textDocument/hover" },
+                "actions": [{ "type": "respond", "body": { "contents": { "kind": "plaintext", "value": "hover good sync" } } }]
+            },
+            {
+                "expect": { "method": "textDocument/hover" },
+                "actions": [{ "type": "respond", "body": { "contents": { "kind": "plaintext", "value": "hover good again" } } }]
+            },
+            {
+                "expect": { "method": "shutdown" },
+                "actions": [{ "type": "respond", "body": null }]
+            }
+        ]
+    });
+
+    // Slow handshake (mirrors cold_spawn_does_not_block_warm_venv_e2e):
+    // gives the "good" venv's traffic a comfortable window to prove it's
+    // unblocked while "zombie" is still Creating. No further steps after
+    // the restoration didOpen — the mock falls into its drain loop and
+    // stays alive, since it's never scripted to crash or exit.
+    let scenario_zombie = serde_json::json!({
+        "on_startup": [],
+        "steps": [
+            {
+                "expect": { "method": "initialize" },
+                "actions": [
+                    { "type": "sleep_ms", "ms": 300 },
+                    { "type": "respond", "body": { "capabilities": { "hoverProvider": true } } }
+                ]
+            },
+            { "expect": { "method": "initialized" }, "actions": [] },
+            {
+                "expect": { "method": "textDocument/didOpen" },
+                "actions": [{ "type": "raw_bytes", "data": "Content-Length: 999999999999\r\n\r\n" }]
+            }
+        ]
+    });
+
+    let config = WorkspaceConfig {
+        packages: vec![
+            PackageConfig {
+                name: "good".to_string(),
+                scenario: scenario_good,
+                has_venv: true,
+            },
+            PackageConfig {
+                name: "zombie".to_string(),
+                scenario: scenario_zombie,
+                has_venv: true,
+            },
+        ],
+    };
+
+    let (temp_dir, root) = support::setup_test_workspace(&config);
+    let mut proxy = ProxyUnderTest::spawn(temp_dir, root.clone(), &root);
+
+    let root_uri = support::path_to_uri(&root);
+    let init_resp = proxy.initialize(&root_uri).await;
+    assert!(
+        init_resp.error.is_none(),
+        "initialize should not return an error"
+    );
+    proxy.send_initialized().await;
+
+    let file_good = root.join("good/main.py");
+    std::fs::write(&file_good, "a = 1\n").unwrap();
+    let file_good_uri = support::path_to_uri(&file_good);
+    proxy.did_open(&file_good_uri, "a = 1\n").await;
+
+    let hover_good_params = || {
+        serde_json::json!({
+            "textDocument": { "uri": &file_good_uri },
+            "position": { "line": 0, "character": 0 }
+        })
+    };
+    let sync_good = proxy
+        .request("textDocument/hover", hover_good_params())
+        .await;
+    assert!(
+        sync_good.error.is_none(),
+        "sync hover(good) failed: {:?}",
+        sync_good.error
+    );
+
+    // Opening a document under "zombie" starts its creation (300ms
+    // handshake); restoration writes this didOpen back to it, and the mock
+    // answers with a malformed frame right after.
+    let file_zombie = root.join("zombie/main.py");
+    std::fs::write(&file_zombie, "z = 1\n").unwrap();
+    let file_zombie_uri = support::path_to_uri(&file_zombie);
+    proxy.did_open(&file_zombie_uri, "z = 1\n").await;
+
+    // Un-awaited: queues behind the in-flight (and soon-to-be-contained) creation.
+    let zombie_hover_params = serde_json::json!({
+        "textDocument": { "uri": &file_zombie_uri },
+        "position": { "line": 0, "character": 0 }
+    });
+    let zombie_id = proxy
+        .send_request("textDocument/hover", zombie_hover_params)
+        .await;
+
+    // The good venv must stay unaffected regardless of the zombie's outcome.
+    let hover_good2 = proxy
+        .request("textDocument/hover", hover_good_params())
+        .await;
+    assert!(
+        hover_good2.error.is_none(),
+        "hover(good) failed: {:?}",
+        hover_good2.error
+    );
+    assert_eq!(
+        hover_good2.result.as_ref().unwrap()["contents"]["value"],
+        "hover good again"
+    );
+
+    // The zombie venv's queued request must get an explicit error — not a
+    // hang, which is what forwarding into a backend with a dead reader task
+    // would cause (nothing left to ever drain a response out of the pipe).
+    // Either race path (see the doc comment above) produces a distinct but
+    // equally explicit message: `handle_creation_outcome`'s new
+    // `is_finished()` check says "backend error" (creation-failure path);
+    // if the reader's error is instead observed after the instance was
+    // already pooled `Ready` (the residual race `handle_creation_outcome`'s
+    // own liveness-check comment already documents as unclosed), the
+    // pre-existing crash-cleanup path says "cancelled due to backend
+    // eviction" — same observable property, different message text.
+    let zombie_resp = proxy.wait_for_response(zombie_id, 5000).await;
+    let error = zombie_resp
+        .error
+        .expect("queued hover against a backend with a dead reader must fail explicitly, not hang");
+    assert!(
+        error.message.contains("backend error") || error.message.contains("cancelled"),
+        "expected an explicit backend-death error, got: {}",
+        error.message
+    );
+
+    let shutdown_resp = proxy.shutdown_and_exit().await;
+    assert!(
+        shutdown_resp.error.is_none(),
+        "shutdown should not return an error"
+    );
+}
