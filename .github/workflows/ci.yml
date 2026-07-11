@@ -35,6 +35,3 @@ jobs:
 
       - name: Run Makefile CI
         run: make ci
-
-      - name: Check version consistency & JSON syntax
-        run: make check-versions

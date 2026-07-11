@@ -44,5 +44,5 @@ check-versions:
 clean:
 	cargo clean
 
-# For CI: fmt-check + lint + doc + test
-ci: fmt-check lint doc test
+# For CI: check-versions + fmt-check + lint + doc + test
+ci: check-versions fmt-check lint doc test
