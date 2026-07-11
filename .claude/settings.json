@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "make lint 2>&1 | head -30"
+            "command": "cargo check --quiet --locked"
           }
         ]
       }
