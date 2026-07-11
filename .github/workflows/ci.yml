@@ -10,6 +10,15 @@ on:
     paths-ignore:
       - "*.md"
 
+# Dedupe superseded runs. For pull_request events, github.head_ref is the PR's
+# source branch, so repeated pushes to the same PR share a group and the
+# newer run cancels the older one. For push events to main, head_ref is empty,
+# so the group falls back to the unique run_id — every main commit gets its
+# own group and never cancels another main run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -17,7 +26,11 @@ jobs:
   ci:
     name: Makefile CI (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
+      # Let every platform leg finish even if another one fails, so a
+      # platform-specific failure doesn't hide the other two platforms' results.
+      fail-fast: false
       matrix:
         os:
           - ubuntu-latest
@@ -33,5 +46,23 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
 
+      # Step timeout (25) is lower than the job timeout (30) on purpose: a
+      # step timeout marks the step as failed, so the `if: failure()` upload
+      # below still runs. A job-level timeout instead cancels the job, and
+      # `if: failure()` steps do not run on cancellation.
       - name: Run Makefile CI
-        run: make ci
+        timeout-minutes: 25
+        run: make ci 2>&1 | tee ci-output.log
+
+      # Uploads only on failure (assertion failures and the step timeout
+      # above), never on success or on cancellation from `concurrency`.
+      # `if-no-files-found: warn` keeps a missing log from masking whatever
+      # step actually failed.
+      - name: Upload CI diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-diagnostics-${{ matrix.os }}
+          path: ci-output.log
+          if-no-files-found: warn
+          retention-days: 3
