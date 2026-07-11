@@ -48,6 +48,28 @@ fn rewrite_root_uri(init_params: &mut Value, venv: &Path) {
     }
 }
 
+/// Whether an open document should be restored (re-sent as `didOpen`) to a
+/// freshly (re)spawned backend for `venv`.
+///
+/// A document restores here if it already routes to this venv, or if its
+/// venv was never resolved (`doc_venv` is `None`) and the file falls under
+/// this venv's project root. A document already owned by a *different* venv
+/// is never restored here, even if its path is nested under this venv's
+/// project root (e.g. a child project's own `.venv`).
+fn should_restore_document(
+    doc_venv: Option<&Path>,
+    venv: &Path,
+    file_path: Option<&Path>,
+    venv_parent: Option<&Path>,
+) -> bool {
+    doc_venv == Some(venv)
+        || (doc_venv.is_none()
+            && match (file_path, venv_parent) {
+                (Some(fp), Some(vp)) => fp.starts_with(vp),
+                _ => false,
+            })
+}
+
 /// Perform the LSP initialize handshake with a backend:
 /// 1. Send `initialize` request with the given params
 /// 2. Wait for the initialize response (10s timeout, skip notifications)
@@ -221,12 +243,13 @@ impl super::LspProxy {
         );
 
         for (url, doc) in &self.state.open_documents {
-            // Only restore documents matching this venv
-            let should_restore = doc.venv.as_deref() == Some(venv)
-                || match (url.to_file_path().ok(), &venv_parent) {
-                    (Some(file_path), Some(vp)) => file_path.starts_with(vp),
-                    _ => false,
-                };
+            let file_path = url.to_file_path().ok();
+            let should_restore = should_restore_document(
+                doc.venv.as_deref(),
+                venv,
+                file_path.as_deref(),
+                venv_parent.as_deref(),
+            );
 
             if !should_restore {
                 skipped += 1;
@@ -283,5 +306,68 @@ impl super::LspProxy {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_restore_document;
+    use std::path::Path;
+
+    const VENV: &str = "/repo/.venv";
+    const CHILD_VENV: &str = "/repo/sub/.venv";
+    const VENV_PARENT: &str = "/repo";
+
+    #[test]
+    fn restores_document_owned_by_this_venv() {
+        assert!(should_restore_document(
+            Some(Path::new(VENV)),
+            Path::new(VENV),
+            Some(Path::new("/repo/a.py")),
+            Some(Path::new(VENV_PARENT)),
+        ));
+    }
+
+    #[test]
+    fn does_not_restore_document_owned_by_a_different_venv_even_if_nested_under_this_root() {
+        // Regression test for #94: a document under `repo/sub/app.py` owned
+        // by `repo/sub/.venv` must not be captured by `repo/.venv`'s restore,
+        // even though its path starts with `repo`.
+        assert!(!should_restore_document(
+            Some(Path::new(CHILD_VENV)),
+            Path::new(VENV),
+            Some(Path::new("/repo/sub/app.py")),
+            Some(Path::new(VENV_PARENT)),
+        ));
+    }
+
+    #[test]
+    fn restores_unresolved_document_under_this_venvs_project_root() {
+        assert!(should_restore_document(
+            None,
+            Path::new(VENV),
+            Some(Path::new("/repo/a.py")),
+            Some(Path::new(VENV_PARENT)),
+        ));
+    }
+
+    #[test]
+    fn does_not_restore_unresolved_document_outside_this_venvs_project_root() {
+        assert!(!should_restore_document(
+            None,
+            Path::new(VENV),
+            Some(Path::new("/elsewhere/a.py")),
+            Some(Path::new(VENV_PARENT)),
+        ));
+    }
+
+    #[test]
+    fn does_not_restore_unresolved_document_when_venv_has_no_parent() {
+        assert!(!should_restore_document(
+            None,
+            Path::new(VENV),
+            Some(Path::new("/repo/a.py")),
+            None,
+        ));
     }
 }
