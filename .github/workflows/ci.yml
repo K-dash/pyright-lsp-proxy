@@ -111,7 +111,7 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
 
   msrv:
-    name: MSRV (declared in Cargo.toml)
+    name: MSRV
     runs-on: ubuntu-latest
     permissions:
       contents: read
