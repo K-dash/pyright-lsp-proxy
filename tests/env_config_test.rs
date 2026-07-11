@@ -60,7 +60,7 @@ fn invalid_pool_sweep_interval_fails_startup() {
     );
 }
 
-/// Unlike the other three vars, `0` is a value-level error here, not just an
+/// Unlike the other four vars, `0` is a value-level error here, not just an
 /// unparseable one: it would silently disable both the TTL sweep and the
 /// venv staleness sweep (issue #126).
 #[test]

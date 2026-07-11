@@ -132,7 +132,7 @@ const TIMEOUT_ENV_VARS: [&str; 5] = [
 /// reports invalid values instead of aborting.
 ///
 /// `TYPEMUX_CC_POOL_SWEEP_INTERVAL` additionally rejects `0`: unlike the
-/// other four vars (where `0` is a documented "disable" sentinel), `0` here
+/// other four vars (which accept `0` with variable-specific semantics), `0` here
 /// would silently disable both periodic jobs it drives. Disabling TTL
 /// eviction is already expressed via `--backend-ttl 0`, and disabling the
 /// venv staleness sweep via `TYPEMUX_CC_VENV_CHECK_INTERVAL=0`.
