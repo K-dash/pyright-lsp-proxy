@@ -96,12 +96,32 @@ pub fn init_handshake_timeout() -> Duration {
         .map_or(DEFAULT_INIT_HANDSHAKE_TIMEOUT, Duration::from_secs)
 }
 
-/// Env vars validated by `validate_env_config`, backing the four accessors above.
-const TIMEOUT_ENV_VARS: [&str; 4] = [
+/// Default pool sweep tick interval; overridable via
+/// `TYPEMUX_CC_POOL_SWEEP_INTERVAL` env var. Drives both periodic jobs in the
+/// event loop: TTL eviction and the venv staleness sweep.
+const DEFAULT_POOL_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Returns the pool sweep tick interval. Unlike the four accessors above,
+/// `0` is not a valid value here (it would silently disable both the TTL
+/// sweep and the venv staleness sweep) — `validate_env_config` rejects it at
+/// startup, so this is only reachable with an unset or already-validated
+/// (positive) value on the normal startup path. (`--doctor` skips that
+/// validation and calls this directly; it reports raw invalid values itself
+/// instead of relying on this fallback.)
+pub fn pool_sweep_interval() -> Duration {
+    std::env::var("TYPEMUX_CC_POOL_SWEEP_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(DEFAULT_POOL_SWEEP_INTERVAL, Duration::from_secs)
+}
+
+/// Env vars validated by `validate_env_config`, backing the five accessors above.
+const TIMEOUT_ENV_VARS: [&str; 5] = [
     "TYPEMUX_CC_WARMUP_TIMEOUT",
     "TYPEMUX_CC_FANOUT_TIMEOUT",
     "TYPEMUX_CC_VENV_CHECK_INTERVAL",
     "TYPEMUX_CC_INIT_HANDSHAKE_TIMEOUT",
+    "TYPEMUX_CC_POOL_SWEEP_INTERVAL",
 ];
 
 /// Validates the timeout/interval env vars above at startup, before the event
@@ -110,13 +130,27 @@ const TIMEOUT_ENV_VARS: [&str; 4] = [
 /// returns an error naming the variable and its raw value instead of letting
 /// the accessors swallow it via `.ok()`. Not called for `--doctor`, which
 /// reports invalid values instead of aborting.
+///
+/// `TYPEMUX_CC_POOL_SWEEP_INTERVAL` additionally rejects `0`: unlike the
+/// other four vars (where `0` is a documented "disable" sentinel), `0` here
+/// would silently disable both periodic jobs it drives. Disabling TTL
+/// eviction is already expressed via `--backend-ttl 0`, and disabling the
+/// venv staleness sweep via `TYPEMUX_CC_VENV_CHECK_INTERVAL=0`.
 pub fn validate_env_config() -> Result<(), String> {
     for env_var in TIMEOUT_ENV_VARS {
         if let Ok(raw) = std::env::var(env_var) {
-            if raw.parse::<u64>().is_err() {
-                return Err(format!(
-                    "invalid {env_var}={raw:?}: expected a non-negative integer number of seconds"
-                ));
+            match raw.parse::<u64>() {
+                Err(_) => {
+                    return Err(format!(
+                        "invalid {env_var}={raw:?}: expected a non-negative integer number of seconds"
+                    ));
+                }
+                Ok(0) if env_var == "TYPEMUX_CC_POOL_SWEEP_INTERVAL" => {
+                    return Err(format!(
+                        "invalid {env_var}={raw:?}: must be a positive integer number of seconds (use --backend-ttl 0 or TYPEMUX_CC_VENV_CHECK_INTERVAL=0 to disable the sweep's individual jobs instead)"
+                    ));
+                }
+                Ok(_) => {}
             }
         }
     }

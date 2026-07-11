@@ -340,10 +340,14 @@ impl LspProxy {
 
         let mut didopen_count: usize = 0;
 
-        // TTL sweep timer: checks every 60 seconds for expired backends
-        let mut ttl_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        // TTL sweep timer: checks for expired backends every
+        // `pool_sweep_interval()` (default 60s, configurable via
+        // `TYPEMUX_CC_POOL_SWEEP_INTERVAL`).
+        let sweep_interval = crate::backend_pool::pool_sweep_interval();
+        let mut ttl_interval = tokio::time::interval(sweep_interval);
         ttl_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        // Consume the first immediate tick so the first real tick fires after 60s
+        // Consume the first immediate tick so the first real tick fires after
+        // one full sweep_interval.
         ttl_interval.tick().await;
 
         loop {
