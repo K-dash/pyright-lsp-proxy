@@ -21,6 +21,15 @@ pub enum WarmupState {
     Ready,
 }
 
+/// Maximum number of index-dependent requests queued per backend during
+/// warmup. Not configurable: a fixed ceiling is enough to bound memory growth
+/// without adding another env var to the surface.
+pub const MAX_WARMUP_QUEUE_LEN: usize = 64;
+
+/// Queue length at which `try_queue_warmup_request` logs a one-time
+/// approaching-capacity warning.
+const WARMUP_QUEUE_WARN_THRESHOLD: usize = MAX_WARMUP_QUEUE_LEN * 4 / 5;
+
 /// Default warmup timeout; overridable via `TYPEMUX_CC_WARMUP_TIMEOUT` env var.
 const DEFAULT_WARMUP_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -143,6 +152,26 @@ impl BackendInstance {
     /// Check if the warmup deadline has passed
     pub fn warmup_expired(&self) -> bool {
         Instant::now() >= self.warmup_deadline
+    }
+
+    /// Queue an index-dependent request during warmup, unless the queue is
+    /// already at `MAX_WARMUP_QUEUE_LEN`. Returns `false` if the request was
+    /// rejected for capacity, in which case the caller must send an error
+    /// response instead of queueing.
+    pub fn try_queue_warmup_request(&mut self, msg: RpcMessage) -> bool {
+        if self.warmup_queue.len() >= MAX_WARMUP_QUEUE_LEN {
+            return false;
+        }
+        self.warmup_queue.push(msg);
+        if self.warmup_queue.len() == WARMUP_QUEUE_WARN_THRESHOLD {
+            tracing::warn!(
+                venv = %self.venv_path.display(),
+                queue_len = self.warmup_queue.len(),
+                max = MAX_WARMUP_QUEUE_LEN,
+                "Warmup queue approaching capacity"
+            );
+        }
+        true
     }
 
     /// Remove a queued request by its JSON-RPC id (for $/cancelRequest handling).

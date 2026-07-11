@@ -235,6 +235,17 @@ impl ProxyUnderTest {
         self.write(&msg).await;
     }
 
+    /// Send a request without waiting for its response. Returns the assigned
+    /// id, for matching against a later `read_next`.
+    #[allow(dead_code)] // Used by some but not all integration test binaries.
+    pub async fn send_request(&mut self, method: &str, params: Value) -> i64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let msg = RpcMessage::request(RpcId::Number(id), method, Some(params));
+        self.write(&msg).await;
+        id
+    }
+
     /// Send a request and wait for the response (with timeout).
     pub async fn request(&mut self, method: &str, params: Value) -> RpcMessage {
         let id = self.next_id;
