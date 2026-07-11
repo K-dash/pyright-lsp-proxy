@@ -5,6 +5,7 @@ mod document;
 mod fanout;
 mod initialization;
 mod pool_management;
+mod progress_token;
 
 use crate::backend::{BackendKind, LspBackend};
 use crate::error::ProxyError;
@@ -240,6 +241,9 @@ impl LspProxy {
             }
             Some("$/cancelRequest") => {
                 self.dispatch_cancel_request(&msg, client_writer).await?;
+            }
+            Some("window/workDoneProgress/cancel") => {
+                self.dispatch_workdone_progress_cancel(&msg).await?;
             }
             _ if msg.is_request() => {
                 self.dispatch_client_request(&msg, client_writer).await?;

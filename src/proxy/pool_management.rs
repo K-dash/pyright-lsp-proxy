@@ -231,11 +231,15 @@ impl super::LspProxy {
         };
 
         match result {
-            Ok(instance) => {
+            Ok(mut instance) => {
+                // Carry over a token recorded while still Creating (#104's
+                // Creating-window race — see `dispatch_creating_backend_message`).
+                instance.indexing_progress_token = entry.indexing_progress_token;
                 tracing::info!(
                     venv = %venv_path.display(),
                     session = entry.session,
                     queued = entry.queued.len(),
+                    indexing_progress_token = ?instance.indexing_progress_token,
                     "Backend creation completed"
                 );
                 self.state.pool.insert(venv_path.clone(), instance);

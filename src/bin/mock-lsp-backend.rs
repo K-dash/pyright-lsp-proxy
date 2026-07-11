@@ -11,7 +11,7 @@ use tokio::io;
 use tokio::io::AsyncWriteExt;
 use typemux_cc::error::FramingError;
 use typemux_cc::framing::{LspFrameReader, LspFrameWriter};
-use typemux_cc::message::RpcMessage;
+use typemux_cc::message::{RpcId, RpcMessage};
 
 // ── Scenario types ──────────────────────────────────────────────────
 
@@ -33,6 +33,12 @@ struct Step {
 #[derive(Debug, Deserialize)]
 struct Expect {
     method: String,
+    /// If set, also asserts `params.token` equals this value. Used by
+    /// progress-token tests (#104) to verify the exact (namespaced or
+    /// restored-original) token that reaches this step, not just the
+    /// method name.
+    #[serde(default)]
+    token: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +48,16 @@ enum Action {
         body: Value,
     },
     Notify {
+        method: String,
+        params: Value,
+    },
+    /// Send a server→client request (e.g. `window/workDoneProgress/create`).
+    /// Fire-and-forget from the mock's perspective: it does not wait for a
+    /// response before continuing to the next scripted step, matching how
+    /// real backends observed in #104's capture don't block on the ack
+    /// either.
+    Request {
+        id: i64,
         method: String,
         params: Value,
     },
@@ -96,6 +112,17 @@ async fn main() {
                 step.expect.method, got_method
             );
             process::exit(1);
+        }
+
+        if let Some(expected_token) = &step.expect.token {
+            let got_token = msg.params.as_ref().and_then(|p| p.get("token"));
+            if got_token != Some(expected_token) {
+                eprintln!(
+                    "mock-lsp-backend: step {i}: expected token {:?}, got {:?}",
+                    expected_token, got_token
+                );
+                process::exit(1);
+            }
         }
 
         for action in &step.actions {
@@ -184,6 +211,13 @@ async fn execute_action<W: tokio::io::AsyncWrite + Unpin>(
                     eprintln!("mock-lsp-backend: write error: {e}");
                     process::exit(1);
                 });
+        }
+        Action::Request { id, method, params } => {
+            let request = RpcMessage::request(RpcId::Number(*id), method, Some(params.clone()));
+            writer.write_message(&request).await.unwrap_or_else(|e| {
+                eprintln!("mock-lsp-backend: write error: {e}");
+                process::exit(1);
+            });
         }
         Action::SleepMs { ms } => {
             tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;

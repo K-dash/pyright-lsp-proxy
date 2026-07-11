@@ -67,14 +67,36 @@ impl super::LspProxy {
     /// Handle a message from a backend that's still `Creating` (split and
     /// reader-draining, but not yet inserted into `backends`).
     ///
-    /// Notifications are the only message kind that can legitimately arrive
-    /// here: they're the backend's own reaction to a restoration `didOpen`
-    /// (e.g. `publishDiagnostics`), and forwarding them needs no pending-
-    /// request/fan-out bookkeeping (that only applies to requests/responses)
-    /// and no warmup instance (there isn't one yet — a `$/progress end`
-    /// landing here is a no-op per the accepted v1 gap; fail-open still
-    /// converges once the backend is `Ready`). So "the normal notification
-    /// path" for this window is simply: forward it.
+    /// Notifications are the common case here: they're the backend's own
+    /// reaction to a restoration `didOpen` (e.g. `publishDiagnostics`), and
+    /// forwarding them needs no pending-request/fan-out bookkeeping (that
+    /// only applies to requests/responses). A `$/progress` notification's
+    /// token is namespaced exactly as it would be for a `Ready` backend
+    /// (`progress_token::namespace`), so the client sees consistent tokens
+    /// regardless of which side of the Creating/Ready boundary a given
+    /// message happened to land on.
+    ///
+    /// `window/workDoneProgress/create` is the one request kind handled
+    /// here (see #104): the backend can start indexing — and emit this
+    /// request for its indexing progress — before its own creation task
+    /// completes, since the reader task drains from the moment it's split,
+    /// well before insertion into `backends`. There is no reachable writer
+    /// back to the backend at this point (it's owned by the in-flight
+    /// creation task), so the request is still dropped without a response —
+    /// but its token is recorded onto `CreatingEntry.indexing_progress_token`
+    /// first and carried into the `BackendInstance` on success
+    /// (`pool_management::handle_creation_outcome`), so the eventual
+    /// progress-based Ready trigger doesn't silently lose track of it. This
+    /// is safe by construction even if some backend actually blocks on the
+    /// ack before sending `$/progress`: warmup just never sees a
+    /// progress-based signal for that session and falls back to the
+    /// timeout — degraded, never wrong. pyright 1.1.407 does not wait for
+    /// the ack (see #104's capture notes).
+    ///
+    /// Any other request/response can't legitimately arrive here: no client
+    /// request is ever forwarded to a Creating backend (queued instead, in
+    /// `CreatingEntry.queued`), and the handshake's own response is consumed
+    /// pre-split, inside the creation task, never reaching this channel.
     async fn dispatch_creating_backend_message(
         &mut self,
         venv_path: PathBuf,
@@ -83,15 +105,45 @@ impl super::LspProxy {
         client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
     ) -> Result<(), ProxyError> {
         match result {
-            Ok(msg) if msg.is_notification() => {
+            Ok(mut msg) if msg.is_notification() => {
+                if msg.method.as_deref() == Some("$/progress") {
+                    if let Some(params) = msg.params.as_mut() {
+                        if super::progress_token::namespace(params, session).is_none() {
+                            tracing::warn!(
+                                venv = %venv_path.display(),
+                                session = session,
+                                "$/progress notification during Creating has no valid token; forwarding unrewritten"
+                            );
+                        }
+                    }
+                }
                 client_writer.write_message(&msg).await?;
             }
+            Ok(msg)
+                if msg.is_request()
+                    && msg.method.as_deref() == Some("window/workDoneProgress/create") =>
+            {
+                if let Some(token) = super::progress_token::extract(msg.params.as_ref()) {
+                    if let Some(entry) = self.state.pool.creating_get_mut(&venv_path) {
+                        if entry.indexing_progress_token.is_none() {
+                            tracing::info!(
+                                venv = %venv_path.display(),
+                                session = session,
+                                token = ?token,
+                                "Recording indexing progress token during Creating (request dropped: no reachable backend writer yet)"
+                            );
+                            entry.indexing_progress_token = Some(token);
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        venv = %venv_path.display(),
+                        session = session,
+                        "window/workDoneProgress/create during Creating has no valid token"
+                    );
+                }
+            }
             Ok(msg) => {
-                // Requests/responses can't legitimately arrive here: no
-                // client request is ever forwarded to a Creating backend
-                // (queued instead, in `CreatingEntry.queued`), and the
-                // handshake's own response is consumed pre-split, inside
-                // the creation task, never reaching this channel.
                 tracing::debug!(
                     venv = %venv_path.display(),
                     session = session,
@@ -137,7 +189,7 @@ impl super::LspProxy {
         client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
     ) -> Result<(), ProxyError> {
         match result {
-            Ok(msg) => {
+            Ok(mut msg) => {
                 tracing::debug!(
                     venv = %venv_path.display(),
                     session = session,
@@ -176,6 +228,46 @@ impl super::LspProxy {
                         // Rewrite the ID before forwarding to client
                         let mut forwarded_msg = msg;
                         forwarded_msg.id = Some(proxy_id);
+
+                        // Namespace the token too (see #104): the id above
+                        // only dedupes the request/response round-trip
+                        // itself, but `params.token` is a separate value the
+                        // client keeps around for later `$/progress`
+                        // matching and `window/workDoneProgress/cancel` — it
+                        // needs the same per-backend namespacing. The first
+                        // one observed while the backend is still Warming is
+                        // recorded as its indexing progress token, gating
+                        // the Ready transition below.
+                        if forwarded_msg.method.as_deref() == Some("window/workDoneProgress/create")
+                        {
+                            if let Some(params) = forwarded_msg.params.as_mut() {
+                                match super::progress_token::namespace(params, session) {
+                                    Some(original_token) => {
+                                        if let Some(inst) = self.state.pool.get_mut(&venv_path) {
+                                            if inst.is_warming()
+                                                && inst.indexing_progress_token.is_none()
+                                            {
+                                                tracing::info!(
+                                                    venv = %venv_path.display(),
+                                                    session = session,
+                                                    token = ?original_token,
+                                                    "Recording indexing progress token for warmup gating"
+                                                );
+                                                inst.indexing_progress_token = Some(original_token);
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        tracing::warn!(
+                                            venv = %venv_path.display(),
+                                            session = session,
+                                            "window/workDoneProgress/create has no valid token; forwarding unrewritten"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
                         client_writer.write_message(&forwarded_msg).await?;
                     } else {
                         // Request without ID (shouldn't happen per JSON-RPC, but be defensive)
@@ -221,28 +313,50 @@ impl super::LspProxy {
                     }
                 }
 
-                // Detect $/progress end → transition warming backend to ready
-                if msg.is_notification() {
-                    if let Some(method) = msg.method_name() {
-                        if method == "$/progress" && is_progress_end(&msg) {
-                            if let Some(inst) = self.state.pool.get_mut(&venv_path) {
-                                if inst.is_warming() {
-                                    tracing::info!(
-                                        venv = %venv_path.display(),
-                                        "Backend warmup complete (reason: progress), transitioning to Ready"
-                                    );
-                                    let queued = inst.mark_ready();
-                                    if !queued.is_empty() {
-                                        self.drain_warmup_queue(
-                                            &venv_path,
-                                            session,
-                                            queued,
-                                            client_writer,
-                                        )
-                                        .await?;
+                // Namespace $/progress tokens (see #104), and gate the
+                // warmup Ready transition on an EXACT match against this
+                // backend's own recorded indexing token — never on kind
+                // alone, which an unrelated progress stream (this backend's
+                // or, pre-fix, another backend's colliding one) could
+                // trigger early.
+                if msg.is_notification() && msg.method.as_deref() == Some("$/progress") {
+                    let params = msg.params.as_mut();
+                    let original_token =
+                        params.and_then(|p| super::progress_token::namespace(p, session));
+                    match original_token {
+                        Some(original_token) => {
+                            if is_progress_end(&msg) {
+                                if let Some(inst) = self.state.pool.get_mut(&venv_path) {
+                                    if inst.is_warming()
+                                        && inst.indexing_progress_token.as_ref()
+                                            == Some(&original_token)
+                                    {
+                                        tracing::info!(
+                                            venv = %venv_path.display(),
+                                            session = session,
+                                            token = ?original_token,
+                                            "Backend warmup complete (reason: progress), transitioning to Ready"
+                                        );
+                                        let queued = inst.mark_ready();
+                                        if !queued.is_empty() {
+                                            self.drain_warmup_queue(
+                                                &venv_path,
+                                                session,
+                                                queued,
+                                                client_writer,
+                                            )
+                                            .await?;
+                                        }
                                     }
                                 }
                             }
+                        }
+                        None => {
+                            tracing::warn!(
+                                venv = %venv_path.display(),
+                                session = session,
+                                "$/progress notification has no valid token; forwarding unrewritten, warmup gating skipped"
+                            );
                         }
                     }
                 }
