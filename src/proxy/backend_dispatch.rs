@@ -76,30 +76,51 @@ impl super::LspProxy {
     /// regardless of which side of the Creating/Ready boundary a given
     /// message happened to land on.
     ///
-    /// `window/workDoneProgress/create` is a request kind handled specially
-    /// here (see #104): the backend can start indexing — and emit this
-    /// request for its indexing progress — before its own creation task
-    /// completes, since the reader task drains from the moment it's split,
-    /// well before insertion into `backends`. There is no reachable writer
-    /// back to the backend at this point (it's owned by the in-flight
-    /// creation task), so the request can't be answered yet — but its token
-    /// is recorded onto `CreatingEntry.indexing_progress_token` first and
-    /// carried into the `BackendInstance` on success
-    /// (`pool_management::handle_creation_outcome`), so the eventual
-    /// progress-based Ready trigger doesn't silently lose track of it. This
-    /// is safe by construction even if some backend actually blocks on the
-    /// ack before sending `$/progress`: warmup just never sees a
-    /// progress-based signal for that session and falls back to the
-    /// timeout — degraded, never wrong. pyright 1.1.407 does not wait for
-    /// the ack (see #104's capture notes).
+    /// `window/workDoneProgress/create` is the one request kind still
+    /// dropped here, deliberately, even after #134 (see below): the backend
+    /// can start indexing — and emit this request for its indexing progress
+    /// — before its own creation task completes, since the reader task
+    /// drains from the moment it's split, well before insertion into
+    /// `backends`. There is no reachable writer back to the backend at this
+    /// point (it's owned by the in-flight creation task), so the request
+    /// can't be answered yet — but its token is recorded onto
+    /// `CreatingEntry.indexing_progress_token` first and carried into the
+    /// `BackendInstance` on success (`pool_management::handle_creation_outcome`),
+    /// so the eventual progress-based Ready trigger doesn't silently lose
+    /// track of it. This is safe by construction even if some backend
+    /// actually blocks on the ack before sending `$/progress`: warmup just
+    /// never sees a progress-based signal for that session and falls back
+    /// to the timeout — degraded, never wrong. pyright 1.1.407 does not
+    /// wait for the ack (see #104's capture notes).
     ///
-    /// Every request arriving here — `window/workDoneProgress/create`
-    /// included — is queued onto `CreatingEntry.server_requests` (see #134:
-    /// pyright 1.1.407 sends three `workspace/configuration` requests right
-    /// after `initialized`, squarely in this window; the pre-#130 sync
-    /// implementation answered these because they just sat in the OS pipe
-    /// until the backend was pooled, so silently dropping them post-#130 was
-    /// a regression). Once the instance is pooled, each queued request is
+    /// #134 queues every OTHER request kind arriving here instead of
+    /// dropping it (see below) — deliberately NOT extended to
+    /// `window/workDoneProgress/create`: `$/progress` notifications for the
+    /// same token are forwarded to the client immediately, live, on this
+    /// very path (the arm above), while a queued `create` would only reach
+    /// the client after `pool.insert` on success — arbitrarily later. A
+    /// backend that sends create→begin→end during this window (pyright
+    /// doesn't wait for the create ack — #104's capture, again) would then
+    /// produce client-visible order begin→end→create: a work-done-progress
+    /// lifecycle violation (the client sees progress for a token it was
+    /// never told exists yet) even though every token value still matches.
+    /// The complete fix — queuing the create AND every subsequent
+    /// same-token `$/progress` together, replayed in order once Ready —
+    /// would collide with #93's requirement that notifications drain (and
+    /// reach the client) live during Creating, not get held back behind a
+    /// request queue. Out of scope here; dropping (after recording the
+    /// token) keeps the existing, already-accepted degraded-to-timeout
+    /// behavior instead of trading it for a protocol violation.
+    ///
+    /// Every OTHER request arriving here is queued onto
+    /// `CreatingEntry.server_requests` (see #134: pyright 1.1.407 sends
+    /// three `workspace/configuration` requests right after `initialized`,
+    /// squarely in this window; the pre-#130 sync implementation answered
+    /// these because they just sat in the OS pipe until the backend was
+    /// pooled, so silently dropping them post-#130 was a regression). These
+    /// have no ordering coupling to a live notification stream the way
+    /// `window/workDoneProgress/create` does, so deferring them to forward
+    /// time is safe. Once the instance is pooled, each queued request is
     /// forwarded to the client through the exact same rewriting a `Ready`
     /// backend's request gets (`forward_backend_request_to_client`) — see
     /// `pool_management::handle_creation_outcome`. A response can't
@@ -152,7 +173,14 @@ impl super::LspProxy {
                         "window/workDoneProgress/create during Creating has no valid token"
                     );
                 }
-                self.queue_creating_server_request(&venv_path, session, msg);
+                // Deliberately dropped, NOT queued onto `server_requests` —
+                // see this function's doc comment for why (causal-order
+                // collision with the live `$/progress` notification path).
+                tracing::info!(
+                    venv = %venv_path.display(),
+                    session = session,
+                    "Dropping window/workDoneProgress/create during Creating (token already recorded above; no reachable backend writer yet, and queuing would desync it from the live $/progress stream)"
+                );
             }
             Ok(msg) if msg.is_request() => {
                 // #134: any other server-initiated request (most notably

@@ -1,7 +1,7 @@
 mod support;
 
 use support::{PackageConfig, ProxyUnderTest, WorkspaceConfig};
-use typemux_cc::message::RpcId;
+use typemux_cc::message::{RpcId, RpcMessage};
 
 /// Mirrors `MAX_CREATING_QUEUE_LEN` in `src/backend_pool.rs`. Not exported
 /// from the lib crate (the E2E harness only links `framing`/`message` and
@@ -1982,12 +1982,17 @@ async fn workspace_configuration_during_creating_is_answered_e2e() {
 }
 
 /// E2E (#134 AC2): a server-initiated request queued during Creating must
-/// not leak into `pending_backend_requests` when that creation FAILS — no
-/// response is ever registered/expected for it (registration happens only
-/// at forward time, on success), so there is nothing to leak by
-/// construction. This proves it observably: no response for the dropped
-/// request ever reaches the client, and a subsequent, unrelated request
-/// completes normally (no corrupted pending-request state left behind).
+/// not leak into `pending_backend_requests` when that creation FAILS.
+/// `pending_backend_requests` registration only ever happens at forward
+/// time, inside the SUCCESS arm (`handle_creation_outcome`) — the failure
+/// arm never calls it, so there is nothing to leak by construction; that
+/// structural guarantee is what actually rules out a leak, not anything
+/// this test observes directly (a leaked entry, being keyed by its own
+/// proxy id in an unrelated map, wouldn't block or corrupt an unrelated
+/// request either way). What this test DOES show observably: no response
+/// for the dropped request ever reaches the client, and the proxy keeps
+/// working normally afterward (a subsequent, unrelated request completes) —
+/// i.e. the failure path doesn't crash or wedge the event loop.
 ///
 /// Deterministic failure (unlike `dead_backend_during_creation_does_not_pool_as_zombie_e2e`,
 /// which tolerates a race between two failure paths): two large
@@ -2144,8 +2149,10 @@ async fn queued_server_request_dropped_on_creation_failure_e2e() {
     );
 
     // A subsequent, unrelated request (different venv) must complete
-    // normally — proves `pending_backend_requests`/`pending_requests`
-    // weren't corrupted by the failed creation.
+    // normally — shows the failure path didn't crash or wedge the proxy.
+    // (Not itself proof of no `pending_backend_requests` leak: a leaked
+    // entry there wouldn't affect an unrelated venv's request either way —
+    // the no-leak guarantee is structural, see this test's doc comment.)
     let file_good = root.join("good/main.py");
     std::fs::write(&file_good, "g = 1\n").unwrap();
     let file_good_uri = support::path_to_uri(&file_good);
@@ -2169,6 +2176,185 @@ async fn queued_server_request_dropped_on_creation_failure_e2e() {
         hover_good.result.as_ref().unwrap()["contents"]["value"],
         "hover good"
     );
+
+    let shutdown_resp = proxy.shutdown_and_exit().await;
+    assert!(
+        shutdown_resp.error.is_none(),
+        "shutdown should not return an error"
+    );
+}
+
+/// E2E (#134 external review follow-up): a `window/workDoneProgress/create`
+/// request emitted during the Creating window must stay dropped — the #104
+/// carve-out, unchanged — NOT queued and forwarded like #134's generic
+/// server-initiated requests are.
+///
+/// Why: `$/progress` notifications for the same token are forwarded to the
+/// client LIVE, on the spot, during Creating (the existing #104/#130
+/// notification path, the arm right above the `create` handling in
+/// `dispatch_creating_backend_message`). If `create` were queued instead
+/// (like #134's generic requests), it would only reach the client after
+/// `pool.insert` on success — arbitrarily later than the `$/progress`
+/// stream it's supposed to introduce. A backend that sends
+/// create→begin→end during this window without waiting for the create ack
+/// (pyright 1.1.407 doesn't — #104's capture) would then produce
+/// client-visible order begin→end→create: a work-done-progress lifecycle
+/// violation even though every token value still matches. The complete fix
+/// (queue the create AND every subsequent same-token `$/progress` together,
+/// replayed in order once Ready) would collide with #93's requirement that
+/// notifications drain live during Creating, so it's out of scope — this
+/// test only proves the narrower, already-shipped mitigation: never invert
+/// the order by queuing the create alone.
+///
+/// Two large (`BACKPRESSURE_TEXT_LEN`) documents are restored, same
+/// technique as the sibling tests above: the create→begin→report→end
+/// burst reacts to the FIRST restored document, while the creation task is
+/// then provably still blocked writing the SECOND large document — so the
+/// burst is deterministically dispatched via `dispatch_creating_backend_message`
+/// while genuinely `Creating`, not racing the outcome.
+///
+/// Detection power: reverting the create-drop back to #134's queue-and-
+/// forward behavior makes the create request eventually reach the client
+/// (after creation succeeds, alongside the hover reply). `request_collecting`
+/// collects anything that isn't the awaited hover's own response — a
+/// request equally as well as a notification — so a wrongly-forwarded
+/// create lands in `extra` and fails the `create_requests.is_empty()`
+/// assertion below.
+#[tokio::test]
+// `file_a`/`file_b` (and their `_uri` variants) are deliberately parallel
+// names for the two test fixtures this scenario exercises.
+#[allow(clippy::similar_names)]
+async fn create_progress_during_creating_stays_dropped_not_queued_e2e() {
+    const TOKEN: &str = "indexing-token-134";
+
+    let scenario = serde_json::json!({
+        "on_startup": [],
+        "steps": [
+            {
+                "expect": { "method": "initialize" },
+                "actions": [{ "type": "respond", "body": { "capabilities": { "hoverProvider": true } } }]
+            },
+            { "expect": { "method": "initialized" }, "actions": [] },
+            {
+                "expect": { "method": "textDocument/didOpen" },
+                "actions": [
+                    { "type": "request", "id": 3, "method": "window/workDoneProgress/create", "params": { "token": TOKEN } },
+                    { "type": "notify", "method": "$/progress", "params": { "token": TOKEN, "value": { "kind": "begin", "title": "" } } },
+                    { "type": "notify", "method": "$/progress", "params": { "token": TOKEN, "value": { "kind": "report", "message": "indexing" } } },
+                    { "type": "notify", "method": "$/progress", "params": { "token": TOKEN, "value": { "kind": "end" } } }
+                ]
+            },
+            { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
+            {
+                "expect": { "method": "textDocument/hover" },
+                "actions": [{ "type": "respond", "body": { "contents": { "kind": "plaintext", "value": "hover after create" } } }]
+            },
+            {
+                "expect": { "method": "shutdown" },
+                "actions": [{ "type": "respond", "body": null }]
+            }
+        ]
+    });
+
+    let config = WorkspaceConfig {
+        packages: vec![PackageConfig {
+            name: "pkg".to_string(),
+            scenario: scenario.clone(),
+            has_venv: false,
+        }],
+    };
+
+    let (temp_dir, root) = support::setup_test_workspace(&config);
+    let pkg_dir = root.join("pkg");
+    let mut proxy = ProxyUnderTest::spawn(temp_dir, root.clone(), &root);
+
+    let root_uri = support::path_to_uri(&root);
+    let init_resp = proxy.initialize(&root_uri).await;
+    assert!(
+        init_resp.error.is_none(),
+        "initialize should not return an error"
+    );
+    proxy.send_initialized().await;
+
+    let large_text = "x".repeat(BACKPRESSURE_TEXT_LEN);
+
+    let file_a = pkg_dir.join("a.py");
+    std::fs::write(&file_a, "a = 1\n").unwrap();
+    let file_a_uri = support::path_to_uri(&file_a);
+    let file_b = pkg_dir.join("b.py");
+    std::fs::write(&file_b, "b = 1\n").unwrap();
+    let file_b_uri = support::path_to_uri(&file_b);
+
+    // No `.venv` yet: both cache with `venv: None`, neither triggers creation.
+    proxy.did_open(&file_a_uri, &large_text).await;
+    proxy.did_open(&file_b_uri, &large_text).await;
+
+    // Synchronizing round-trip — see the sibling tests' identical step for
+    // why this is required before writing `.venv` below.
+    let presync = proxy
+        .request(
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": &file_a_uri },
+                "position": { "line": 0, "character": 0 }
+            }),
+        )
+        .await;
+    assert!(
+        presync.error.is_some(),
+        "hover before .venv exists should error (no backend yet)"
+    );
+
+    // `.venv` now exists.
+    support::write_venv_fixture(&pkg_dir, &scenario);
+
+    // Re-open a.py: starts creation. Restoration snapshot captures both
+    // large documents — see this test's doc comment for why the create
+    // reaction is guaranteed to land while still Creating.
+    proxy.did_open(&file_a_uri, &large_text).await;
+
+    let (hover, extra) = proxy
+        .request_collecting(
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": &file_a_uri },
+                "position": { "line": 0, "character": 0 }
+            }),
+        )
+        .await;
+    assert!(hover.error.is_none(), "hover failed: {:?}", hover.error);
+    assert_eq!(
+        hover.result.as_ref().unwrap()["contents"]["value"],
+        "hover after create"
+    );
+
+    let create_requests: Vec<&RpcMessage> = extra
+        .iter()
+        .filter(|m| m.method.as_deref() == Some("window/workDoneProgress/create"))
+        .collect();
+    assert!(
+        create_requests.is_empty(),
+        "window/workDoneProgress/create must never reach the client (dropped per #104, not queued) — got: {create_requests:?}"
+    );
+
+    let progress_notifications: Vec<&RpcMessage> = extra
+        .iter()
+        .filter(|m| m.method.as_deref() == Some("$/progress"))
+        .collect();
+    assert_eq!(
+        progress_notifications.len(),
+        3,
+        "expected begin+report+end to reach the client live during Creating, got: {progress_notifications:?}"
+    );
+    for notif in &progress_notifications {
+        let token = notif.params.as_ref().unwrap()["token"]
+            .as_str()
+            .expect("token must be a string once namespaced");
+        assert_ne!(
+            token, TOKEN,
+            "token must be namespaced, not passed through raw"
+        );
+    }
 
     let shutdown_resp = proxy.shutdown_and_exit().await;
     assert!(
