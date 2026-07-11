@@ -109,3 +109,30 @@ jobs:
       # No separate Rust toolchain setup: the action's container bundles one.
       - name: Run cargo-deny
         uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+
+  msrv:
+    name: MSRV (Rust 1.88)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      # `master`, not `stable`: passing an explicit `toolchain` input
+      # requires `master` per dtolnay/rust-toolchain's own docs (`stable`
+      # only carries the "always latest stable" default this input overrides).
+      - name: Setup Rust 1.88
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: "1.88"
+
+      # Guards the declared `rust-version` in Cargo.toml: without this, only
+      # the latest stable toolchain (via the `ci` job) is ever exercised, so
+      # a transitive dependency bump can silently raise the real minimum
+      # supported Rust version past what's declared.
+      - name: Check MSRV
+        run: cargo check --workspace --all-targets --locked
