@@ -153,17 +153,27 @@ impl super::LspProxy {
                 );
             }
             Err(e) => {
-                // The backend died mid-creation. `pool.creating`'s entry is
-                // owned by the `creation_rx` completion handler, not this
-                // crash-cleanup path (which only operates on `backends`) —
-                // the completion handler's own liveness check catches this
-                // and reports it as a contained creation failure.
+                // The backend's reader task died mid-creation. `pool.creating`'s
+                // entry is owned by the `creation_rx` completion handler, not
+                // this crash-cleanup path (which only operates on `backends`)
+                // — the completion handler's own liveness checks catch this:
+                // the process itself dying (`try_wait`), the reader task's own
+                // `JoinHandle` finishing (`is_finished()`) with the process
+                // still alive, or — this arm's own contribution — this exact
+                // error, recorded onto `CreatingEntry::reader_error` below so
+                // it isn't lost by being consumed (and, before this fix,
+                // merely logged) here instead of reaching that check. #106.
                 tracing::debug!(
                     venv = %venv_path.display(),
                     session = session,
                     error = ?e,
-                    "Backend read error during creation; completion handler will report the outcome"
+                    "Backend read error during creation; recording onto the entry for the completion handler"
                 );
+                if let Some(entry) = self.state.pool.creating_get_mut(&venv_path) {
+                    if entry.reader_error.is_none() {
+                        entry.reader_error = Some(e);
+                    }
+                }
             }
         }
         Ok(())

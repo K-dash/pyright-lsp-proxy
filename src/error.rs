@@ -51,6 +51,18 @@ pub enum FramingError {
     #[error("Invalid Content-Length value")]
     InvalidContentLength,
 
+    #[error("Duplicate Content-Length header")]
+    DuplicateContentLength,
+
+    #[error("Content-Length {actual} exceeds maximum frame size of {limit} bytes")]
+    ContentLengthTooLarge { limit: usize, actual: usize },
+
+    #[error("Header line exceeds maximum length of {limit} bytes")]
+    HeaderLineTooLong { limit: usize },
+
+    #[error("Header block exceeds maximum total size of {limit} bytes")]
+    HeaderBlockTooLarge { limit: usize },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

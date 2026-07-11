@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::process;
 use tokio::io;
+use tokio::io::AsyncWriteExt;
 use typemux_cc::error::FramingError;
 use typemux_cc::framing::{LspFrameReader, LspFrameWriter};
 use typemux_cc::message::{RpcId, RpcMessage};
@@ -65,6 +66,12 @@ enum Action {
     },
     Crash,
     Eof,
+    /// Write raw bytes to stdout, bypassing LSP framing entirely. For
+    /// scripting a malformed/oversized frame (e.g. a `Content-Length` past
+    /// the proxy's framing limit) to test containment (#106).
+    RawBytes {
+        data: String,
+    },
 }
 
 // ── Main ────────────────────────────────────────────────────────────
@@ -222,6 +229,20 @@ async fn execute_action<W: tokio::io::AsyncWrite + Unpin>(
             // Close stdout and exit cleanly.
             drop(std::io::stdout());
             process::exit(0);
+        }
+        Action::RawBytes { data } => {
+            writer
+                .get_mut()
+                .write_all(data.as_bytes())
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("mock-lsp-backend: write error: {e}");
+                    process::exit(1);
+                });
+            writer.get_mut().flush().await.unwrap_or_else(|e| {
+                eprintln!("mock-lsp-backend: flush error: {e}");
+                process::exit(1);
+            });
         }
     }
 }
