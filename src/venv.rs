@@ -51,6 +51,10 @@ pub async fn get_git_toplevel(working_dir: &Path) -> Result<Option<PathBuf>, Ven
     if output.status.success() {
         let path_str = String::from_utf8_lossy(&output.stdout);
         let path = PathBuf::from(path_str.trim());
+        // `git rev-parse --show-toplevel` already resolves symlinks, but
+        // canonicalize defensively so this is guaranteed to match the form
+        // `find_venv` canonicalizes the file path to.
+        let path = path.canonicalize().unwrap_or(path);
         tracing::info!(toplevel = %path.display(), "Git toplevel found");
         Ok(Some(path))
     } else {
@@ -99,8 +103,14 @@ pub fn find_venv(file_path: &Path, git_toplevel: Option<&Path>) -> Option<PathBu
         "Starting .venv search"
     );
 
-    // Start from file's parent directory
-    let mut current = file_path.parent();
+    // Canonicalize the starting directory so the upward walk and the
+    // `git_toplevel` boundary (already canonicalized in `get_git_toplevel`)
+    // agree on symlink resolution. Falls back to the raw path when the file
+    // (or its parent) does not exist yet, e.g. an unsaved buffer.
+    let start = file_path
+        .parent()
+        .map(|dir| dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()));
+    let mut current = start.as_deref();
     let mut depth = 0;
 
     while let Some(dir) = current {
@@ -215,20 +225,85 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_venv() {
+        // Canonicalize to resolve symlinks (e.g., /var -> /private/var on
+        // macOS): find_venv now returns a canonical path, so the expected
+        // value must be canonical too.
         let temp = tempdir().unwrap();
-        let venv = temp.path().join(".venv");
+        let root = temp.path().canonicalize().unwrap();
+        let venv = root.join(".venv");
         fs::create_dir(&venv).await.unwrap();
         fs::write(venv.join("pyvenv.cfg"), "home = /usr/bin")
             .await
             .unwrap();
 
-        let subdir = temp.path().join("subdir");
+        let subdir = root.join("subdir");
         fs::create_dir(&subdir).await.unwrap();
         let file = subdir.join("test.py");
         fs::write(&file, "# test").await.unwrap();
 
         let result = find_venv(&file, None);
         assert_eq!(result, Some(venv));
+    }
+
+    #[tokio::test]
+    async fn test_find_venv_resolves_symlinked_project_dir() {
+        // The file path reaches the project through a symlink (mimicking a
+        // client URI with a logical path like macOS's /tmp -> /private/tmp),
+        // while `find_venv` walks physical directories. The returned venv
+        // path must still be canonical so it matches pool keys derived from
+        // the canonicalized git toplevel.
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+
+        let real_project = root.join("real_project");
+        fs::create_dir(&real_project).await.unwrap();
+        let venv = real_project.join(".venv");
+        fs::create_dir(&venv).await.unwrap();
+        fs::write(venv.join("pyvenv.cfg"), "home = /usr/bin")
+            .await
+            .unwrap();
+
+        let symlink_project = root.join("symlinked_project");
+        std::os::unix::fs::symlink(&real_project, &symlink_project).unwrap();
+
+        let file = symlink_project.join("test.py");
+        fs::write(real_project.join("test.py"), "# test")
+            .await
+            .unwrap();
+
+        let result = find_venv(&file, None);
+        assert_eq!(result, Some(venv));
+    }
+
+    #[tokio::test]
+    async fn test_find_venv_respects_boundary_under_symlink() {
+        // Boundary check must still hold once both sides are canonicalized:
+        // a venv that lives above the (canonicalized) git toplevel must not
+        // be adopted, even when the file is reached through a symlink.
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+
+        // Outer .venv, above the toplevel — must never be picked up.
+        let outer_venv = root.join(".venv");
+        fs::create_dir(&outer_venv).await.unwrap();
+        fs::write(outer_venv.join("pyvenv.cfg"), "home = /usr/bin")
+            .await
+            .unwrap();
+
+        let real_repo = root.join("real_repo");
+        fs::create_dir(&real_repo).await.unwrap();
+
+        let symlink_repo = root.join("symlinked_repo");
+        std::os::unix::fs::symlink(&real_repo, &symlink_repo).unwrap();
+
+        let file = symlink_repo.join("test.py");
+        fs::write(real_repo.join("test.py"), "# test")
+            .await
+            .unwrap();
+
+        // Toplevel is the (canonical) real repo dir — no .venv inside it.
+        let result = find_venv(&file, Some(&real_repo));
+        assert_eq!(result, None);
     }
 
     #[tokio::test]
