@@ -797,7 +797,7 @@ fn check_creation_liveness(
             }
             instance.reader_task.abort();
             Err(ProxyError::Backend(BackendError::InitializeFailed(
-                "backend reader task exited during creation (framing error) \
+                "backend reader task exited during creation \
                  while the process is still alive"
                     .to_string(),
             )))
