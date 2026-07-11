@@ -7,8 +7,12 @@ use typemux_cc::message::{RpcId, RpcMessage};
 /// E2E: while a backend is warming, an index-dependent request
 /// (`textDocument/definition`) is queued rather than forwarded, and a
 /// non-index-dependent request (`textDocument/hover`) passes through
-/// immediately. Once the backend signals readiness via `$/progress` (kind
-/// "end"), the queued request is drained and answered.
+/// immediately. Once the backend signals readiness via its recorded
+/// indexing token's `$/progress` end, the queued request is drained and
+/// answered. The `window/workDoneProgress/create` request is what records
+/// "warmup" as that token in the first place (see #104) — without it,
+/// warmup would never see a matching `end` and this would fall back to the
+/// timeout instead of draining on the progress signal this test targets.
 ///
 /// Determinism: the proxy processes client messages strictly in the order
 /// they arrive on its stdin, so sending `definition` and then a second
@@ -37,6 +41,7 @@ async fn queued_definition_drains_after_progress_end_while_hover_passes_through(
             {
                 "expect": { "method": "textDocument/hover" },
                 "actions": [
+                    { "type": "request", "id": 100, "method": "window/workDoneProgress/create", "params": { "token": "warmup" } },
                     { "type": "notify", "method": "$/progress", "params": { "token": "warmup", "value": { "kind": "end" } } },
                     { "type": "respond", "body": { "contents": { "kind": "plaintext", "value": "hover triggering ready" } } }
                 ]
@@ -117,11 +122,17 @@ async fn queued_definition_drains_after_progress_end_while_hover_passes_through(
     // backend to Ready and drains the queued definition request.
     let hover2_id = proxy.send_request("textDocument/hover", doc_params()).await;
 
+    // Filtered to `is_response()`: the backend's `window/workDoneProgress/create`
+    // request is also forwarded to the client in this window (with its own
+    // proxy-assigned id — see #104), and would otherwise be miscounted as
+    // one of the two responses this loop is waiting for.
     let mut responses: HashMap<i64, RpcMessage> = HashMap::new();
     while responses.len() < 2 {
         let msg = proxy.read_next().await;
-        if let Some(RpcId::Number(id)) = &msg.id {
-            responses.insert(*id, msg);
+        if msg.is_response() {
+            if let Some(RpcId::Number(id)) = &msg.id {
+                responses.insert(*id, msg);
+            }
         }
     }
 

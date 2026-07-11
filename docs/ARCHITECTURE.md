@@ -145,7 +145,7 @@ When the creation task finishes, the `creation_rx` select! arm (the only code pa
 
 **Pool capacity.** `is_full()` counts `backends.len() + creating.len()`: a creation task holds a real process even before it's `Ready`. If the pool is full and no `Ready` backend is evictable (every slot is `Creating`), backend creation is rejected outright with `ProxyError::PoolBusy` — surfaced as an immediate JSON-RPC error, no implicit waiting.
 
-**Known v1 gaps** (accepted, not fixed): a `$/progress end` for an instance not yet in `backends` is a no-op — the warmup state update is missed but converges via the warmup fail-open timeout; fan-out (`workspace/symbol`) only targets `pool.backends_keys()`, so a `Creating` venv is silently excluded — unchanged, existing best-effort semantics. (`didClose` for a `Creating` venv used to be a similar no-op; it's now queued and replayed like any other message — see Event Loop below.)
+**Known v1 gaps** (accepted, not fixed): fan-out (`workspace/symbol`) only targets `pool.backends_keys()`, so a `Creating` venv is silently excluded — unchanged, existing best-effort semantics. (`didClose` for a `Creating` venv used to be a similar no-op; it's now queued and replayed like any other message — see Event Loop below.) A `window/workDoneProgress/create` request landing during Creating can't be answered either — there's no reachable backend writer yet, it's owned by the in-flight creation task — but its token IS recorded onto `CreatingEntry.indexing_progress_token` and carried into the `BackendInstance` on success, so the warmup Ready trigger described below still recognizes a matching `end` that arrives after the backend is pooled (see #104). If the matching `end` itself also lands during the Creating window, that fact is not carried over — the backend stays Warming and converges via the warmup fail-open timeout, never via a wrong early Ready.
 
 ## Backend-to-Client Request Proxying
 
@@ -167,6 +167,14 @@ pub struct PendingBackendRequest {
 }
 ```
 
+### Progress Token Namespacing (#104)
+
+The request ID above dedupes the `workDoneProgress/create` round-trip itself, but LSP's `ProgressToken` (`integer | string`, carried in `params.token` on both `window/workDoneProgress/create` and `$/progress`) is a *separate* value the client keeps around for later `$/progress` matching and `window/workDoneProgress/cancel` — untouched, it can collide the same way request IDs would. `proxy::progress_token` (`src/proxy/progress_token.rs`) rewrites it stateless-ly, reusing `RpcId` as the token type (its `Number(i64) | String(String)` shape already matches `ProgressToken` exactly):
+
+- **Backend → client** (`create` request, `$/progress` notification): `params.token` is rewritten to `tmx:{session}:{n|s}:{original}` before forwarding. The `n`/`s` tag preserves whether the original was a JSON number or string, so the rewrite is lossless in both directions. No side table — the session is encoded directly in the string, so there's nothing to clean up on backend eviction/crash.
+- **Client → backend** (`window/workDoneProgress/cancel`): the prefixed token is decoded back to `(session, original_token)`; the notification is forwarded to that ONE backend (via `BackendPool::get_mut_by_session`) with the ORIGINAL token restored — never broadcast to every backend (the generic notification path has no `textDocument.uri` to route `workDoneProgress/cancel` by, so without this special case it would go out to all of them, still holding the client's prefixed token, which none of them minted). If the token isn't proxy-namespaced, or its session no longer resolves to a pooled backend, the notification is dropped with a debug log.
+- **Client-initiated requests carrying `workDoneToken` in their own params** (e.g. a `textDocument/definition` request's `workDoneToken`) are left untouched: they flow inside a request already routed to one specific backend, so there's no cross-backend collision surface for the proxy to namespace against.
+
 ## Warmup Readiness
 
 ### Problem
@@ -183,7 +191,7 @@ stateDiagram-v2
     [*] --> Warming: Backend spawned
     [*] --> Ready: TYPEMUX_CC_WARMUP_TIMEOUT=0
 
-    Warming --> Ready: $/progress end received
+    Warming --> Ready: indexing token's $/progress end received
     Warming --> Ready: Timeout expired (fail-open)
 ```
 
@@ -211,7 +219,7 @@ pub enum WarmupState {
 
 ### Ready Transition Triggers (OR logic)
 
-1. **`$/progress` notification** with `kind: "end"` received from backend
+1. **`$/progress` notification** with `kind: "end"` AND a `token` matching this backend's own recorded indexing-progress token — the token of the FIRST `window/workDoneProgress/create` request the backend sent while Warming (`BackendInstance::indexing_progress_token`, or `CreatingEntry::indexing_progress_token` if it arrived before the backend was even inserted — see #104). Matched against the ORIGINAL backend-side token, never the client-visible namespaced one. A kind-only match (any `$/progress end`, regardless of token) was #104's bug: an unrelated progress stream could release queued index-dependent requests early. Identified structurally, not by title — pyright 1.1.407's indexing `begin` carries an empty `title`, so title-matching wasn't viable anyway. Confirmed (2026, this capture): `ty` 0.0.58 and `pyrefly` 1.1.1 never send `$/progress` at all, so this trigger never fires for them — they rely solely on trigger 2.
 2. **Bounded timeout** (default 2s, configurable via `TYPEMUX_CC_WARMUP_TIMEOUT`) expires — **fail-open**: forward queued requests anyway
 
 ### Configuration
@@ -615,7 +623,8 @@ make ci
 | `error.rs` | Error type definitions (ProxyError, BackendError, etc.) |
 | `proxy/mod.rs` | Main event loop (`tokio::select!` with 7 arms) |
 | `proxy/client_dispatch.rs` | Client message routing, warmup queueing, cancel handling |
-| `proxy/backend_dispatch.rs` | Backend message routing, proxy ID rewriting, progress detection |
+| `proxy/backend_dispatch.rs` | Backend message routing, proxy ID rewriting, progress-token namespacing and indexing-token gated warmup detection |
+| `proxy/progress_token.rs` | Stateless progress-token namespacing/decoding (`ProgressToken` ↔ `RpcId`) |
 | `proxy/fanout.rs` | Fan-out dispatch, response merging, deduplication, timeout handling |
 | `proxy/pool_management.rs` | LRU/TTL eviction, crash recovery, warmup expiry |
 | `proxy/initialization.rs` | Backend initialization handshake, document restoration |
