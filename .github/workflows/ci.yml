@@ -92,3 +92,20 @@ jobs:
           # Public repo, no Advanced Security tier needed: print findings to
           # the log and fail the job on any finding instead of uploading SARIF.
           advanced-security: false
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      # Checks advisories, licenses, bans, and sources against deny.toml.
+      # No separate Rust toolchain setup: the action's container bundles one.
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20

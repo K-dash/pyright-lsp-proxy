@@ -1,0 +1,33 @@
+name: Dependency Review
+
+# Diffs the dependencies a PR introduces against GitHub's advisory and
+# license data. Complements the `deny` job in ci.yml, which checks the whole
+# graph on every push/PR against deny.toml; this checks only what a PR
+# changes, using GitHub's own dependency-graph view.
+on:
+  pull_request:
+    paths-ignore:
+      - "*.md"
+
+permissions: {}
+
+jobs:
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: low
+          fail-on-scopes: runtime, development
+          # Same allow-list as deny.toml's [licenses], for consistency.
+          allow-licenses: MIT, Apache-2.0, Unicode-3.0
