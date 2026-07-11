@@ -39,6 +39,17 @@ fn invalid_venv_check_interval_fails_startup() {
 }
 
 #[test]
+fn invalid_init_handshake_timeout_fails_startup() {
+    let mut cmd = Command::cargo_bin("typemux-cc").unwrap();
+    cmd.env("TYPEMUX_CC_INIT_HANDSHAKE_TIMEOUT", "soon");
+
+    cmd.assert().failure().stderr(
+        predicate::str::contains("TYPEMUX_CC_INIT_HANDSHAKE_TIMEOUT")
+            .and(predicate::str::contains("soon")),
+    );
+}
+
+#[test]
 fn doctor_reports_invalid_env_value_distinctly() {
     let mut cmd = Command::cargo_bin("typemux-cc").unwrap();
     cmd.arg("--doctor").env("TYPEMUX_CC_WARMUP_TIMEOUT", "abc");

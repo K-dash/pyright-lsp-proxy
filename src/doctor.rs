@@ -262,6 +262,13 @@ pub async fn collect_doctor_report(
         config_report,
     );
 
+    let init_handshake_timeout_item = timeout_env_item(
+        "init_handshake_timeout",
+        "TYPEMUX_CC_INIT_HANDSHAKE_TIMEOUT",
+        backend_pool::init_handshake_timeout(),
+        config_report,
+    );
+
     let log_file_value: String = matches
         .get_one::<PathBuf>("log_file")
         .map_or_else(|| "<not set>".to_string(), |p| p.display().to_string());
@@ -286,6 +293,7 @@ pub async fn collect_doctor_report(
             warmup_timeout_item,
             fanout_timeout_item,
             venv_check_interval_item,
+            init_handshake_timeout_item,
             log_file_item,
         ],
     };

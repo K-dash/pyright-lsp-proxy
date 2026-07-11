@@ -1,5 +1,5 @@
-use crate::backend::{shutdown_fire_and_forget, BackendParts};
-use crate::error::BackendError;
+use crate::backend::shutdown_fire_and_forget;
+use crate::error::{BackendError, ProxyError};
 use crate::framing::{LspFrameReader, LspFrameWriter};
 use crate::message::{RpcId, RpcMessage};
 use crate::venv::VenvToken;
@@ -79,11 +79,29 @@ pub fn venv_check_interval() -> Duration {
         .map_or(DEFAULT_VENV_CHECK_INTERVAL, Duration::from_secs)
 }
 
-/// Env vars validated by `validate_env_config`, backing the three accessors above.
-const TIMEOUT_ENV_VARS: [&str; 3] = [
+/// Default backend initialize handshake timeout; overridable via
+/// `TYPEMUX_CC_INIT_HANDSHAKE_TIMEOUT` env var.
+const DEFAULT_INIT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Returns the timeout for the spawn → `initialize` handshake performed by a
+/// backend-creation task. Runs off the event loop (see `CreatingEntry`), so a
+/// slow/wedged backend only stalls its own venv, not the whole proxy.
+///
+/// See `warmup_timeout`'s doc comment: reachable only with an unset or
+/// already-validated value on the normal startup path.
+pub fn init_handshake_timeout() -> Duration {
+    std::env::var("TYPEMUX_CC_INIT_HANDSHAKE_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(DEFAULT_INIT_HANDSHAKE_TIMEOUT, Duration::from_secs)
+}
+
+/// Env vars validated by `validate_env_config`, backing the four accessors above.
+const TIMEOUT_ENV_VARS: [&str; 4] = [
     "TYPEMUX_CC_WARMUP_TIMEOUT",
     "TYPEMUX_CC_FANOUT_TIMEOUT",
     "TYPEMUX_CC_VENV_CHECK_INTERVAL",
+    "TYPEMUX_CC_INIT_HANDSHAKE_TIMEOUT",
 ];
 
 /// Validates the timeout/interval env vars above at startup, before the event
@@ -136,25 +154,34 @@ pub struct BackendInstance {
 }
 
 impl BackendInstance {
-    /// Create a `BackendInstance` from a split backend, spawning the reader task
-    /// and computing the warmup state. Does NOT insert into the pool.
+    /// Assemble a `BackendInstance` from an already-split backend and an
+    /// already-spawned reader task, computing the warmup state. Does NOT
+    /// insert into the pool.
+    ///
+    /// The reader task is spawned by the caller (via `spawn_reader_task`)
+    /// BEFORE any document restoration is written to `writer` — this is the
+    /// #93 fix: draining starts as soon as the backend is split, so a
+    /// restoration-triggered diagnostics burst can't fill the backend's
+    /// stdout pipe and deadlock the write loop.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
-        parts: BackendParts,
+        writer: LspFrameWriter<ChildStdin>,
+        child: Child,
+        next_id: u64,
+        reader_task: JoinHandle<()>,
         venv_path: PathBuf,
         session: u64,
-        msg_sender: mpsc::Sender<BackendMessage>,
         venv_token: Option<VenvToken>,
     ) -> Self {
-        let reader_task = spawn_reader_task(parts.reader, msg_sender, venv_path.clone(), session);
         let timeout = warmup_timeout();
         Self {
-            writer: parts.writer,
-            child: parts.child,
+            writer,
+            child,
             venv_path,
             session,
             last_used: Instant::now(),
             reader_task,
-            next_id: parts.next_id,
+            next_id,
             warmup_state: if timeout.is_zero() {
                 WarmupState::Ready
             } else {
@@ -227,11 +254,84 @@ impl BackendInstance {
     }
 }
 
+/// Maximum number of messages queued per venv while its backend is
+/// `Creating` (spawn + handshake + restoration, running off the event loop —
+/// see `start_backend_creation`). A separate constant from
+/// `MAX_WARMUP_QUEUE_LEN`: the two queues protect different states (no
+/// backend yet vs. a Ready-but-indexing backend) and are drained by
+/// different mechanisms.
+pub const MAX_CREATING_QUEUE_LEN: usize = 64;
+
+/// A backend currently being created (spawn + handshake + restoration
+/// running in a `tokio::spawn`ed task — see ARCHITECTURE.md's Creating-state
+/// section). Tracked in `BackendPool::creating`, a map separate from
+/// `backends`: LRU/TTL/staleness/warmup logic applies only to `Ready`
+/// backends.
+pub struct CreatingEntry {
+    /// Allocated up front (before the task spawns) via `next_session_id`,
+    /// and carried into the `BackendInstance` on success — this keeps the
+    /// stale-message-discard invariant intact across the Creating → Ready
+    /// transition, and lets `$/cancelRequest` find queued requests via the
+    /// same `pending_requests` lookup used for Ready backends' warmup queue.
+    pub session: u64,
+    /// Messages that arrived for this venv while it was Creating, in
+    /// arrival order. Moved to `ProxyState::replay_queue` by the
+    /// `creation_rx` completion handler on success, or answered/dropped on
+    /// failure — never delivered by a batch loop (see ARCHITECTURE.md).
+    pub queued: Vec<RpcMessage>,
+}
+
+impl CreatingEntry {
+    pub fn new(session: u64) -> Self {
+        Self {
+            session,
+            queued: Vec::new(),
+        }
+    }
+
+    /// Queue a message, unless the queue is already at
+    /// `MAX_CREATING_QUEUE_LEN`. Returns `false` if rejected for capacity, in
+    /// which case the caller must respond with an error (requests) or send a
+    /// dedup'd `window/showMessage` warning (notifications) instead.
+    pub fn try_queue(&mut self, msg: RpcMessage) -> bool {
+        if self.queued.len() >= MAX_CREATING_QUEUE_LEN {
+            return false;
+        }
+        self.queued.push(msg);
+        true
+    }
+
+    /// Remove a queued request by its JSON-RPC id (for $/cancelRequest handling).
+    /// Returns the removed message if found.
+    pub fn cancel_queued_request(&mut self, id: &RpcId) -> Option<RpcMessage> {
+        if let Some(pos) = self
+            .queued
+            .iter()
+            .position(|msg| msg.id.as_ref() == Some(id))
+        {
+            Some(self.queued.remove(pos))
+        } else {
+            None
+        }
+    }
+}
+
+/// Outcome of a backend-creation task, sent back to the main loop over
+/// `BackendPool::creation_tx` so only the single-threaded event loop ever
+/// touches `BackendPool::backends` / `BackendPool::creating`.
+pub struct CreationOutcome {
+    pub venv_path: PathBuf,
+    pub result: Result<BackendInstance, ProxyError>,
+}
+
 /// Pool of backend processes keyed by venv path
 pub struct BackendPool {
     backends: HashMap<PathBuf, BackendInstance>,
+    creating: HashMap<PathBuf, CreatingEntry>,
     pub backend_msg_tx: mpsc::Sender<BackendMessage>,
     pub backend_msg_rx: mpsc::Receiver<BackendMessage>,
+    creation_tx: mpsc::Sender<CreationOutcome>,
+    pub creation_rx: mpsc::Receiver<CreationOutcome>,
     max_backends: usize,
     backend_ttl: Option<Duration>,
     next_session: u64,
@@ -240,10 +340,17 @@ pub struct BackendPool {
 impl BackendPool {
     pub fn new(max_backends: usize, backend_ttl: Option<Duration>) -> Self {
         let (tx, rx) = mpsc::channel(1024);
+        // Bounded by `max_backends`: `is_full()` counts `backends.len() +
+        // creating.len()`, so at most `max_backends` creation tasks can be
+        // outstanding at once, each sending at most one outcome.
+        let (creation_tx, creation_rx) = mpsc::channel(max_backends.max(1));
         Self {
             backends: HashMap::new(),
+            creating: HashMap::new(),
             backend_msg_tx: tx,
             backend_msg_rx: rx,
+            creation_tx,
+            creation_rx,
             max_backends,
             backend_ttl,
             next_session: 0,
@@ -275,6 +382,39 @@ impl BackendPool {
         self.backends.remove(venv_path)
     }
 
+    /// Check if a venv currently has a backend being created.
+    pub fn creating_contains(&self, venv_path: &PathBuf) -> bool {
+        self.creating.contains_key(venv_path)
+    }
+
+    /// Get the session of a venv's in-flight creation, if any. Used to
+    /// recognize messages from a backend that's already split and reader-
+    /// draining but not yet `Ready` (see `dispatch_creating_backend_message`).
+    pub fn creating_session(&self, venv_path: &PathBuf) -> Option<u64> {
+        self.creating.get(venv_path).map(|entry| entry.session)
+    }
+
+    /// Get mutable reference to a Creating entry (for queueing/cancelling).
+    pub fn creating_get_mut(&mut self, venv_path: &PathBuf) -> Option<&mut CreatingEntry> {
+        self.creating.get_mut(venv_path)
+    }
+
+    /// Insert a new Creating entry.
+    pub fn creating_insert(&mut self, venv_path: PathBuf, entry: CreatingEntry) {
+        self.creating.insert(venv_path, entry);
+    }
+
+    /// Remove a Creating entry (only the `creation_rx` completion handler
+    /// should call this — see ARCHITECTURE.md's Creating-state section).
+    pub fn creating_remove(&mut self, venv_path: &PathBuf) -> Option<CreatingEntry> {
+        self.creating.remove(venv_path)
+    }
+
+    /// Get a clone of the sender creation tasks use to report their outcome.
+    pub fn creation_sender(&self) -> mpsc::Sender<CreationOutcome> {
+        self.creation_tx.clone()
+    }
+
     /// Find the LRU (least recently used) venv path.
     /// Prefers backends with no pending requests (caller provides the count).
     /// Returns None if pool is empty.
@@ -304,9 +444,10 @@ impl BackendPool {
         self.next_session
     }
 
-    /// Check if pool is at capacity
+    /// Check if pool is at capacity. Counts `creating` alongside `backends`:
+    /// a creation task holds a real process even before it's Ready.
     pub fn is_full(&self) -> bool {
-        self.backends.len() >= self.max_backends
+        self.backends.len() + self.creating.len() >= self.max_backends
     }
 
     /// Number of backends in the pool

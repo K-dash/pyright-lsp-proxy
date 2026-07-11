@@ -433,6 +433,39 @@ impl ProxyUnderTest {
         }
     }
 
+    /// Wait for a response matching `id`, discarding any other messages
+    /// (notifications, other responses) observed in the meantime. For
+    /// requests sent via `send_request` whose response may not be the very
+    /// next message (e.g. it's raced against another venv's unrelated
+    /// traffic). Panics on timeout.
+    #[allow(dead_code)] // Used by some but not all integration test binaries.
+    pub async fn wait_for_response(&mut self, id: i64, timeout_ms: u64) -> RpcMessage {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "wait_for_response: timed out after {timeout_ms}ms waiting for id {id}"
+            );
+            match tokio::time::timeout(remaining, self.reader.read_message()).await {
+                Ok(Ok(msg)) if msg.is_response() && msg.id == Some(RpcId::Number(id)) => {
+                    return msg;
+                }
+                Ok(Ok(_)) => {} // Not the response we're waiting for.
+                Ok(Err(e)) => {
+                    let stderr = self.dump_stderr().await;
+                    panic!("wait_for_response: read error: {e}\n--- stderr ---\n{stderr}");
+                }
+                Err(_) => {
+                    let stderr = self.dump_stderr().await;
+                    panic!(
+                        "wait_for_response: timed out after {timeout_ms}ms waiting for id {id}\n--- stderr ---\n{stderr}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Collect any messages that arrive within `wait_ms`, without panicking
     /// if none arrive before the deadline. Used to give an async side effect
     /// (e.g. backend-crash cleanup notifications) a bounded window to

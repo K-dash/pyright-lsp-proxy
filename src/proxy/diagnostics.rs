@@ -1,3 +1,4 @@
+use crate::backend_pool::MAX_CREATING_QUEUE_LEN;
 use crate::error::ProxyError;
 use crate::framing::LspFrameWriter;
 use crate::message::RpcMessage;
@@ -107,6 +108,43 @@ impl super::LspProxy {
             tracing::warn!(
                 error = ?e,
                 "Failed to send backend error notification to client"
+            );
+        }
+    }
+
+    /// Send a dedup'd `window/showMessage` warning when a Creating venv's
+    /// queue overflows and a notification (no response to send an error for)
+    /// was dropped instead of queued. Shares `should_notify_backend_failure`'s
+    /// per-venv dedup TTL and map with backend-creation-failure notifications
+    /// — both report a problem with the same venv, so sharing the dedup
+    /// budget avoids doubling up on `window/showMessage` spam.
+    pub(crate) async fn notify_creating_queue_overflow(
+        &mut self,
+        venv_path: &Path,
+        client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
+    ) {
+        if !self
+            .state
+            .should_notify_backend_failure(venv_path, Instant::now())
+        {
+            return;
+        }
+
+        let msg = RpcMessage::notification(
+            "window/showMessage",
+            Some(serde_json::json!({
+                "type": 2,
+                "message": format!(
+                    "typemux-cc: {} is still starting and its request queue is full ({MAX_CREATING_QUEUE_LEN} pending); a notification was dropped.",
+                    venv_path.display()
+                )
+            })),
+        );
+
+        if let Err(e) = client_writer.write_message(&msg).await {
+            tracing::warn!(
+                error = ?e,
+                "Failed to send creating-queue-overflow warning to client"
             );
         }
     }

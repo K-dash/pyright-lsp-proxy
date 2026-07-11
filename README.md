@@ -214,6 +214,7 @@ Settings priority: **CLI flag > environment variable > config file > default**
 | `TYPEMUX_CC_BACKEND_TTL` | Backend TTL in seconds (0 = disabled) | `1800` |
 | `TYPEMUX_CC_FANOUT_TIMEOUT` | Fan-out timeout in seconds for `workspace/symbol` (0 = no timeout) | `5` |
 | `TYPEMUX_CC_VENV_CHECK_INTERVAL` | Interval in seconds between venv identity checks (0 = disable venv identity tracking) | `5` |
+| `TYPEMUX_CC_INIT_HANDSHAKE_TIMEOUT` | Backend spawn → `initialize` handshake timeout in seconds | `10` |
 | `RUST_LOG` | Log level | `typemux_cc=debug` |
 
 An invalid value for a numeric variable above (e.g. `TYPEMUX_CC_FANOUT_TIMEOUT=5s`) fails startup with an explicit error instead of silently falling back to the default.

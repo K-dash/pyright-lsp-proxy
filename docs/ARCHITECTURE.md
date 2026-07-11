@@ -108,6 +108,43 @@ pub struct PendingRequest {
 }
 ```
 
+### Creating State
+
+Backend creation (process spawn → `initialize` handshake → document restoration) never runs inline on the event loop. Each creation runs in its own `tokio::spawn`ed task, reported back via a dedicated `creation_rx` channel — the same "reader/writer/handler as independent tasks" shape session tracking already uses for a running backend, applied to the window before one exists.
+
+```rust
+pub struct CreatingEntry {
+    pub session: u64,            // allocated up front, carried into the Ready BackendInstance
+    pub queued: Vec<RpcMessage>, // messages that arrived while this venv was Creating
+}
+```
+
+`BackendPool` tracks `creating: HashMap<PathBuf, CreatingEntry>` as a map **separate** from `backends`: LRU/TTL/staleness/warmup logic applies only to `Ready` backends, so folding both states into one map would force every one of those call sites to branch on state.
+
+**Why restoration has to live inside the spawned task, not just after a `into_split()` done inline.** Splitting the backend and starting its reader task before writing restored documents fixes the narrow case (a reader now exists to drain diagnostics). It does not fix the general case: while a `select!` arm's handler is `.await`ing inline, the other arms — including the one draining `backend_msg_rx` (capacity 1024) — are not polled. A restoration burst past that capacity parks the reader task on its channel send, the backend's own stdout pipe backs up behind it, the backend blocks writing and stops reading its stdin, and if that same arm still has more to write, the whole proxy deadlocks. True deadlock-freedom requires the reader task, the creation task, and the main loop to be three independent tokio tasks, so the main loop keeps draining `backend_msg_rx` no matter what the creation task's writer is doing. Spawning the whole creation (including restoration) as its own task is what buys that independence.
+
+**Queueing and replay.** A message that targets a `Creating` venv is appended to that entry's `queued` (capped at `MAX_CREATING_QUEUE_LEN = 64`, its own constant independent of the warmup queue's). `ensure_backend_in_pool` returns a `PoolLookup`:
+
+```rust
+enum PoolLookup {
+    Ready(PathBuf),          // forward directly
+    CreatingStarted(PathBuf),   // this call's own snapshot already covers a same-tick didOpen
+    CreatingInFlight(PathBuf),  // a creation was already running; queue this message
+    NotFound,
+}
+```
+
+The `Started`/`InFlight` distinction only matters for `didOpen`: the restoration snapshot is a clone of `open_documents` taken synchronously when the creation task is spawned, so a `didOpen` that triggered the creation itself is already in that snapshot (no further action), while one that lands mid-handshake is not and must be queued. `didChange` and requests are always queued in both `Creating` variants.
+
+When the creation task finishes, the `creation_rx` select! arm (the only code path allowed to remove a `Creating` entry) handles the outcome:
+
+- **Success**: insert the new `BackendInstance` into `backends`, then move `queued` into a global `ProxyState::replay_queue: VecDeque<RpcMessage>` — a plain `VecDeque::extend`, no backend I/O. A dedicated select! arm re-dispatches exactly **one** replayed message per loop iteration (never a batch loop — a burst of replayed `didOpen`s could itself exceed `backend_msg_rx`'s capacity), through the same dispatch path as an ordinary client message. `biased;` on the main `select!` places the `backend_msg_rx` arm ahead of the replay arm, so real backend traffic always drains first.
+- **Failure**: every queued *request* gets an immediate JSON-RPC error response; queued notifications are dropped with one dedup'd `window/showMessage` (issue #26's pattern) — contained per #92, never a process exit.
+
+**Pool capacity.** `is_full()` counts `backends.len() + creating.len()`: a creation task holds a real process even before it's `Ready`. If the pool is full and no `Ready` backend is evictable (every slot is `Creating`), backend creation is rejected outright with `ProxyError::PoolBusy` — surfaced as an immediate JSON-RPC error, no implicit waiting.
+
+**Known v1 gaps** (accepted, not fixed): a `$/progress end` for an instance not yet in `backends` is a no-op — the warmup state update is missed but converges via the warmup fail-open timeout; `didClose` for a `Creating` venv stays a no-op (not queued), narrowing an existing open-then-close race rather than closing it; fan-out (`workspace/symbol`) only targets `pool.backends_keys()`, so a `Creating` venv is silently excluded — unchanged, existing best-effort semantics.
+
 ## Backend-to-Client Request Proxying
 
 LSP backends can send requests to the client (e.g., `window/workDoneProgress/create`). With multiple backends, their request IDs can collide.
@@ -245,8 +282,8 @@ disabled).
 | Observation | Behavior |
 |-------------|----------|
 | Token unchanged | Serve as usual |
-| Token mismatch (venv replaced) | Evict old backend (cancel pending, clear diagnostics, shutdown), notify client via `window/showMessage`, respawn with the new environment — exactly once per change |
-| Token mismatch, respawn fails (e.g. broken interpreter mid-`uv sync`) | Contained, never fatal: notify the client via `window/showMessage`, keep serving other venvs; the next request for this venv retries backend creation via the pool-miss path |
+| Token mismatch (venv replaced) | Evict old backend (cancel pending, clear diagnostics, shutdown), notify client via `window/showMessage`, start creating a new one (`Creating`, off the event loop — see Creating State) — exactly once per change |
+| Token mismatch, creation fails to even start (e.g. pool busy) | Contained, never fatal: notify the client via `window/showMessage`, keep serving other venvs; the next request for this venv retries backend creation via the pool-miss path |
 | `pyvenv.cfg` missing < grace (2 × interval) | Keep serving the old backend (transient `uv sync` window) |
 | `pyvenv.cfg` missing ≥ grace | Evict without respawn; reset affected documents' cached venv so the next request re-resolves it — usually the strict-mode ".venv not found" error |
 
@@ -585,16 +622,20 @@ make ci
 
 ### Event Loop
 
-The main event loop in `proxy/mod.rs` uses `tokio::select!` with 5 arms:
+The main event loop in `proxy/mod.rs` uses `tokio::select!`, `biased;`, with 7 arms:
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                  tokio::select!                     │
-├─────────────────────────────────────────────────────┤
-│ 1. Client reader     │ stdin JSON-RPC messages      │
-│ 2. Backend reader    │ mpsc channel (all backends)  │
-│ 3. TTL timer         │ 60s interval sweep           │
-│ 4. Warmup timer      │ nearest warmup deadline      │
-│ 5. Fan-out timer     │ nearest fan-out deadline     │
-└─────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────┐
+│                  tokio::select! (biased)                  │
+├───────────────────────────────────────────────────────────┤
+│ 1. Client reader     │ stdin JSON-RPC messages             │
+│ 2. Backend reader    │ mpsc channel (all backends)         │
+│ 3. Creation outcome  │ mpsc channel (backend-creation tasks)│
+│ 4. TTL timer         │ 60s interval sweep                  │
+│ 5. Warmup timer      │ nearest warmup deadline             │
+│ 6. Fan-out timer     │ nearest fan-out deadline             │
+│ 7. Replay queue      │ one Creating-queued message/iteration│
+└───────────────────────────────────────────────────────────┘
 ```
+
+`biased;` polls arms top-to-bottom instead of in random order, stopping at the first ready one. This is load-bearing for arm 7 (see the Creating State section): arm 2 (backend reader) must always be checked — and, if ready, win — ahead of arm 7, so a replayed message can never be dispatched while there's real backend traffic waiting to be drained. All other arms keep their pre-existing relative order.

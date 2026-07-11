@@ -142,6 +142,13 @@ async fn did_save_routes_only_to_owning_backend() {
 
 /// E2E: a notification without `textDocument.uri` (e.g.
 /// `workspace/didChangeConfiguration`) still reaches every pooled backend.
+///
+/// Broadcast (unlike URI-bearing notifications, which queue-and-replay
+/// through a `Creating` backend) only ever targets `pool.backends_keys()`
+/// (Ready backends) — deliberately unchanged by the Creating-state work, see
+/// ARCHITECTURE.md. Each scenario's synchronizing `hover` step, answered
+/// right after `didOpen`, forces both backends to `Ready` before the
+/// broadcast fires below, so the test doesn't race backend creation.
 #[tokio::test]
 // `file_a`/`file_b` (and their `_uri` variants) are deliberately parallel names
 // for the two test fixtures this scenario exercises.
@@ -156,6 +163,10 @@ async fn non_uri_notification_still_broadcasts() {
             },
             { "expect": { "method": "initialized" }, "actions": [] },
             { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
+            {
+                "expect": { "method": "textDocument/hover" },
+                "actions": [{ "type": "respond", "body": { "contents": { "kind": "plaintext", "value": "sync hover a" } } }]
+            },
             { "expect": { "method": "workspace/didChangeConfiguration" }, "actions": [] },
             {
                 "expect": { "method": "textDocument/hover" },
@@ -173,6 +184,10 @@ async fn non_uri_notification_still_broadcasts() {
             },
             { "expect": { "method": "initialized" }, "actions": [] },
             { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
+            {
+                "expect": { "method": "textDocument/hover" },
+                "actions": [{ "type": "respond", "body": { "contents": { "kind": "plaintext", "value": "sync hover b" } } }]
+            },
             { "expect": { "method": "workspace/didChangeConfiguration" }, "actions": [] },
             {
                 "expect": { "method": "textDocument/hover" },
@@ -216,6 +231,37 @@ async fn non_uri_notification_still_broadcasts() {
     std::fs::write(&file_b, "b = 2\n").unwrap();
     let file_b_uri = support::path_to_uri(&file_b);
     proxy.did_open(&file_b_uri, "b = 2\n").await;
+
+    // Synchronizing round-trips: force both backends to `Ready` before the
+    // broadcast below (see the test's doc comment).
+    let sync_a = proxy
+        .request(
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": &file_a_uri },
+                "position": { "line": 0, "character": 0 }
+            }),
+        )
+        .await;
+    assert!(
+        sync_a.error.is_none(),
+        "sync hover(a) failed: {:?}",
+        sync_a.error
+    );
+    let sync_b = proxy
+        .request(
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": &file_b_uri },
+                "position": { "line": 0, "character": 0 }
+            }),
+        )
+        .await;
+    assert!(
+        sync_b.error.is_none(),
+        "sync hover(b) failed: {:?}",
+        sync_b.error
+    );
 
     // No `textDocument` field: must broadcast to every pooled backend.
     proxy

@@ -1,4 +1,4 @@
-use super::pool_management::StaleOutcome;
+use super::pool_management::{PoolLookup, StaleOutcome};
 use crate::error::ProxyError;
 use crate::framing::LspFrameWriter;
 use crate::message::RpcMessage;
@@ -93,15 +93,30 @@ impl super::LspProxy {
         };
 
         if !self.state.pool.contains(venv_path) {
-            // `Some`/`None` both just mean "handled, nothing left to forward here" but
-            // for distinct reasons, so keep them as separate documented arms.
+            // Ready/CreatingStarted/NotFound all just mean "handled, nothing
+            // left to forward here" but for distinct reasons, so keep them
+            // as separate documented arms.
             #[allow(clippy::match_same_arms)]
             match self
                 .ensure_backend_in_pool(&url, &file_path, client_writer)
                 .await
             {
-                Ok(Some(_)) => return Ok(()), // didOpen restored during backend creation
-                Ok(None) => return Ok(()),
+                // Unreachable here (we just checked `!contains`, and nothing
+                // else could have mutated the pool in between), kept for
+                // exhaustiveness.
+                Ok(PoolLookup::Ready(_)) => return Ok(()),
+                // This very call took the restoration snapshot, so this
+                // didOpen is already in it — no further queueing needed.
+                Ok(PoolLookup::CreatingStarted(_)) => return Ok(()),
+                // A creation for this venv was already running (started by
+                // an earlier didOpen/request) and its snapshot did NOT
+                // capture this document — queue it for replay.
+                Ok(PoolLookup::CreatingInFlight(_)) => {
+                    self.forward_or_queue_for_venv(venv_path, msg, client_writer)
+                        .await?;
+                    return Ok(());
+                }
+                Ok(PoolLookup::NotFound) => return Ok(()),
                 Err(e) => {
                     self.notify_backend_error(venv_path, &e, client_writer)
                         .await;
