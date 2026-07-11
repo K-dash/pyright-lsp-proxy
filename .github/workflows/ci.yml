@@ -111,7 +111,7 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
 
   msrv:
-    name: MSRV (Rust 1.88)
+    name: MSRV
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -122,13 +122,26 @@ jobs:
         with:
           persist-credentials: false
 
+      # Cargo.toml's `rust-version` is the only source of truth for the MSRV.
+      # Reading it here (instead of hardcoding the version in this workflow)
+      # means there is nothing for a dependency bot to update independently
+      # of that declaration — see renovate.json's packageRules entry that
+      # disables updates to this job's toolchain dependency for the same
+      # reason.
+      - name: Read MSRV
+        id: msrv
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          test -n "$msrv"
+          echo "version=$msrv" >> "$GITHUB_OUTPUT"
+
       # `master`, not `stable`: passing an explicit `toolchain` input
       # requires `master` per dtolnay/rust-toolchain's own docs (`stable`
       # only carries the "always latest stable" default this input overrides).
-      - name: Setup Rust 1.88
+      - name: Setup declared MSRV
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
         with:
-          toolchain: "1.88"
+          toolchain: ${{ steps.msrv.outputs.version }}
 
       # Guards the declared `rust-version` in Cargo.toml: without this, only
       # the latest stable toolchain (via the `ci` job) is ever exercised, so
