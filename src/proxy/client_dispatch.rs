@@ -444,11 +444,30 @@ impl super::LspProxy {
 
     /// Handle a generic client notification (not handled by specific handlers above).
     ///
-    /// Forwards to all backends in the pool.
+    /// If the notification carries `textDocument.uri`, it is routed to that
+    /// document's owning backend only (resolved via the same cache lookup as
+    /// `textDocument/didChange`). If no owning backend can be determined, the
+    /// notification is dropped rather than broadcast, to avoid delivering
+    /// document-scoped notifications to backends that never opened the
+    /// document. Notifications without a `textDocument.uri` (e.g.
+    /// `workspace/didChangeConfiguration`) are still broadcast to all
+    /// backends in the pool.
     pub(crate) async fn dispatch_client_notification(
         &mut self,
         msg: &RpcMessage,
     ) -> Result<(), ProxyError> {
+        if let Some(url) = Self::extract_text_document_uri(msg) {
+            let Some(venv_path) = self.venv_for_uri(&url) else {
+                tracing::warn!(
+                    method = ?msg.method_name(),
+                    uri = %url,
+                    "Dropping URI-bearing notification: no owning backend found"
+                );
+                return Ok(());
+            };
+            return self.forward_to_backend(&venv_path, msg).await;
+        }
+
         let venvs: Vec<PathBuf> = self.state.pool.backends_keys();
         for venv in &venvs {
             if let Some(inst) = self.state.pool.get_mut(venv) {

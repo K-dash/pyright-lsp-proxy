@@ -235,6 +235,13 @@ impl ProxyUnderTest {
         self.write(&msg).await;
     }
 
+    /// Send an arbitrary fire-and-forget notification.
+    #[allow(dead_code)] // Used by some but not all integration test binaries.
+    pub async fn notify(&mut self, method: &str, params: Value) {
+        let msg = RpcMessage::notification(method, Some(params));
+        self.write(&msg).await;
+    }
+
     /// Send a request without waiting for its response. Returns the assigned
     /// id, for matching against a later `read_next`.
     #[allow(dead_code)] // Used by some but not all integration test binaries.
@@ -385,6 +392,27 @@ impl ProxyUnderTest {
                         "wait_for_notification: timed out after {timeout_ms}ms waiting for {method:?}\n--- stderr ---\n{stderr}"
                     );
                 }
+            }
+        }
+    }
+
+    /// Collect any messages that arrive within `wait_ms`, without panicking
+    /// if none arrive before the deadline. Used to give an async side effect
+    /// (e.g. backend-crash cleanup notifications) a bounded window to
+    /// surface, so a test can assert on its absence.
+    #[allow(dead_code)] // Used by some but not all integration test binaries.
+    pub async fn drain_notifications(&mut self, wait_ms: u64) -> Vec<RpcMessage> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+        let mut collected = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return collected;
+            }
+            match tokio::time::timeout(remaining, self.reader.read_message()).await {
+                Ok(Ok(msg)) => collected.push(msg),
+                Ok(Err(e)) => panic!("drain_notifications: framing error: {e}"),
+                Err(_) => return collected,
             }
         }
     }
