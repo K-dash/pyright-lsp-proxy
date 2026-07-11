@@ -6,8 +6,6 @@ name: Dependency Review
 # changes, using GitHub's own dependency-graph view.
 on:
   pull_request:
-    paths-ignore:
-      - "*.md"
 
 permissions: {}
 
