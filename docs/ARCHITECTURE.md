@@ -286,8 +286,8 @@ Checks are debounced to once per `TYPEMUX_CC_VENV_CHECK_INTERVAL` seconds
 (default 5; `0` disables tracking; a non-integer value fails startup with an
 explicit error). Triggers: `ensure_backend_in_pool`
 (all venv-checked request methods), `didOpen`/`didChange` forwarding, and a
-60s background sweep (shared with the TTL timer, armed even when TTL is
-disabled).
+background sweep on the `TYPEMUX_CC_POOL_SWEEP_INTERVAL` tick (default 60s;
+shared with the TTL timer, armed even when TTL is disabled).
 
 | Observation | Behavior |
 |-------------|----------|
@@ -298,7 +298,8 @@ disabled).
 | `pyvenv.cfg` missing ≥ grace | Evict without respawn; reset affected documents' cached venv so the next request re-resolves it — usually the strict-mode ".venv not found" error |
 
 The background sweep evicts without respawning (the next request lazily
-respawns), so an idle stale backend is corrected within ~60s even if no
+respawns), so an idle stale backend is corrected within one sweep interval
+(default ~60s, configurable via `TYPEMUX_CC_POOL_SWEEP_INTERVAL`) even if no
 request ever targets it again.
 
 Staleness eviction reuses the standard eviction path, so the session-id
@@ -642,7 +643,7 @@ The main event loop in `proxy/mod.rs` uses `tokio::select!` with 7 arms, unbiase
 │ Client reader     │ mpsc channel (dedicated reader task)   │
 │ Backend reader    │ mpsc channel (all backends)            │
 │ Creation outcome  │ mpsc channel (backend-creation tasks)  │
-│ TTL timer         │ 60s interval sweep                     │
+│ TTL timer         │ sweep tick (default 60s, configurable) │
 │ Warmup timer      │ nearest warmup deadline                │
 │ Fan-out timer     │ nearest fan-out deadline                │
 │ Replay queue      │ one Creating-queued message/iteration  │

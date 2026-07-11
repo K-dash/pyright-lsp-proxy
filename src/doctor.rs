@@ -105,11 +105,16 @@ fn env_only_source(env_var: &str, config_report: &ConfigLoadReport) -> String {
 /// (see `main.rs`), so an invalid value never aborts here; instead this shows
 /// the raw value and marks it invalid rather than reporting the accessor's
 /// silent default fallback as if it were in effect.
+///
+/// `is_valid` covers value-level rules beyond parseability (e.g.
+/// `pool_sweep_interval`'s rejection of `0`); the other callers pass `|_|
+/// true` since parseability is their only constraint.
 fn timeout_env_item(
     name: &str,
     env_var: &str,
     effective: std::time::Duration,
     config_report: &ConfigLoadReport,
+    is_valid: impl Fn(u64) -> bool,
 ) -> ConfigItem {
     let raw = std::env::var(env_var);
     let source = env_only_source(env_var, config_report);
@@ -119,7 +124,7 @@ fn timeout_env_item(
             value: effective.as_secs().to_string(),
             source,
         },
-        Ok(raw) if raw.parse::<u64>().is_ok() => ConfigItem {
+        Ok(raw) if raw.parse::<u64>().is_ok_and(is_valid) => ConfigItem {
             name: name.to_string(),
             value: effective.as_secs().to_string(),
             source,
@@ -246,6 +251,7 @@ pub async fn collect_doctor_report(
         "TYPEMUX_CC_WARMUP_TIMEOUT",
         backend_pool::warmup_timeout(),
         config_report,
+        |_| true,
     );
 
     let fanout_timeout_item = timeout_env_item(
@@ -253,6 +259,7 @@ pub async fn collect_doctor_report(
         "TYPEMUX_CC_FANOUT_TIMEOUT",
         backend_pool::fanout_timeout(),
         config_report,
+        |_| true,
     );
 
     let venv_check_interval_item = timeout_env_item(
@@ -260,6 +267,7 @@ pub async fn collect_doctor_report(
         "TYPEMUX_CC_VENV_CHECK_INTERVAL",
         backend_pool::venv_check_interval(),
         config_report,
+        |_| true,
     );
 
     let init_handshake_timeout_item = timeout_env_item(
@@ -267,6 +275,17 @@ pub async fn collect_doctor_report(
         "TYPEMUX_CC_INIT_HANDSHAKE_TIMEOUT",
         backend_pool::init_handshake_timeout(),
         config_report,
+        |_| true,
+    );
+
+    // `0` is invalid for this one (see `validate_env_config`'s doc comment):
+    // it would silently disable both periodic jobs the sweep tick drives.
+    let pool_sweep_interval_item = timeout_env_item(
+        "pool_sweep_interval",
+        "TYPEMUX_CC_POOL_SWEEP_INTERVAL",
+        backend_pool::pool_sweep_interval(),
+        config_report,
+        |v| v > 0,
     );
 
     let log_file_value: String = matches
@@ -294,6 +313,7 @@ pub async fn collect_doctor_report(
             fanout_timeout_item,
             venv_check_interval_item,
             init_handshake_timeout_item,
+            pool_sweep_interval_item,
             log_file_item,
         ],
     };
