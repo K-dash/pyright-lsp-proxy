@@ -267,6 +267,22 @@ Two distinct caches can go stale, and they fail differently:
    identity tracking (below), a backend would keep serving after its `.venv`
    was replaced or deleted — the "silently lying LSP" failure mode.
 
+### Frozen Empty Capabilities (Important)
+
+The `capabilities: {}` response above is static and never updated: there is
+no `registerCapability` call anywhere in the codebase, so once `initialize`
+answers with an empty object, the client sees that same advertisement for
+the rest of the session — even after a `.venv` is created later and a real
+backend spawns via the pool-miss path. This is safe in practice: verified
+empirically with Claude Code 2.1.207 on 2026-07-12 that the client does not
+gate LSP requests on advertised capabilities. `textDocument/hover`,
+`textDocument/documentSymbol`, `textDocument/definition` (cross-file),
+`textDocument/references`, and `textDocument/publishDiagnostics` all
+worked immediately after mid-session venv discovery created the backend,
+with no re-advertisement and no client restart. The frozen `{}` response is
+therefore a deliberate trade-off, not a functional gap for the tested
+Claude Code version.
+
 ## Venv Identity Tracking
 
 ### Problem

@@ -58,6 +58,8 @@ npm install -g pyright
 - **🔄 Multi-project venv switching (monorepos)** — typemux-cc keeps a per-`.venv` backend pool and routes requests to the correct one. Switching between projects is instant.
 - **🔀 Multi-backend support** — Not locked into pyright. Choose between pyright, ty, or pyrefly — switch via a single env var.
 
+> **Frozen capabilities on cold start** — When no `.venv` exists at startup, `initialize` answers with empty capabilities and that advertisement stays frozen for the session — verified with Claude Code 2.1.207 that the client keeps sending LSP requests regardless, so nothing is gated (see [Frozen Empty Capabilities](docs/ARCHITECTURE.md#frozen-empty-capabilities-important)).
+
 > **Why LSP over text search?** In monorepos, grep returns false positives from same-named types across projects. LSP resolves references at the type-system level. See [real-world benchmarks](./docs/why-lsp.md).
 
 ## Supported Backends
