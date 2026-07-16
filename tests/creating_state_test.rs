@@ -49,8 +49,6 @@ async fn restoration_survives_large_diagnostics_burst_e2e() {
                 "actions": [{ "type": "respond", "body": { "capabilities": { "hoverProvider": true } } }]
             },
             { "expect": { "method": "initialized" }, "actions": [] },
-            // dispatch_initialized forwards a 2nd "initialized" to fallback backends
-            { "expect": { "method": "initialized" }, "actions": [] },
             { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
             { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
             {
@@ -1014,8 +1012,6 @@ async fn restoration_diagnostics_reach_client_during_creating_e2e() {
                 "expect": { "method": "initialize" },
                 "actions": [{ "type": "respond", "body": { "capabilities": { "hoverProvider": true } } }]
             },
-            { "expect": { "method": "initialized" }, "actions": [] },
-            // dispatch_initialized forwards a 2nd "initialized" to fallback backends
             { "expect": { "method": "initialized" }, "actions": [] },
             { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
             {

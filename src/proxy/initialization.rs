@@ -201,23 +201,6 @@ impl super::LspProxy {
             .and_then(|msg| msg.params.clone())
             .ok_or_else(|| ProxyError::InvalidMessage("No initialize params cached".to_string()))
     }
-
-    /// Complete backend initialization: forward initialize, receive response, send initialized.
-    /// Returns the initialize response to forward to the client.
-    ///
-    /// Used only by the very first (pre-spawned fallback) backend at startup,
-    /// before the event loop is even running — no other venv can be waiting
-    /// on the loop yet, so this stays inline rather than moving into a
-    /// spawned task like `start_backend_creation`.
-    pub(crate) async fn complete_backend_initialization(
-        &self,
-        backend: &mut LspBackend,
-        venv: &Path,
-        _client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
-    ) -> Result<RpcMessage, ProxyError> {
-        let init_params = self.cached_init_params()?;
-        perform_initialize_handshake(backend, init_params, venv).await
-    }
 }
 
 /// Write restored documents (already filtered to this venv by the caller) to

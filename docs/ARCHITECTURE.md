@@ -247,7 +247,7 @@ Strict Venv Mode implements this philosophy.
 | File opened, `.venv` found, backend NOT in pool | Spawn new backend, add to pool |
 | File opened, `.venv` NOT found | Return error (`-32603: .venv not found`) |
 | Pool full, new backend needed | Evict LRU backend, then spawn new one |
-| `initialize` (no fallback .venv) | Return success with `capabilities: {}` (prevents Claude Code error state) |
+| `initialize` (every startup) | Return success with `capabilities: {}` immediately; no backend is spawned yet (#140) |
 | URI-bearing request, cache miss | Attempt full venv resolution via `ensure_backend_in_pool` |
 | URI-bearing request, non-file URI | Return error (cannot resolve venv for non-file scheme) |
 | URI-less request (e.g., `workspace/symbol`), single backend | Forward to sole backend (no cross-contamination risk) |
@@ -269,13 +269,25 @@ Two distinct caches can go stale, and they fail differently:
 
 ### Frozen Empty Capabilities (Important)
 
-The `capabilities: {}` response above is static and never updated: there is
-no `registerCapability` call anywhere in the codebase, so once `initialize`
+`initialize` always answers immediately with `capabilities: {}`, for every
+startup — not only when no fallback `.venv` is found. Until #140, a `.venv`
+present at startup took a different path: the proxy pre-spawned a backend
+and forwarded the client's `initialize` to it synchronously before
+responding. That path reproduced a permanent wedge in Claude Code 2.1.207's
+LSP client (observed 3/3, still reproducible on 2.1.211): the client never sent `initialized` after
+receiving the (141–550ms-delayed) response. The venv-less instant-`{}` path
+survived every reproduction attempt (2/2), so #140 unified every startup on
+it: the first backend, like every other, is now created lazily by the
+Creating machinery on the first venv-resolving client message (`didOpen` or
+a URI-bearing request), never synchronously inside `initialize`.
+
+The `capabilities: {}` response is static and never updated: there is no
+`registerCapability` call anywhere in the codebase, so once `initialize`
 answers with an empty object, the client sees that same advertisement for
-the rest of the session — even after a `.venv` is created later and a real
-backend spawns via the pool-miss path. This is safe in practice: verified
-empirically with Claude Code 2.1.207 on 2026-07-12 that the client does not
-gate LSP requests on advertised capabilities. `textDocument/hover`,
+the rest of the session — including after the lazily-created backend
+becomes `Ready`. This is safe in practice: verified empirically with Claude
+Code 2.1.207 on 2026-07-12 (#105) that the client does not gate LSP requests
+on advertised capabilities. `textDocument/hover`,
 `textDocument/documentSymbol`, `textDocument/definition` (cross-file),
 `textDocument/references`, and `textDocument/publishDiagnostics` all
 worked immediately after mid-session venv discovery created the backend,
@@ -374,7 +386,7 @@ If a backend crashes or is evicted during a fan-out, its sub-request is removed 
 
 ## Operation Sequences
 
-### Sequence 1: Startup with Fallback Venv
+### Sequence 1: Startup and Lazy Backend Creation
 
 ```mermaid
 sequenceDiagram
@@ -382,20 +394,20 @@ sequenceDiagram
     participant Proxy as typemux-cc
     participant Backend as LSP Backend
 
-    Note over Proxy: Pre-spawn: fallback .venv found
-
-    Proxy->>Backend: spawn(VIRTUAL_ENV=fallback/.venv)
-
     Client->>Proxy: initialize request
-    Proxy->>Backend: initialize request
-    Backend->>Proxy: initialize response
-    Proxy->>Client: initialize response
-    Proxy->>Backend: initialized notification
+    Note over Proxy: No backend spawned yet (#140)
+    Proxy->>Client: initialize response (capabilities: {})
 
-    Note over Proxy: Backend in pool (session 1, Warming)
+    Client->>Proxy: initialized notification
 
     Client->>Proxy: didOpen(project-a/main.py)
-    Proxy->>Backend: didOpen (forwarded)
+    Note over Proxy: .venv resolved, not in pool<br/>→ start Creating
+    Proxy->>Backend: spawn(VIRTUAL_ENV=project-a/.venv)
+    Proxy->>Backend: initialize request
+    Backend->>Proxy: initialize response
+    Proxy->>Backend: initialized notification
+    Note over Proxy: Backend in pool (session 1, Warming)
+    Proxy->>Backend: didOpen (restored from snapshot)
 
     Client->>Proxy: textDocument/definition
     Note over Proxy: Index-dependent + Warming<br/>→ Queued
@@ -484,13 +496,15 @@ graph TD
 3. **Boundary**: git toplevel (git repository root obtained at startup)
 4. **Direction**: Traverse parent directories upward
 
-### Fallback `.venv` Search Order
+### Startup `.venv` Detection Order
 
-Determines initial virtual environment at startup:
+Diagnostics only (#140): this search only produces the startup log line and
+the `--doctor` "Startup .venv" field. It never spawns anything and is never
+the lazy-creation target — that's resolved per message by `find_venv`.
 
 1. `.venv` at git toplevel
 2. `.venv` at cwd (current working directory)
-3. Start without venv if neither exists
+3. Log "no `.venv` detected" if neither exists
 
 ## Document State Cache
 
@@ -535,7 +549,7 @@ Documents under project-a/ are skipped. Skipped documents get empty diagnostics 
 | LRU eviction | Evict least recently used backend when pool is full |
 | TTL-based eviction | Auto-evict idle backends (default: 30 min) |
 | `.venv` auto-detection | Detect by traversing parent directories |
-| Fallback `.venv` | Pre-spawn backend with initial venv at startup |
+| Lazy backend creation | First backend, like every other, is created on the first venv-resolving message (#140) |
 | Warmup readiness | Queue index-dependent requests until backend index is built |
 | Document state caching | Remember open file contents for restoration |
 | Selective restoration | Restore only documents under the target venv |

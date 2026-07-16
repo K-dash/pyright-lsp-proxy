@@ -58,7 +58,7 @@ npm install -g pyright
 - **🔄 Multi-project venv switching (monorepos)** — typemux-cc keeps a per-`.venv` backend pool and routes requests to the correct one. Switching between projects is instant.
 - **🔀 Multi-backend support** — Not locked into pyright. Choose between pyright, ty, or pyrefly — switch via a single env var.
 
-> **Frozen capabilities on cold start** — When no `.venv` exists at startup, `initialize` answers with empty capabilities and that advertisement stays frozen for the session — verified with Claude Code 2.1.207 that the client keeps sending LSP requests regardless, so nothing is gated (see [Frozen Empty Capabilities](docs/ARCHITECTURE.md#frozen-empty-capabilities-important)).
+> **Frozen capabilities on cold start** — `initialize` always answers immediately with empty capabilities, on every startup, regardless of whether a `.venv` exists yet — the first backend, like every other, is created lazily on the first venv-resolving message ([#140](https://github.com/K-dash/typemux-cc/issues/140): a synchronous pre-spawned-backend handshake here used to permanently wedge Claude Code 2.1.207's LSP client, still reproducible on 2.1.211). That advertisement stays frozen for the session — verified with Claude Code 2.1.207 that the client keeps sending LSP requests regardless, so nothing is gated (see [Frozen Empty Capabilities](docs/ARCHITECTURE.md#frozen-empty-capabilities-important)).
 
 > **Why LSP over text search?** In monorepos, grep returns false positives from same-named types across projects. LSP resolves references at the type-system level. See [real-world benchmarks](./docs/why-lsp.md).
 
@@ -264,7 +264,7 @@ my-monorepo/
 
 | Claude Code Action | Proxy Behavior |
 |--------------------|----------------|
-| 1. Session starts | Search for fallback .venv (start without venv if not found) |
+| 1. Session starts | `initialize` answers instantly with empty capabilities; no backend spawned yet |
 | 2. Opens `project-a/src/main.py` | Detect `project-a/.venv` → spawn backend (session 1), add to pool |
 | 3. Opens `project-b/src/main.py` | Detect `project-b/.venv` → spawn backend (session 2), add to pool |
 | 4. Returns to `project-a/src/main.py` | `project-a/.venv` already in pool → route to session 1 (no restart) |

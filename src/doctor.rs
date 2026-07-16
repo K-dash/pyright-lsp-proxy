@@ -470,14 +470,17 @@ pub fn render_human(report: &DoctorReport) -> String {
             .as_deref()
             .unwrap_or("<not in a git repo>")
     );
+    // Detection only (#140): never used to spawn — backends are created
+    // lazily, resolved per message by `find_venv`.
     let _ = writeln!(
         out,
-        "  Fallback venv     {}",
-        report
-            .environment
-            .fallback_venv
-            .as_deref()
-            .unwrap_or("<not found>")
+        "  Startup .venv     {}",
+        report.environment.fallback_venv.as_deref().map_or_else(
+            || "<not found>".to_string(),
+            |v| format!(
+                "{v} (detection only; backends spawn lazily on the first venv-resolving message)"
+            )
+        )
     );
 
     out.push_str("\nSystem:\n");

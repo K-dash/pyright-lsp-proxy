@@ -33,7 +33,7 @@ Environment:
     Path            /usr/local/bin/pyright-langserver
     Version         pyright 1.1.350
   Git toplevel      /Users/foo/project
-  Fallback venv     /Users/foo/project/.venv
+  Startup .venv     /Users/foo/project/.venv (detection only; backends spawn lazily on the first venv-resolving message)
 
 System:
   OS                macos (Darwin 24.0.0)

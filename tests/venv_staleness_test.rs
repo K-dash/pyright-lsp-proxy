@@ -20,8 +20,6 @@ async fn replaced_venv_triggers_single_backend_respawn() {
                 "actions": [{ "type": "respond", "body": { "capabilities": { "hoverProvider": true } } }]
             },
             { "expect": { "method": "initialized" }, "actions": [] },
-            // dispatch_initialized forwards a 2nd "initialized" to fallback backends
-            { "expect": { "method": "initialized" }, "actions": [] },
             { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
             {
                 "expect": { "method": "textDocument/hover" },
@@ -163,8 +161,6 @@ async fn failed_respawn_is_contained_and_recovers() {
                 "expect": { "method": "initialize" },
                 "actions": [{ "type": "respond", "body": { "capabilities": { "hoverProvider": true } } }]
             },
-            { "expect": { "method": "initialized" }, "actions": [] },
-            // dispatch_initialized forwards a 2nd "initialized" to fallback backends
             { "expect": { "method": "initialized" }, "actions": [] },
             { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
             {
@@ -320,7 +316,6 @@ async fn removed_venv_evicts_after_grace_and_errors() {
                 "expect": { "method": "initialize" },
                 "actions": [{ "type": "respond", "body": { "capabilities": { "hoverProvider": true } } }]
             },
-            { "expect": { "method": "initialized" }, "actions": [] },
             { "expect": { "method": "initialized" }, "actions": [] },
             { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
             {
