@@ -28,8 +28,6 @@ async fn idle_backend_evicted_after_ttl_expiry() {
                 "actions": [{ "type": "respond", "body": { "capabilities": { "hoverProvider": true } } }]
             },
             { "expect": { "method": "initialized" }, "actions": [] },
-            // dispatch_initialized forwards a 2nd "initialized" to fallback backends
-            { "expect": { "method": "initialized" }, "actions": [] },
             { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
             {
                 "expect": { "method": "textDocument/hover" },
@@ -191,8 +189,6 @@ async fn backend_with_pending_request_survives_ttl_sweep() {
                 "expect": { "method": "initialize" },
                 "actions": [{ "type": "respond", "body": { "capabilities": { "hoverProvider": true } } }]
             },
-            { "expect": { "method": "initialized" }, "actions": [] },
-            // dispatch_initialized forwards a 2nd "initialized" to fallback backends
             { "expect": { "method": "initialized" }, "actions": [] },
             { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
             {
@@ -358,8 +354,6 @@ async fn backend_awaiting_client_response_survives_ttl_sweep() {
                 "expect": { "method": "initialize" },
                 "actions": [{ "type": "respond", "body": { "capabilities": { "hoverProvider": true } } }]
             },
-            { "expect": { "method": "initialized" }, "actions": [] },
-            // dispatch_initialized forwards a 2nd "initialized" to fallback backends
             { "expect": { "method": "initialized" }, "actions": [] },
             { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
             {

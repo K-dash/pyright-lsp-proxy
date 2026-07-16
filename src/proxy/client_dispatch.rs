@@ -1,8 +1,6 @@
 use super::pool_management::PoolLookup;
-use crate::backend::LspBackend;
 use crate::backend_pool::{
-    shutdown_backend_instance, spawn_reader_task, BackendInstance, MAX_CREATING_QUEUE_LEN,
-    MAX_WARMUP_QUEUE_LEN,
+    shutdown_backend_instance, MAX_CREATING_QUEUE_LEN, MAX_WARMUP_QUEUE_LEN,
 };
 use crate::error::ProxyError;
 use crate::framing::LspFrameWriter;
@@ -42,69 +40,24 @@ pub(crate) enum NotificationDelivery {
 impl super::LspProxy {
     /// Handle client "initialize" request.
     ///
-    /// Caches the message, completes initialization with the pre-spawned
-    /// backend (if any), or returns a minimal capabilities response.
+    /// Caches the message for the first backend's eventual handshake, and
+    /// answers immediately with empty capabilities. No backend is spawned
+    /// here: the first one is created lazily by the Creating machinery, on
+    /// the first venv-resolving client message (`didOpen` or a URI-bearing
+    /// request) — the design behind every startup, not a degraded fallback
+    /// (see #140: a synchronous pre-spawned-backend handshake here
+    /// permanently wedges Claude Code 2.1.207's LSP client).
     pub(crate) async fn dispatch_initialize(
         &mut self,
         msg: &RpcMessage,
-        pending_initial_backend: &mut Option<(LspBackend, PathBuf)>,
         client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
     ) -> Result<(), ProxyError> {
         tracing::info!("Caching initialize message for backend initialization");
         self.state.client_initialize = Some(msg.clone());
 
-        // `backend` holds a child-process handle with a custom `Drop`, so its
-        // scope will change under Edition 2024. Deferred to the eventual edition
-        // migration rather than restructured here to satisfy the lint.
-        #[allow(if_let_rescope)]
-        if let Some((mut backend, venv)) = pending_initial_backend.take() {
-            // Forward initialize to the pre-spawned backend
-            match self
-                .complete_backend_initialization(&mut backend, &venv, client_writer)
-                .await
-            {
-                Ok(init_response) => {
-                    // Split and insert into pool. No restoration needed here:
-                    // this is the very first backend, spawned before the
-                    // event loop starts, so no `didOpen` could have arrived
-                    // yet — the reader task is started before insertion
-                    // regardless, for consistency with `run_backend_creation`.
-                    let session = self.state.pool.next_session_id();
-                    let venv_token = crate::venv::venv_token(&venv).await;
-                    let parts = backend.into_split();
-                    let tx = self.state.pool.msg_sender();
-                    let reader_task = spawn_reader_task(parts.reader, tx, venv.clone(), session);
-                    let instance = BackendInstance::from_parts(
-                        parts.writer,
-                        parts.child,
-                        parts.next_id,
-                        reader_task,
-                        venv.clone(),
-                        session,
-                        venv_token,
-                    );
-                    self.state.pool.insert(venv.clone(), instance);
-
-                    // Send initialize response to client
-                    client_writer.write_message(&init_response).await?;
-                    tracing::info!("Initial backend inserted into pool");
-                    self.warn_if_project_root_ignored(&venv, client_writer)
-                        .await;
-                }
-                Err(e) => {
-                    tracing::error!(error = ?e, "Failed to initialize fallback backend, returning minimal response");
-                    let init_response =
-                        RpcMessage::success_response(msg, serde_json::json!({"capabilities": {}}));
-                    client_writer.write_message(&init_response).await?;
-                }
-            }
-        } else {
-            // No fallback backend — return minimal capabilities
-            tracing::warn!("No fallback backend: returning minimal initialize response");
-            let init_response =
-                RpcMessage::success_response(msg, serde_json::json!({"capabilities": {}}));
-            client_writer.write_message(&init_response).await?;
-        }
+        let init_response =
+            RpcMessage::success_response(msg, serde_json::json!({"capabilities": {}}));
+        client_writer.write_message(&init_response).await?;
 
         Ok(())
     }

@@ -21,8 +21,6 @@ async fn backend_crash_recovery() {
                 "actions": [{ "type": "respond", "body": { "capabilities": { "hoverProvider": true } } }]
             },
             { "expect": { "method": "initialized" }, "actions": [] },
-            // dispatch_initialized forwards a 2nd "initialized" to fallback backends
-            { "expect": { "method": "initialized" }, "actions": [] },
             { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
             {
                 "expect": { "method": "textDocument/hover" },
@@ -44,7 +42,8 @@ async fn backend_crash_recovery() {
     };
 
     let (temp_dir, root) = support::setup_test_workspace(&config);
-    // Start proxy from pkg/ (has .venv → backend spawns immediately).
+    // Start proxy from pkg/ (has .venv, detected but not spawned yet — #140:
+    // the backend is created lazily on the first didOpen below).
     let mut proxy = ProxyUnderTest::spawn(temp_dir, root.clone(), &root.join("pkg"));
 
     let root_uri = support::path_to_uri(&root.join("pkg"));

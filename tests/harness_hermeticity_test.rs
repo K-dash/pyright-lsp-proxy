@@ -38,8 +38,6 @@ async fn config_at_redirected_home_takes_effect() {
                 "actions": [{ "type": "respond", "body": { "capabilities": { "hoverProvider": true, "definitionProvider": true } } }]
             },
             { "expect": { "method": "initialized" }, "actions": [] },
-            // dispatch_initialized forwards a 2nd "initialized" to fallback backends
-            { "expect": { "method": "initialized" }, "actions": [] },
             { "expect": { "method": "textDocument/didOpen" }, "actions": [] },
             {
                 "expect": { "method": "textDocument/hover" },

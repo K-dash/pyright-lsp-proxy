@@ -7,7 +7,7 @@ mod initialization;
 mod pool_management;
 mod progress_token;
 
-use crate::backend::{BackendKind, LspBackend};
+use crate::backend::BackendKind;
 use crate::error::ProxyError;
 use crate::framing::{LspFrameReader, LspFrameWriter};
 use crate::message::RpcMessage;
@@ -15,7 +15,6 @@ use crate::state::ProxyState;
 use crate::venv;
 use client_dispatch::NotificationDelivery;
 use pool_management::StaleOutcome;
-use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{stdin, stdout};
 use tokio::time::MissedTickBehavior;
@@ -49,7 +48,6 @@ impl LspProxy {
     async fn dispatch_client_message(
         &mut self,
         msg: RpcMessage,
-        pending_initial_backend: &mut Option<(LspBackend, PathBuf)>,
         client_writer: &mut LspFrameWriter<tokio::io::Stdout>,
         didopen_count: &mut usize,
     ) -> Result<bool, ProxyError> {
@@ -65,8 +63,7 @@ impl LspProxy {
         // Dispatch based on method, preserving original if-chain order
         match method {
             Some("initialize") => {
-                self.dispatch_initialize(&msg, pending_initial_backend, client_writer)
-                    .await?;
+                self.dispatch_initialize(&msg, client_writer).await?;
             }
             Some("initialized") => {
                 self.dispatch_initialized().await?;
@@ -322,21 +319,19 @@ impl LspProxy {
         // Get and cache git toplevel
         self.state.git_toplevel = venv::get_git_toplevel(&cwd).await?;
 
-        // Search for fallback venv
-        let fallback_venv = venv::find_fallback_venv(&cwd).await?;
-
-        // Pre-spawn backend if fallback venv found (but don't insert into pool yet —
-        // wait for client's `initialize` to complete the handshake first)
-        let mut pending_initial_backend: Option<(LspBackend, PathBuf)> = if let Some(venv) =
-            fallback_venv
-        {
-            tracing::info!(venv = %venv.display(), "Using fallback .venv, pre-spawning backend");
-            let backend = LspBackend::spawn(self.state.backend_kind, Some(&venv))?;
-            Some((backend, venv))
+        // Startup .venv detection is diagnostics-only (#140): the result is
+        // never used to spawn anything here. Every backend, including the
+        // first, is created lazily by the Creating machinery on the first
+        // venv-resolving client message (`didOpen` or a URI-bearing
+        // request), resolved per message by `find_venv`.
+        if let Some(venv) = venv::find_fallback_venv(&cwd).await? {
+            tracing::info!(
+                venv = %venv.display(),
+                "Startup .venv detected; backends are created lazily on the first venv-resolving message"
+            );
         } else {
-            tracing::warn!("No fallback .venv found, starting with empty pool");
-            None
-        };
+            tracing::info!("No .venv detected at startup");
+        }
 
         let mut didopen_count: usize = 0;
 
@@ -380,7 +375,7 @@ impl LspProxy {
                 // inline here).
                 Some(result) = client_msg_rx.recv() => {
                     let msg = result?;
-                    if self.dispatch_client_message(msg, &mut pending_initial_backend, &mut client_writer, &mut didopen_count).await? {
+                    if self.dispatch_client_message(msg, &mut client_writer, &mut didopen_count).await? {
                         return Ok(());
                     }
                 }
@@ -460,7 +455,7 @@ impl LspProxy {
                             self.dispatch_backend_message(backend_msg, &mut client_writer).await?;
                         }
                         Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                            if self.dispatch_client_message(replay_msg, &mut pending_initial_backend, &mut client_writer, &mut didopen_count).await? {
+                            if self.dispatch_client_message(replay_msg, &mut client_writer, &mut didopen_count).await? {
                                 return Ok(());
                             }
                         }
@@ -473,7 +468,7 @@ impl LspProxy {
                             // silently dropping the replay if this ever
                             // does trigger.
                             tracing::debug!("backend_msg_rx disconnected while checking before replay (unexpected)");
-                            if self.dispatch_client_message(replay_msg, &mut pending_initial_backend, &mut client_writer, &mut didopen_count).await? {
+                            if self.dispatch_client_message(replay_msg, &mut client_writer, &mut didopen_count).await? {
                                 return Ok(());
                             }
                         }
