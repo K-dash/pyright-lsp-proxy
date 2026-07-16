@@ -71,7 +71,7 @@ async fn venv_detection_routing() {
 
     let root_uri = support::path_to_uri(&root);
     let init_resp = proxy.initialize(&root_uri).await;
-    // No fallback backend → minimal capabilities
+    // initialize always answers with empty capabilities (#140)
     assert!(
         init_resp.error.is_none(),
         "initialize should not return an error"

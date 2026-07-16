@@ -470,11 +470,8 @@ pub fn render_human(report: &DoctorReport) -> String {
             .as_deref()
             .unwrap_or("<not in a git repo>")
     );
-    // "Fallback" is deliberately not used in the label: this is detection
-    // only (#140) — the path found here is never used to spawn anything;
-    // every backend, including the first, is created lazily by the Creating
-    // machinery on the first venv-resolving client message, resolved per
-    // message by `find_venv`, not by this startup search.
+    // Detection only (#140): never used to spawn — backends are created
+    // lazily, resolved per message by `find_venv`.
     let _ = writeln!(
         out,
         "  Startup .venv     {}",

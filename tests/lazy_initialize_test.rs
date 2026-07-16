@@ -95,9 +95,9 @@ async fn initialize_is_instant_and_backend_spawns_lazily() {
 
     proxy.send_initialized().await;
 
-    // (ii) settle delay well past the slow handshake's completion point (had
-    // any backend been spawned already): still no spawn marker. Direct proof
-    // nothing was launched before a venv-resolving message arrived.
+    // (ii) settle delay: the spawn marker is written at process startup, so
+    // anything spawned by now would have left one. Still absent — direct
+    // proof nothing was launched before a venv-resolving message arrived.
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
         !spawn_marker.exists(),

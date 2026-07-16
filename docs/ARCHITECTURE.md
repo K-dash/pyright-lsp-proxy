@@ -274,7 +274,7 @@ startup — not only when no fallback `.venv` is found. Until #140, a `.venv`
 present at startup took a different path: the proxy pre-spawned a backend
 and forwarded the client's `initialize` to it synchronously before
 responding. That path reproduced a permanent wedge in Claude Code 2.1.207's
-LSP client (observed 3/3): the client never sent `initialized` after
+LSP client (observed 3/3, still reproducible on 2.1.211): the client never sent `initialized` after
 receiving the (141–550ms-delayed) response. The venv-less instant-`{}` path
 survived every reproduction attempt (2/2), so #140 unified every startup on
 it: the first backend, like every other, is now created lazily by the
