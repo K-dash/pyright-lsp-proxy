@@ -24,15 +24,14 @@ confidence-threshold = 0.8
 ignore = false
 
 [bans]
-# Only one duplicate exists in the current graph: bitflags 1.3.2 (only via
-# lsp-types -> fluent-uri) vs. 2.10.0 (used by everything else: tokio's
-# parking_lot chain, and dev-dependency tempfile's rustix). Denying
-# duplicates outright with a single, documented skip is more useful than
-# leaving this at "warn" forever: it catches any *new* duplicate immediately
-# instead of silently accumulating more.
+# Duplicates are denied outright, with each tolerated one listed below.
+# Enumerating them is more useful than leaving this at "warn" forever: it
+# catches any *new* duplicate immediately instead of silently accumulating
+# more.
 multiple-versions = "deny"
 wildcards = "deny"
 skip = [
+    { crate = "syn@2", reason = "the ecosystem-wide syn 2 -> 3 migration is in progress: proc-macro crates cross over one release at a time (clap_derive, serde_derive and thiserror-impl already have; tokio-macros, tracing-attributes and the icu4x derives have not), so a 2/3 split is unavoidable for months. A version range rather than an exact pin, because syn 2.x keeps shipping patches while the migration runs. Delete this once nothing pulls syn 2.x." },
     { crate = "bitflags@1.3.2", reason = "the only consumer left on bitflags 1.x is lsp-types 0.97 (via fluent-uri); every other dependency in the graph already uses bitflags 2.x. Re-check when lsp-types updates its URI parser." },
 ]
 
