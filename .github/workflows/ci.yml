@@ -38,15 +38,23 @@ jobs:
           - ubuntu-24.04-arm
     steps:
       - name: Checkout code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      # dtolnay/rust-toolchain publishes via force-pushed branches, not tags,
+      # so the pinned SHA stops being reachable from `stable` every time
+      # upstream pushes (roughly every 3-6 weeks). Both audits below then fire
+      # on a pin that is not actually compromised: `ref-version-mismatch`
+      # because `stable` no longer resolves to it, `impostor-commit` because it
+      # is no longer reachable from any ref. Renovate bumping the digest is
+      # what guards these pins; a review should confirm the new SHA matches the
+      # branch tip at that time.
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable # zizmor: ignore[ref-version-mismatch,impostor-commit]
 
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       # Step timeout (25) is lower than the job timeout (30) on purpose: a
       # step timeout marks the step as failed, so the `if: failure()` upload
@@ -62,7 +70,7 @@ jobs:
       # step actually failed.
       - name: Upload CI diagnostics
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ci-diagnostics-${{ matrix.os }}
           path: ci-output.log
@@ -77,7 +85,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -97,7 +105,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -114,7 +122,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -134,8 +142,9 @@ jobs:
       # `master`, not `stable`: passing an explicit `toolchain` input
       # requires `master` per dtolnay/rust-toolchain's own docs (`stable`
       # only carries the "always latest stable" default this input overrides).
+      # The ignored audits are the same two explained in the `ci` job above.
       - name: Setup declared MSRV
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master # zizmor: ignore[ref-version-mismatch,impostor-commit]
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
 
