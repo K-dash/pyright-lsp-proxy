@@ -31,7 +31,7 @@ ignore = false
 multiple-versions = "deny"
 wildcards = "deny"
 skip = [
-    { crate = "syn@2", reason = "the ecosystem-wide syn 2 -> 3 migration is in progress: proc-macro crates cross over one release at a time (clap_derive, serde_derive and thiserror-impl already have; tokio-macros, tracing-attributes and the icu4x derives have not), so a 2/3 split is unavoidable for months. A version range rather than an exact pin, because syn 2.x keeps shipping patches while the migration runs. Delete this once nothing pulls syn 2.x." },
+    { crate = "syn@2", reason = "the ecosystem-wide syn 2 -> 3 migration is in progress: proc-macro crates cross over one release at a time (clap_derive, serde_derive and thiserror-impl already have; tokio-macros, tracing-attributes and the icu4x derives have not), so a 2/3 split is unavoidable for months. A version range rather than an exact pin, because syn 2.x keeps shipping patches while the migration runs. Delete this once `cargo tree -i syn@2` comes back empty; until then it stays, and while the graph happens to hold only one syn major it reports an `unnecessary-skip` warning (non-fatal)." },
     { crate = "bitflags@1.3.2", reason = "the only consumer left on bitflags 1.x is lsp-types 0.97 (via fluent-uri); every other dependency in the graph already uses bitflags 2.x. Re-check when lsp-types updates its URI parser." },
 ]
 

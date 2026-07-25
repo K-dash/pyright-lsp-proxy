@@ -154,8 +154,10 @@ jobs:
           TAG: ${{ needs.preflight.outputs.tag }}
         run: ./scripts/check-versions.sh --release "$TAG"
 
+      # See the `ci` job in ci.yml for why these two audits are ignored on
+      # every dtolnay/rust-toolchain pin.
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable # zizmor: ignore[ref-version-mismatch,impostor-commit]
 
       - name: Run quality gate
         run: make ci
@@ -188,7 +190,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable # zizmor: ignore[ref-version-mismatch,impostor-commit]
         with:
           targets: ${{ matrix.target }}
 
